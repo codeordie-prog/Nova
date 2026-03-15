@@ -34,6 +34,9 @@ _LOCAL_CONFIG_JSON: Path = (
     Path(__file__).resolve().parents[1] / "model_config" / "config.json"
 )
 
+# Path to the local gateway config file
+_LOCAL_GATEWAY_CONFIG_JSON: Path = Path(__file__).resolve().parent / "gateways" / "config.json"
+
 # Create Modal image with dependencies, attach config file
 image: modal.Image = modal.Image.debian_slim().pip_install(
     "torch",
@@ -48,6 +51,9 @@ image: modal.Image = modal.Image.debian_slim().pip_install(
 ).add_local_python_source("dermascan").add_local_file(
     str(_LOCAL_CONFIG_JSON),
     remote_path="/root/dermascan/ai_service/modal/model_config/config.json",
+).add_local_file(
+    str(_LOCAL_GATEWAY_CONFIG_JSON),
+    remote_path="/root/dermascan/ai_service/modal/medgemma_service/gateways/config.json",
 )
 
 # Create secret: `modal secret create huggingface HF_TOKEN=your_token`
