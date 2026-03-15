@@ -1,0 +1,9 @@
+{
+    "model_id": "google/medgemma-1.5-4b-it",
+    "task": "vision-text-generation",
+    "max_new_tokens": 2000,
+    "temperature": 0.0,
+    "image_size": 1024,
+    "revision": "main",
+    "dtype": "bfloat16"   
+}

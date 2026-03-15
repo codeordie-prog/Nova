@@ -1,0 +1,10 @@
+
+{
+    "rate_limiter": {
+        "max_requests_per_minute": 60,
+        "max_requests_per_hour": 1000
+    },
+    "max_concurrency":4,
+    "timeout":90,
+    "rate_limit_window":60
+}
