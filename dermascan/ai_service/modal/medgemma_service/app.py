@@ -16,12 +16,15 @@ from pathlib import Path
 import subprocess
 import time
 import uuid
+import logging
 
 import modal
 from PIL import Image
 import requests
 import httpx
 from httpx import Response
+
+from typing import List, Dict, Any, Optional
 
 from dermascan.ai_service.modal.medgemma_service.model import load_medgemma_pipeline
 from dermascan.ai_service.modal.model_config.loader import ModelConfig, load_config
@@ -57,14 +60,14 @@ image: modal.Image = modal.Image.debian_slim().pip_install(
 )
 
 # Create secret: `modal secret create huggingface HF_TOKEN=your_token`
-hf_secret = modal.Secret.from_name("huggingface")
+hf_secret: modal.Secret = modal.Secret.from_name("huggingface")
 
 
 # Modal app definition
-app = modal.App("dermascan-medgemma")
+app: modal.App = modal.App("dermascan-medgemma")
 
 # Logger initialization
-log = get_logger(__name__)
+log: logging.Logger = get_logger(__name__)
 
 # Create class for MedGemma service, runs on A10G GPU with specified image and secrets
 @app.cls(
@@ -260,8 +263,8 @@ class MedGemmaService:
         """
 
         # Encode image to base64 and create data URL
-        b64 = base64.b64encode(image_bytes).decode("ascii")
-        data_url = f"data:image/jpeg;base64,{b64}"
+        b64: str = base64.b64encode(image_bytes).decode("ascii")
+        data_url: str = f"data:image/jpeg;base64,{b64}"
         return [
             {
                 "role": "user",
@@ -290,8 +293,8 @@ class MedGemmaService:
         """
 
         # Format messages for MedGemma
-        messages = self._messages(img=img, prompt=prompt)
-        result = self.pipe(
+        messages: List[Dict[str, Any]] = self._messages(img=img, prompt=prompt)
+        result: List[Dict[str, Any]] = self.pipe(
             messages,
             max_new_tokens=self.cfg.max_new_tokens,
             temperature=self.cfg.temperature,
@@ -313,7 +316,7 @@ class MedGemmaService:
         Returns:
             Generated text
         """
-        payload = {
+        payload: Dict[str, Any] = {
             "model": self.cfg.model_id,
             "messages": self._vllm_messages(image_bytes=image_bytes, prompt=prompt),
             "temperature": self.cfg.temperature,
@@ -321,11 +324,11 @@ class MedGemmaService:
         }
 
         # Call vLLM server, pass the payload as JSON
-        r = httpx.post(f"{self._vllm_base_url}/v1/chat/completions", json=payload, timeout=None)
+        r: Response = httpx.post(f"{self._vllm_base_url}/v1/chat/completions", json=payload, timeout=None)
         r.raise_for_status()
 
         # Parse the response
-        data = r.json()
+        data: Dict[str, Any] = r.json()
         return data["choices"][0]["message"]["content"]
 
     # Run one inference
@@ -345,10 +348,10 @@ class MedGemmaService:
         """
         log.info("Request received: boot_id=%s", self.boot_id)
         if getattr(self, "_engine", "transformers") == "vllm":
-            text = self._infer_one_vllm(image_bytes=image_bytes, prompt=prompt)
+            text: str = self._infer_one_vllm(image_bytes=image_bytes, prompt=prompt)
         else:
-            img = self._decode_image_bytes(image_bytes)
-            text = self._infer_one(img=img, prompt=prompt)
+            img: Image.Image = self._decode_image_bytes(image_bytes)
+            text: str = self._infer_one(img=img, prompt=prompt)
         return self.boot_id, text
 
     # Run batched inference requests
@@ -366,7 +369,7 @@ class MedGemmaService:
             Tuple of (boot_id, list of generated texts)
         """
         log.info("Batch request received: boot_id=%s, size=%s", self.boot_id, len(requests))
-        outputs: list[str] = []
+        outputs: List[str] = []
 
         # Use vLLM for batch inference
         if getattr(self, "_engine", "transformers") == "vllm":
@@ -378,7 +381,7 @@ class MedGemmaService:
                 async with httpx.AsyncClient(timeout=None) as client:
                     tasks = []
                     for image_bytes, prompt in requests:
-                        payload = {
+                        payload: Dict[str, Any] = {
                             "model": self.cfg.model_id,
                             "messages": self._vllm_messages(image_bytes=image_bytes, prompt=prompt),
                             "temperature": self.cfg.temperature,
@@ -424,7 +427,7 @@ class MedGemmaService:
             Generated text.
         """
         if isinstance(image_source, str):
-            resp = requests.get(image_source, stream=True)
+            resp: requests.Response = requests.get(image_source, stream=True)
             resp.raise_for_status()
             image_bytes = resp.content
         else:
