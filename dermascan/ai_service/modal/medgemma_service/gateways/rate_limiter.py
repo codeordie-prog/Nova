@@ -11,7 +11,7 @@ import time
 
 import anyio
 import logging
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Callable
 
 from fastapi import Request, HTTPException
 
