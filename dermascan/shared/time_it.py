@@ -1,5 +1,5 @@
 """
-Author: Kelvin Ndeti
+Author: Dermascan team
 Date: 2026-03-12
 License: MIT
 
