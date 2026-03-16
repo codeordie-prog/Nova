@@ -1,5 +1,7 @@
 """
-MedGemma model loader (loading only).
+Author: DermaScan Team
+Date: 2026-03-12
+Description: MedGemma model loader (loading only).
 
 Loads the Hugging Face image-text-to-text pipeline once. Used by app.py in a
 Modal class `@enter` so the model is loaded a single time per container.
