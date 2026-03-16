@@ -1,5 +1,7 @@
 """
-Model configuration loader for the AI inference layer.
+Author: DermaScan Team
+Date: 2026-03-12
+Description: Model configuration loader for the AI inference layer.
 
 Reads non-secret, static model settings from ``config.json`` (same directory)
 and exposes them as a typed :class:`ModelConfig` dataclass. Use this module
