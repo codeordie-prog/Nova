@@ -1,6 +1,6 @@
 # MedGemma Service (Modal)
 
-This package contains the **Modal-hosted MedGemma inference service** and the **FastAPI gateway** that validates inputs and forwards requests to Modal.
+This package contains the **Modal-hosted MedGemma inference service**, a **FastAPI enqueue API**, and a **worker** that consumes queued jobs and performs inference.
 
 ## What lives here
 
@@ -13,22 +13,28 @@ This package contains the **Modal-hosted MedGemma inference service** and the **
   Model loader (pipeline construction only).
 
 - **`schemas.py`**
-  Pydantic request/response schemas used by the gateway API.
+  Pydantic request/response schemas used by the enqueue API.
+
+- **`worker.py`**
+  Redis Stream consumer that:
+  - reads queued jobs from the stream
+  - dispatches inference to `MedGemmaService`
+  - writes job result/status back to Redis
 
 - **`gateways/`**
-  FastAPI ASGI app exposed via Modal (`modal serve ...`).
-  Includes input validation + rate limiting + concurrency control + timeouts.
+  FastAPI enqueue/status API served with `uvicorn`.
+  Includes input validation and request rate limiting before enqueue.
 
 ## Request flow (high level)
 
 1. Client calls FastAPI gateway endpoint (`/diagnose`, `/diagnose_batch`, `/diagnose_base64`).
-2. Gateway validates prompt + image payload and applies:
-   - rate limiting
-   - concurrency limit
-   - request timeout
-3. Gateway calls `MedGemmaService.run_one.remote(...)` or `run_batch.remote(...)`.
-4. Modal executes inference in the GPU container and returns `(boot_id, text)`.
+2. Gateway validates payload and enqueues a Redis Stream job.
+3. Worker consumes jobs and dispatches `MedGemmaService.run_one` on Modal GPU containers.
+4. Worker updates Redis job status (`queued` -> `running` -> `done`/`failed`).
+5. Client polls `GET /jobs/{job_id}` for result.
 
 ## How to run
 
-See `gateways/README.md` for how to run the gateway API locally and on Modal.
+See:
+- `gateways/README.md` for running the API with `uvicorn`
+- project root `README.md` for end-to-end API + worker quickstart

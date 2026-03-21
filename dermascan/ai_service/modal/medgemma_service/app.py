@@ -51,6 +51,7 @@ image: modal.Image = modal.Image.debian_slim().pip_install(
     "vllm",
     "fastapi",
     "python-multipart",
+    "redis",
 ).add_local_python_source("dermascan").add_local_file(
     str(_LOCAL_CONFIG_JSON),
     remote_path="/root/dermascan/ai_service/modal/model_config/config.json",
@@ -61,6 +62,9 @@ image: modal.Image = modal.Image.debian_slim().pip_install(
 
 # Create secret: `modal secret create huggingface HF_TOKEN=your_token`
 hf_secret: modal.Secret = modal.Secret.from_name("huggingface")
+
+# Create secret: `modal secret create redis REDIS_HOST=your_host REDIS_PORT=your_port REDIS_USERNAME=your_username REDIS_PASSWORD=your_password REDIS_DB=your_db`
+redis_secret: modal.Secret = modal.Secret.from_name("redis")
 
 
 # Modal app definition
@@ -74,6 +78,7 @@ log: logging.Logger = get_logger(__name__)
     gpu="A10G",
     image=image,
     secrets=[hf_secret],
+    max_containers=1,
 )
 class MedGemmaService:
     """

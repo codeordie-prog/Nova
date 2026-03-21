@@ -7,6 +7,7 @@ Schemas for web endpoints, with Pydantic models for request and response validat
 """
 
 from typing import List
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -32,6 +33,35 @@ class DiagnoseBatchResponse(BaseModel):
 
     boot_id: str
     texts: List[str]
+
+# Pydantic model for enqueue response.
+class EnqueueResponse(BaseModel):
+    """
+    Response schema for enqueue endpoint.
+    """
+    job_id: str
+    status: str
+
+
+class BatchEnqueueResponse(BaseModel):
+    """
+    Response schema for batch enqueue endpoint.
+    """
+
+    job_ids: List[str]
+    status: str
+
+
+# Pydantic model for job status response.
+class JobStatusResponse(BaseModel):
+    """
+    Response schema for job status endpoint.
+    """
+    job_id: str
+    status: str
+    boot_id: Optional[str] = None
+    text: Optional[str] = None
+    error: Optional[str] = None
 
 
 

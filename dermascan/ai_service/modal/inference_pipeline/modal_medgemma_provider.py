@@ -1,3 +1,9 @@
+"""
+Author: DermaScan Team
+Date: 2026-03-16
+Description: Modal implementation of the MedGemma inference provider.
+"""
+
 from __future__ import annotations
 
 import modal

@@ -1,5 +1,6 @@
-from pathlib import Path
+import socket
+from redis import Redis
 
-config_path = Path(__file__).resolve().parents[1] / "model_config" / "config.json"
 
-print(config_path)
+pipe: Redis.pipeline = Redis().pipeline(transaction=False)
+print(pipe)

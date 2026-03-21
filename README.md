@@ -2,18 +2,20 @@
 
 AI agents network for medical diagnosis.
 
-## Modal (MedGemma) Quickstart
+## MedGemma Async Quickstart
 
-The MedGemma inference service is implemented as a **Modal app** and exposed via a **FastAPI gateway**.
+The MedGemma service now runs as a separated async system:
 
-- Entry point:
-  `dermascan/ai_service/modal/medgemma_service/gateways/endpoints.py`
+- **FastAPI API (`uvicorn`)**: validates requests and enqueues jobs to Redis.
+- **Worker process**: consumes Redis Stream jobs and calls Modal GPU inference.
+- **Modal service (`app.py`)**: hosts `MedGemmaService` GPU methods used by workers.
 
 ### Prerequisites
 
 - Python 3.12+
 - Poetry
-- Modal CLI (installed by Poetry via the `modal` dependency)
+- Modal CLI (required for worker inference calls)
+- Redis instance (for queue + job status storage)
 
 ### Setup
 
@@ -23,23 +25,24 @@ poetry shell
 
 modal token new
 modal secret create huggingface HF_TOKEN=YOUR_TOKEN
+modal secret create redis REDIS_HOST=YOUR_HOST REDIS_PORT=YOUR_PORT REDIS_USERNAME=YOUR_USERNAME REDIS_PASSWORD=YOUR_PASSWORD REDIS_DB=YOUR_DB
 ```
 
-### Run the gateway locally
+### Run the API locally (uvicorn)
 
 ```bash
-modal serve dermascan/ai_service/modal/medgemma_service/gateways/endpoints.py
+poetry run python -m uvicorn dermascan.ai_service.modal.medgemma_service.gateways.endpoints:web_app --host 0.0.0.0 --port 8080 --reload
 ```
 
-### Deploy the gateway to Modal
+### Run the worker
 
 ```bash
-modal deploy dermascan/ai_service/modal/medgemma_service/gateways/endpoints.py
+python dermascan/ai_service/modal/medgemma_service/worker.py
 ```
 
 ### Configuration
 
-Gateway limits (rate limiting / concurrency / timeout) are configured in:
+Gateway/API and worker limits are configured via env vars and gateway config:
 
 `dermascan/ai_service/modal/medgemma_service/gateways/config.json`
 
