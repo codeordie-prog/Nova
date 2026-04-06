@@ -4,10 +4,15 @@ Date: 2026-03-20
 Description: Redis client for MedGemma service, including connection checking and client creation from environment variables.
 """
 
-from dataclasses import dataclass
-
-from redis import Redis
 import os
+from dataclasses import dataclass
+from pathlib import Path
+
+from dotenv import load_dotenv
+from redis import Redis
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+load_dotenv(_REPO_ROOT / ".env")
 
 @dataclass(frozen=True)
 class RedisConfig:
@@ -57,6 +62,16 @@ class Client:
         return self.client
 
 
+def _redis_db_from_env() -> int:
+    raw = os.environ.get("REDIS_DB", "").strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
 def redis_client_from_env() -> Client:
     """
     Create a Redis client from environment variables.
@@ -67,10 +82,10 @@ def redis_client_from_env() -> Client:
     return Client(
         config=RedisConfig(
             host=os.environ.get("REDIS_HOST", "localhost"),
-            port=int(os.environ.get("REDIS_PORT", "12996")),
+            port=int((os.environ.get("REDIS_PORT") or "12996").strip()),
             username=os.environ.get("REDIS_USERNAME", "default"),
             password=os.environ.get("REDIS_PASSWORD", ""),
-            db=int(os.environ.get("REDIS_DB", "0")),
+            db=_redis_db_from_env(),
             decode_responses=True,
         )
     )
