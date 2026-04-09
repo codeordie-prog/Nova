@@ -41,7 +41,7 @@ _LOCAL_CONFIG_JSON: Path = (
 _LOCAL_GATEWAY_CONFIG_JSON: Path = Path(__file__).resolve().parent / "gateways" / "config.json"
 
 # Create Modal image with dependencies, attach config file
-image: modal.Image = modal.Image.debian_slim().pip_install(
+image: modal.Image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "torch",
     "transformers",
     "accelerate",
@@ -75,10 +75,10 @@ log: logging.Logger = get_logger(__name__)
 
 # Create class for MedGemma service, runs on A10G GPU with specified image and secrets
 @app.cls(
-    gpu="A10G",
+    gpu="L4",
     image=image,
     secrets=[hf_secret],
-    max_containers=1,
+    max_containers=1
 )
 class MedGemmaService:
     """
