@@ -127,7 +127,7 @@ def _enqueue_jobs_batch(jobs: list[tuple[bytes, str]]) -> list[str]:
         image_b64: str = base64.b64encode(image_bytes).decode("ascii")
         job_key: str = f"medgemma:job:{job_id}"
 
-        # set job metadata, 
+        # set job metadata 
         pipe.hset(
             job_key,
             mapping={
