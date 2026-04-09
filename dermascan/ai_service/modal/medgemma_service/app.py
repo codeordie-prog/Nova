@@ -76,7 +76,7 @@ log: logging.Logger = get_logger(__name__)
 
 # Create class for MedGemma service, runs on A10G GPU with specified image and secrets
 @app.cls(
-    gpu="L4",
+    gpu="A10G",
     image=image,
     secrets=[hf_secret],
     max_containers=1
