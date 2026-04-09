@@ -79,7 +79,7 @@ log: logging.Logger = get_logger(__name__)
     gpu="A10G",
     image=image,
     secrets=[hf_secret],
-    max_containers=1
+    max_containers=1,
 )
 class MedGemmaService:
     """
