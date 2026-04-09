@@ -41,6 +41,7 @@ _LOCAL_CONFIG_JSON: Path = (
 _LOCAL_GATEWAY_CONFIG_JSON: Path = Path(__file__).resolve().parent / "gateways" / "config.json"
 
 # Create Modal image with dependencies, attach config file
+# Pin Python <3.14: vLLM -> numba does not support 3.14+ (Modal default image may use latest).
 image: modal.Image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "torch",
     "transformers",
