@@ -63,10 +63,30 @@ _redis: redis.Redis = redis_client_from_env().get_redis()
 _JOB_STREAM: str = os.environ.get("MEDGEMMA_JOB_STREAM", "medgemma:jobs")
 _JOB_TTL_S: int = int(os.environ.get("MEDGEMMA_JOB_TTL_S", "86400"))
 
-
+# enqueue job function
 def _enqueue_job(image_bytes: bytes, prompt: str) -> str:
     """
     Enqueue a job to the Redis stream.
+    This function is used to enqueue a job to the Redis stream.
+    The job will be processed by the async workers.
+
+    Schema:
+    - it will create:
+        -> Hash key on Redis with the following Schema:
+            - medgemma:job:{job_id} : job_id, 
+                                      status = "queued", 
+                                      created_at,
+                                      started_at,  
+                                      finished_at, 
+                                      boot_id, 
+                                      text, 
+                                      attempts
+
+        -> Stream key on Redis with the following Schema:
+            - medgemma:stream : job_id,
+                                image_b64,
+                                prompt,
+                                created_at
     
     Args:
         image_bytes: The image bytes to enqueue
@@ -75,9 +95,16 @@ def _enqueue_job(image_bytes: bytes, prompt: str) -> str:
     Returns:
         str: The job ID
     """
+    # Create a unique job ID
     job_id: str = uuid.uuid4().hex
+    
+    # Encode the image to base64
     image_b64: str = base64.b64encode(image_bytes).decode("ascii")
+    
+    # Create a unique job key
     job_key: str = f"medgemma:job:{job_id}"
+    
+    # Get the current time
     now_s: int = int(time.time())
 
     # set job metadata
@@ -90,7 +117,7 @@ def _enqueue_job(image_bytes: bytes, prompt: str) -> str:
         },
     )
 
-    # set job ttl
+    # set job ttl - useful for cleaning up old jobs
     _redis.expire(job_key, _JOB_TTL_S)
     
     # add job to stream

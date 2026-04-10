@@ -2,6 +2,16 @@
 Author: Dermascan Team
 Date: 2026-03-20
 Description: Redis client for MedGemma service, including connection checking and client creation from environment variables.
+
+REDIS schema:
+
+Keys:
+- Hash
+- Stream
+
+Values:
+- medgemma:job:{job_id} - Hash with job metadata (job_id, status, started_at, created_at, finished_at, boot_id, text, attempts)
+- medgemma:stream - Stream for job processing
 """
 
 import os
