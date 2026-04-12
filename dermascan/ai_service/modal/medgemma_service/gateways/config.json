@@ -6,5 +6,11 @@
     },
     "max_concurrency":60,
     "timeout":90,
-    "rate_limit_window":60
+    "rate_limit_window":60,
+    
+    "global_rate_limiter": {
+        "request_per_minute": 70,
+        "window_seconds":60,
+        "key_prefix":"medgemma:rate_limit:global"
+    }
 }

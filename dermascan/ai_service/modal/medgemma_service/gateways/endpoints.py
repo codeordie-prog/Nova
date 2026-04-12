@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import anyio
 import base64
+import binascii
 import os
 import time
 import uuid
@@ -32,6 +33,8 @@ from dermascan.ai_service.modal.medgemma_service.schemas import (
     EnqueueResponse,
     JobStatusResponse,
 )
+from dermascan.ai_service.modal.medgemma_service.gateways.queue_depth_manager import (
+    _wait_for_queue_capacity,)
 
 from dermascan.ai_service.modal.medgemma_service.redis_client import redis_client_from_env
 
@@ -46,8 +49,8 @@ from dermascan.ai_service.modal.medgemma_service.gateways.validation import (
     _validate_image_bytes,
 )
 
-from dermascan.ai_service.modal.medgemma_service.gateways.rate_limiter import (
-    _enforce_rate_limit,
+from dermascan.ai_service.modal.medgemma_service.gateways.global_rate_limiter import (
+    _enforce_global_rate_limit,
 )
 
 # Create FastAPI app
@@ -62,31 +65,23 @@ _redis: redis.Redis = redis_client_from_env().get_redis()
 # job stream configuration - used for async job processing
 _JOB_STREAM: str = os.environ.get("MEDGEMMA_JOB_STREAM", "medgemma:jobs")
 _JOB_TTL_S: int = int(os.environ.get("MEDGEMMA_JOB_TTL_S", "86400"))
+_MAX_QUEUE_LEN_HARD: int = int(os.environ.get("MAX_QUEUE_LEN_HARD", "350"))
+_ENQUEUE_CAPACITY_RETRIES: int = int(os.environ.get("MEDGEMMA_ENQUEUE_CAPACITY_RETRIES", "5"))
+_RETRY_AFTER_SECONDS: str = os.environ.get("MEDGEMMA_RETRY_AFTER_SECONDS", "1")
+
+
+class QueueCapacityExceededError(RuntimeError):
+    """Raised when queue capacity is saturated at enqueue time."""
 
 # enqueue job function
 def _enqueue_job(image_bytes: bytes, prompt: str) -> str:
     """
     Enqueue a job to the Redis stream.
-    This function is used to enqueue a job to the Redis stream.
-    The job will be processed by the async workers.
-
-    Schema:
-    - it will create:
-        -> Hash key on Redis with the following Schema:
-            - medgemma:job:{job_id} : job_id, 
-                                      status = "queued", 
-                                      created_at,
-                                      started_at,  
-                                      finished_at, 
-                                      boot_id, 
-                                      text, 
-                                      attempts
-
-        -> Stream key on Redis with the following Schema:
-            - medgemma:stream : job_id,
-                                image_b64,
-                                prompt,
-                                created_at
+    This function uses Atomic enqueue gating principle.
+    Atomic gating is needed here due to expected high concurrency and potential race conditions.
+    We define a transaction with Multiple operations - including Enqueue Job to REDIS stream,
+    Set job data, and Set job status.
+    Atomic gating here means, we only enqueue under valid capacity or retry/fail
     
     Args:
         image_bytes: The image bytes to enqueue
@@ -107,30 +102,50 @@ def _enqueue_job(image_bytes: bytes, prompt: str) -> str:
     # Get the current time
     now_s: int = int(time.time())
 
-    # set job metadata
-    _redis.hset(
-        job_key,
-        mapping={
-            "job_id": job_id,
-            "status": "queued",
-            "created_at": str(now_s),
-        },
-    )
+    # Bound retries to ENQUEUE_CAPACITY_RETRIES
+    for _ in range(_ENQUEUE_CAPACITY_RETRIES):
+        try:
+            # Use a transaction pipeline to bundle together
+            # the watch, check, and multi operations
+            with _redis.pipeline(transaction=True) as pipe:
 
-    # set job ttl - useful for cleaning up old jobs
-    _redis.expire(job_key, _JOB_TTL_S)
-    
-    # add job to stream
-    _redis.xadd(
-        _JOB_STREAM,
-        {
-            "job_id": job_id,
-            "prompt": prompt,
-            "image_base64": image_b64,
-            "created_at": str(now_s),
-        },
-    )
-    return job_id
+                # Watch the job stream to detect concurrent modifications
+                pipe.watch(_JOB_STREAM)
+
+                # Check the current queue length
+                queue_len: int = int(_redis.xlen(_JOB_STREAM))
+
+                # If the queue is at hard capacity, unwatch and raise an error
+                if queue_len >= _MAX_QUEUE_LEN_HARD:
+                    pipe.unwatch()
+                    raise QueueCapacityExceededError("queue is at hard capacity")
+
+                # Start a transaction to bundle the operations
+                pipe.multi()
+                pipe.hset(
+                    job_key,
+                    mapping={
+                        "job_id": job_id,
+                        "status": "queued",
+                        "created_at": str(now_s),
+                    },
+                )
+                pipe.expire(job_key, _JOB_TTL_S)
+                pipe.xadd(
+                    _JOB_STREAM,
+                    {
+                        "job_id": job_id,
+                        "prompt": prompt,
+                        "image_base64": image_b64,
+                        "created_at": str(now_s),
+                    },
+                )
+                pipe.execute()
+                return job_id
+        except redis.WatchError:
+            continue
+
+    raise QueueCapacityExceededError("queue capacity contention: enqueue retries exhausted")
 
 
 def _enqueue_jobs_batch(jobs: list[tuple[bytes, str]]) -> list[str]:
@@ -143,43 +158,57 @@ def _enqueue_jobs_batch(jobs: list[tuple[bytes, str]]) -> list[str]:
     Returns:
         list[str]: List of job IDs
     """
+    if not jobs:
+        return []
+
     now_s: str = str(int(time.time()))
-    pipe = _redis.pipeline(transaction=False)
     job_ids: list[str] = []
 
-    # add each job to the pipeline
+    encoded_jobs: list[tuple[str, str, str]] = []
     for image_bytes, prompt in jobs:
         job_id: str = uuid.uuid4().hex
-        job_ids.append(job_id)
-        image_b64: str = base64.b64encode(image_bytes).decode("ascii")
         job_key: str = f"medgemma:job:{job_id}"
+        image_b64: str = base64.b64encode(image_bytes).decode("ascii")
+        job_ids.append(job_id)
+        encoded_jobs.append((job_id, job_key, image_b64))
 
-        # set job metadata
-        pipe.hset(
-            job_key,
-            mapping={
-                "job_id": job_id,
-                "status": "queued",
-                "created_at": now_s,
-            },
-        )
+    required_slots: int = len(encoded_jobs)
 
-        # set job ttl
-        pipe.expire(job_key, _JOB_TTL_S)
-        
-        # add job to stream
-        pipe.xadd(
-            _JOB_STREAM,
-            {
-                "job_id": job_id,
-                "prompt": prompt,
-                "image_base64": image_b64,
-                "created_at": now_s,
-            },
-        )
+    for _ in range(_ENQUEUE_CAPACITY_RETRIES):
+        try:
+            with _redis.pipeline(transaction=True) as pipe:
+                pipe.watch(_JOB_STREAM)
+                queue_len: int = int(_redis.xlen(_JOB_STREAM))
+                if queue_len + required_slots > _MAX_QUEUE_LEN_HARD:
+                    pipe.unwatch()
+                    raise QueueCapacityExceededError("queue is at hard capacity")
 
-    pipe.execute()
-    return job_ids
+                pipe.multi()
+                for (job_id, job_key, image_b64), (_, prompt) in zip(encoded_jobs, jobs, strict=True):
+                    pipe.hset(
+                        job_key,
+                        mapping={
+                            "job_id": job_id,
+                            "status": "queued",
+                            "created_at": now_s,
+                        },
+                    )
+                    pipe.expire(job_key, _JOB_TTL_S)
+                    pipe.xadd(
+                        _JOB_STREAM,
+                        {
+                            "job_id": job_id,
+                            "prompt": prompt,
+                            "image_base64": image_b64,
+                            "created_at": now_s,
+                        },
+                    )
+                pipe.execute()
+                return job_ids
+        except redis.WatchError:
+            continue
+
+    raise QueueCapacityExceededError("queue capacity contention: batch enqueue retries exhausted")
 
 
 def _get_job_data(job_id: str) -> dict[str, str]:
@@ -215,7 +244,7 @@ async def diagnose(
     logger.info("Diagnose endpoint called")
 
     try:
-        await _enforce_rate_limit(request=request)
+        await _enforce_global_rate_limit(cost=1)
 
         if not prompt.strip():
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
@@ -226,6 +255,16 @@ async def diagnose(
         # Read and validate image
         image_bytes: bytes = await _read_upload_limited(image, max_bytes=MAX_IMAGE_BYTES)
         _validate_image_bytes(image_bytes)
+
+        # Check queue capacity
+        state, _ = await _wait_for_queue_capacity()
+
+        if state == "red":
+            raise HTTPException(
+                status_code=429,
+                detail="Service is overloaded. Please try again later.",
+                headers={"Retry-After": _RETRY_AFTER_SECONDS},
+            )
 
         # Enqueue job
         job_id: str = await anyio.to_thread.run_sync(_enqueue_job, image_bytes, prompt)
@@ -240,7 +279,14 @@ async def diagnose(
         logger.error(f"Image validation error: {e}")
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
-    except redis.exceptions.ConnectionError:
+    except QueueCapacityExceededError:
+        raise HTTPException(
+            status_code=429,
+            detail="Service is overloaded. Please try again later.",
+            headers={"Retry-After": _RETRY_AFTER_SECONDS},
+        )
+
+    except redis.RedisError:
         raise HTTPException(status_code=503, detail="Redis unavailable")
         
     except Exception:
@@ -287,7 +333,7 @@ async def diagnose_batch(
     logger.info("Diagnose batch endpoint called")
 
     try:
-        await _enforce_rate_limit(request=request)
+        await _enforce_global_rate_limit(cost=len(images))
 
         if len(images) != len(prompts):
             raise HTTPException(
@@ -307,6 +353,16 @@ async def diagnose_batch(
             _validate_image_bytes(img_bytes)
             enqueue_jobs.append((img_bytes, p))
 
+        # Check queue capacity
+        state, _ = await _wait_for_queue_capacity()
+
+        if state == "red":
+            raise HTTPException(
+                status_code=429,
+                detail="Service is overloaded. Please try again later.",
+                headers={"Retry-After": _RETRY_AFTER_SECONDS},
+            )
+
         job_ids: list[str] = await anyio.to_thread.run_sync(_enqueue_jobs_batch, enqueue_jobs)
 
         return BatchEnqueueResponse(job_ids=job_ids, status="queued")
@@ -318,7 +374,14 @@ async def diagnose_batch(
         logger.error(f"Image validation error: {e}")
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
-    except redis.exceptions.ConnectionError:
+    except QueueCapacityExceededError:
+        raise HTTPException(
+            status_code=429,
+            detail="Service is overloaded. Please try again later.",
+            headers={"Retry-After": _RETRY_AFTER_SECONDS},
+        )
+
+    except redis.RedisError:
         raise HTTPException(status_code=503, detail="Redis unavailable")
 
     except Exception:
@@ -351,11 +414,10 @@ async def diagnose_base64(
     """
     logger.info("diagnose_base64 endpoint called")
 
+    await _enforce_global_rate_limit(cost=1)
     try:
-        await _enforce_rate_limit(request=request)
-
         image_bytes: bytes = base64.b64decode(payload.image_base64, validate=True)
-    except Exception as e:
+    except (binascii.Error, ValueError) as e:
         logger.error(f"Invalid base64: {e}")
         raise HTTPException(status_code=400, detail="Invalid base64")
 
@@ -364,6 +426,16 @@ async def diagnose_base64(
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
         _validate_image_bytes(image_bytes)
+
+        # Check queue capacity
+        state, _ = await _wait_for_queue_capacity()
+
+        if state == "red":
+            raise HTTPException(
+                status_code=429,
+                detail="Service is overloaded. Please try again later.",
+                headers={"Retry-After": _RETRY_AFTER_SECONDS},
+            )
 
         job_id: str = await anyio.to_thread.run_sync(_enqueue_job, image_bytes, payload.prompt)
         return EnqueueResponse(job_id=job_id, status="queued")
@@ -375,7 +447,14 @@ async def diagnose_base64(
         logger.error(f"Image validation error: {e}")
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
-    except redis.exceptions.ConnectionError:
+    except QueueCapacityExceededError:
+        raise HTTPException(
+            status_code=429,
+            detail="Service is overloaded. Please try again later.",
+            headers={"Retry-After": _RETRY_AFTER_SECONDS},
+        )
+
+    except redis.RedisError:
         raise HTTPException(status_code=503, detail="Redis unavailable")
 
     except Exception:

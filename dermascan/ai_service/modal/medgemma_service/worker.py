@@ -35,7 +35,7 @@ _MAX_ATTEMPTS: int = int(os.environ.get("MEDGEMMA_MAX_ATTEMPTS", "3"))
 _BATCH_SIZE: int = int(os.environ.get("MEDGEMMA_STREAM_BATCH_SIZE", "10"))
 _BATCH_WINDOW_S: int = float(os.environ.get("MEDGEMMA_BATCH_WINDOW_S", "2.0"))
 _BLOCK_MS: int = int(os.environ.get("MEDGEMMA_STREAM_BLOCK_MS", "500"))
-_MAX_INFLIGHT: int = max(1, int(os.environ.get("MEDGEMMA_MAX_INFLIGHT", "4")))
+_MAX_INFLIGHT: int = max(1, int(os.environ.get("MEDGEMMA_MAX_INFLIGHT", "12")))
 _CONSUMER_GROUP: str = os.environ.get("MEDGEMMA_CONSUMER_GROUP", "medgemma-workers")
 _CONSUMER_NAME: str = os.environ.get("MEDGEMMA_CONSUMER_NAME", socket.gethostname())
 
