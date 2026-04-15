@@ -310,6 +310,7 @@ async def get_job(job_id: str) -> JobStatusResponse:
         status=data.get("status", "unknown"),
         boot_id=data.get("boot_id"),
         text=data.get("text"),
+        confidence=float(data["confidence"]) if data.get("confidence") is not None else None,
         error=data.get("error"),
     )
 

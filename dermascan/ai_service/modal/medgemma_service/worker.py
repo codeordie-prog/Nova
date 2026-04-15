@@ -12,6 +12,7 @@ This is implemented inorder to achieve a near one forward pass behavior.
 """
 
 import base64
+import json
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import os
@@ -330,11 +331,20 @@ def _collect_batch_result(batch: list[_JobEntry], call_handle: Any) -> None:
             )
 
         for entry, text in zip(batch, texts, strict=True):
+            text_str: str
+            confidence: str | None = None
+            if isinstance(text, dict):
+                confidence_val = text.get("confidence")
+                confidence = str(confidence_val) if confidence_val is not None else None
+                text_str = json.dumps(text)
+            else:
+                text_str = str(text)
             _mark_status(
                 entry.job_id,
                 status="done",
                 boot_id=boot_id,
-                text=text,
+                text=text_str,
+                confidence=confidence,
                 finished_at=str(int(time.time())),
             )
             _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, entry.msg_id)
@@ -363,12 +373,21 @@ def _collect_result(job_id: str, msg_id: str, call_handle: Any) -> None:
     """
     try:
         boot_id, text = call_handle.get()
-        logger.info("inference done: job_id=%s boot_id=%s text_len=%s", job_id, boot_id, len(text) if text is not None else 0)
+        text_str: str
+        confidence: str | None = None
+        if isinstance(text, dict):
+            confidence_val = text.get("confidence")
+            confidence = str(confidence_val) if confidence_val is not None else None
+            text_str = json.dumps(text)
+        else:
+            text_str = str(text)
+        logger.info("inference done: job_id=%s boot_id=%s text_len=%s", job_id, boot_id, len(text_str) if text_str is not None else 0)
         _mark_status(
             job_id,
             status="done",
             boot_id=boot_id,
-            text=text,
+            text=text_str,
+            confidence=confidence,
             finished_at=str(int(time.time())),
         )
         _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id)

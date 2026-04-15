@@ -10,6 +10,7 @@ Use `modal run app.py` from the project root (where pyproject.toml lives).
 """
 
 import base64
+import json
 import os
 from io import BytesIO
 from pathlib import Path
@@ -27,7 +28,9 @@ from httpx import Response
 from typing import List, Dict, Any, Optional
 
 from dermascan.ai_service.modal.medgemma_service.model import load_medgemma_pipeline
+from dermascan.ai_service.modal.medgemma_service.confidence_score import compute_confidence_score
 from dermascan.ai_service.modal.model_config.loader import ModelConfig, load_config
+
 from dermascan.shared import get_logger
 from dermascan.shared.time_it import timeit
 
@@ -73,6 +76,13 @@ app: modal.App = modal.App("dermascan-medgemma")
 
 # Logger initialization
 log: logging.Logger = get_logger(__name__)
+
+# System prompt to force structured JSON output for diagnosis responses
+_STRUCTURED_SYSTEM_PROMPT: str = (
+    "You are a medical diagnosis assistant. Respond only with compact JSON of the form "
+    '{"diagnosis": "<short diagnosis>", "rationale": "<1-3 bullet sentences>"}, "summary": "<1-2 sentence summary>", "treatment": "<1-2 sentence treatment if requested>". '
+    "Do not include Markdown, preamble, or extra keys."
+)
 
 # Create class for MedGemma service, runs on A10G GPU with specified image and secrets
 @app.cls(
@@ -272,13 +282,14 @@ class MedGemmaService:
         b64: str = base64.b64encode(image_bytes).decode("ascii")
         data_url: str = f"data:image/jpeg;base64,{b64}"
         return [
+            {"role": "system", "content": _STRUCTURED_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": [
                     {"type": "image_url", "image_url": {"url": data_url}},
                     {"type": "text", "text": prompt},
                 ],
-            }
+            },
         ]
 
     # Infer one image with MedGemma
@@ -309,7 +320,7 @@ class MedGemmaService:
 
     # Infer one image with vLLM
     @timeit("MedGemma vLLM inference")
-    def _infer_one_vllm(self, *, image_bytes: bytes, prompt: str) -> str:
+    def _infer_one_vllm(self, *, image_bytes: bytes, prompt: str) -> dict[str, Any]:
         """
         Infer one image with vLLM.
         
@@ -327,6 +338,8 @@ class MedGemmaService:
             "messages": self._vllm_messages(image_bytes=image_bytes, prompt=prompt),
             "temperature": self.cfg.temperature,
             "max_tokens": self.cfg.max_new_tokens,
+            "response_format": {"type": "json_object"},
+            "logprobs": True,
         }
 
         # Call vLLM server, pass the payload as JSON
@@ -335,11 +348,13 @@ class MedGemmaService:
 
         # Parse the response
         data: Dict[str, Any] = r.json()
-        return data["choices"][0]["message"]["content"]
+        content: str = data["choices"][0]["message"]["content"]
+        confidence: float = compute_confidence_score(data)
+        return {"text": content, "confidence": confidence}
 
     # Run one inference
     @modal.method()
-    def run_one(self, image_bytes: bytes, prompt: str) -> tuple[str, str]:
+    def run_one(self, image_bytes: bytes, prompt: str) -> tuple[str, Dict[str, Any]]:
         """
         Run one inference request.
         
@@ -354,15 +369,16 @@ class MedGemmaService:
         """
         log.info("Request received: boot_id=%s", self.boot_id)
         if getattr(self, "_engine", "transformers") == "vllm":
-            text: str = self._infer_one_vllm(image_bytes=image_bytes, prompt=prompt)
+            result: Dict[str, Any] = self._infer_one_vllm(image_bytes=image_bytes, prompt=prompt)
         else:
             img: Image.Image = self._decode_image_bytes(image_bytes)
             text: str = self._infer_one(img=img, prompt=prompt)
-        return self.boot_id, text
+            result = {"text": text, "confidence": None}
+        return self.boot_id, result
 
     # Run batched inference requests
     @modal.method()
-    def run_batch(self, requests: list[tuple[bytes, str]]) -> tuple[str, list[str]]:
+    def run_batch(self, requests: list[tuple[bytes, str]]) -> tuple[str, list[Dict[str, Any]]]:
         """
         Run batched inference requests.
         
@@ -375,13 +391,13 @@ class MedGemmaService:
             Tuple of (boot_id, list of generated texts)
         """
         log.info("Batch request received: boot_id=%s, size=%s", self.boot_id, len(requests))
-        outputs: List[str] = []
+        outputs: List[Dict[str, Any]] = []
 
         # Use vLLM for batch inference
         if getattr(self, "_engine", "transformers") == "vllm":
 
             # Define async function to run all requests
-            async def _run_all() -> list[str]:
+            async def _run_all() -> list[Dict[str, Any]]:
 
                 # Create HTTP client
                 async with httpx.AsyncClient(timeout=None) as client:
@@ -392,16 +408,21 @@ class MedGemmaService:
                             "messages": self._vllm_messages(image_bytes=image_bytes, prompt=prompt),
                             "temperature": self.cfg.temperature,
                             "max_tokens": self.cfg.max_new_tokens,
+                            "response_format": {"type": "json_object"},
+                            "logprobs": True,
                         }
                         tasks.append(
                             client.post(f"{self._vllm_base_url}/v1/chat/completions", json=payload)
                         )
                     responses = await asyncio.gather(*tasks)
-                    texts: list[str] = []
+                    texts: list[Dict[str, Any]] = []
                     for resp in responses:
                         resp.raise_for_status()
                         data = resp.json()
-                        texts.append(data["choices"][0]["message"]["content"])
+                        print(data)
+                        content: str = data["choices"][0]["message"]["content"]
+                        confidence: float = compute_confidence_score(data)
+                        texts.append({"text": content, "confidence": confidence})
                     return texts
 
             import asyncio
@@ -413,7 +434,7 @@ class MedGemmaService:
             # Use local MedGemma model
             for image_bytes, prompt in requests:
                 img = self._decode_image_bytes(image_bytes)
-                outputs.append(self._infer_one(img=img, prompt=prompt))
+                outputs.append({"text": self._infer_one(img=img, prompt=prompt), "confidence": None})
         return self.boot_id, outputs
 
     @modal.method()

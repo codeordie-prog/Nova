@@ -61,6 +61,7 @@ class JobStatusResponse(BaseModel):
     status: str
     boot_id: Optional[str] = None
     text: Optional[str] = None
+    confidence: Optional[float] = None
     error: Optional[str] = None
 
 
