@@ -37,6 +37,10 @@ class _ModelConfigDict(TypedDict):
     image_size: int
     revision: str
     dtype: str
+    gpu_memory_utilization: float
+    max_model_len: int
+    max_num_seqs: int
+    max_num_batched_tokens: int
 
 
 @dataclass(frozen=True)
@@ -60,7 +64,15 @@ class ModelConfig:
         revision: Git revision/branch of the model repository
             (e.g. ``\"main\"``).
         dtype: Model weight dtype as string
-            (e.g. ``\"bfloat16\"``, ``\"float16\"``).
+            (e.g. ``\"bfloat16\"``, ``\"float16\"``),
+        gpu_memory_utilization: Fraction of GPU memory to use for the model
+            (e.g. ``0.85``).
+        max_model_len: Maximum sequence length the model can handle
+            (e.g. ``1536``).
+        max_num_seqs: Maximum number of concurrent sequences
+            (e.g. ``24``).
+        max_num_batched_tokens: Maximum number of tokens that can be batched
+            (e.g. ``8192``).
     """
 
     model_id: str
@@ -70,6 +82,10 @@ class ModelConfig:
     image_size: int
     revision: str
     dtype: str
+    gpu_memory_utilization: float
+    max_model_len: int
+    max_num_seqs: int
+    max_num_batched_tokens: int
 
 # Create a fallback default configs
 DEFAULT_CONFIGS: Final["ModelConfig"] = ModelConfig(
@@ -80,6 +96,10 @@ DEFAULT_CONFIGS: Final["ModelConfig"] = ModelConfig(
     image_size=1024,
     revision="main",
     dtype="bfloat16",
+    gpu_memory_utilization=0.85,
+    max_model_len=1536,
+    max_num_seqs=24,
+    max_num_batched_tokens=8192,
 )
 
 def load_config(path: Path | None = None) -> ModelConfig:
@@ -118,6 +138,10 @@ def load_config(path: Path | None = None) -> ModelConfig:
             image_size=int(data["image_size"]),
             revision=str(data["revision"]),
             dtype=str(data["dtype"]),
+            gpu_memory_utilization=float(data["gpu_memory_utilization"]),
+            max_model_len=int(data["max_model_len"]),
+            max_num_seqs=int(data["max_num_seqs"]),
+            max_num_batched_tokens=int(data["max_num_batched_tokens"]),
         )
 
         _log.info(

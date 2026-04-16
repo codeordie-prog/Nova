@@ -86,10 +86,11 @@ _STRUCTURED_SYSTEM_PROMPT: str = (
 
 # Create class for MedGemma service, runs on A10G GPU with specified image and secrets
 @app.cls(
-    gpu="A10G",
+    gpu="L4",
     image=image,
     secrets=[hf_secret],
     max_containers=1,
+    scaledown_window=600,
 )
 class MedGemmaService:
     """
@@ -156,6 +157,10 @@ class MedGemmaService:
         """
         # Build vLLM command
         model_id: str = self.cfg.model_id
+        gpu_memory_utilization: float = self.cfg.gpu_memory_utilization
+        max_model_len: int = self.cfg.max_model_len
+        max_num_seqs: int = self.cfg.max_num_seqs
+        max_num_batched_tokens: int = self.cfg.max_num_batched_tokens
 
         # Build command - vLLM server
         cmd: list[str] = [
@@ -168,6 +173,14 @@ class MedGemmaService:
             "8000",
             "--model",
             model_id,
+            "--gpu-memory-utilization",
+            str(gpu_memory_utilization),
+            "--max-model-len",
+            str(max_model_len),
+            "--max-num-seqs",
+            str(max_num_seqs),
+            "--max-num-batched-tokens",
+            str(max_num_batched_tokens),
         ]
 
         # Set environment variables
