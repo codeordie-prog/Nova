@@ -89,7 +89,8 @@ _STRUCTURED_SYSTEM_PROMPT: str = (
     gpu="L4",
     image=image,
     secrets=[hf_secret],
-    max_containers=1,
+    max_containers=2,
+    min_containers=2,
     scaledown_window=600,
 )
 class MedGemmaService:

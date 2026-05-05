@@ -53,6 +53,8 @@ from dermascan.ai_service.modal.medgemma_service.gateways.global_rate_limiter im
     _enforce_global_rate_limit,
 )
 
+from dermascan.ai_service.modal.medgemma_service.worker import _ensure_consumer_group
+
 # Create FastAPI app
 web_app = FastAPI(title="DermaScan MedGemma API", version="0.1")
 
@@ -68,13 +70,58 @@ _JOB_TTL_S: int = int(os.environ.get("MEDGEMMA_JOB_TTL_S", "86400"))
 _MAX_QUEUE_LEN_HARD: int = int(os.environ.get("MAX_QUEUE_LEN_HARD", "350"))
 _ENQUEUE_CAPACITY_RETRIES: int = int(os.environ.get("MEDGEMMA_ENQUEUE_CAPACITY_RETRIES", "5"))
 _RETRY_AFTER_SECONDS: str = os.environ.get("MEDGEMMA_RETRY_AFTER_SECONDS", "1")
+_CONSUMER_GROUP: str = os.environ.get("MEDGEMMA_CONSUMER_GROUP", "medgemma-workers")
+_STREAM_MAXLEN: int = int(os.environ.get("MEDGEMMA_STREAM_MAXLEN", "5000"))
+_RETRY_ON_RED_ATTEMPTS: int = int(os.environ.get("MEDGEMMA_RETRY_ON_RED_ATTEMPTS", "2"))
+_RETRY_ON_RED_DELAY_MS: int = int(os.environ.get("MEDGEMMA_RETRY_ON_RED_DELAY_MS", "200"))
+_ENQUEUE_RETRY_ATTEMPTS: int = int(os.environ.get("MEDGEMMA_ENQUEUE_RETRY_ATTEMPTS", "2"))
+_ENQUEUE_RETRY_DELAY_MS: int = int(os.environ.get("MEDGEMMA_ENQUEUE_RETRY_DELAY_MS", "200"))
+
+
+def _get_pending_count() -> int:
+    """Return the number of pending (delivered, unacked) messages in the stream."""
+    _ensure_consumer_group()
+    summary = _redis.xpending(_JOB_STREAM, _CONSUMER_GROUP)
+    if isinstance(summary, dict):
+        return int(summary.get("pending", 0))
+    return 0
+
+
+async def _wait_for_capacity_with_retry() -> tuple[str, int]:
+    """Retry queue pressure checks a few times before giving up."""
+    state, depth = await _wait_for_queue_capacity()
+    for _ in range(_RETRY_ON_RED_ATTEMPTS):
+        if state != "red":
+            break
+        await anyio.sleep(_RETRY_ON_RED_DELAY_MS / 1000.0)
+        state, depth = await _wait_for_queue_capacity()
+    return state, depth
+
+
+async def _enqueue_with_retry(func, *args):
+    """Retry enqueue when capacity briefly exceeds thresholds."""
+    for attempt in range(_ENQUEUE_RETRY_ATTEMPTS + 1):
+        try:
+            return await anyio.to_thread.run_sync(func, *args)
+        except QueueCapacityExceededError:
+            if attempt >= _ENQUEUE_RETRY_ATTEMPTS:
+                raise
+            await anyio.sleep(_ENQUEUE_RETRY_DELAY_MS / 1000.0)
 
 
 class QueueCapacityExceededError(RuntimeError):
     """Raised when queue capacity is saturated at enqueue time."""
 
 # enqueue job function
-def _enqueue_job(image_bytes: bytes, prompt: str) -> str:
+def _enqueue_job(
+    image_bytes: bytes,
+    prompt: str,
+    request_id: str = "",
+    case_id: str = "",
+    client_id: str = "",
+    message_id: str = "",
+    channel: str = "",
+) -> str:
     """
     Enqueue a job to the Redis stream.
     This function uses Atomic enqueue gating principle.
@@ -112,8 +159,8 @@ def _enqueue_job(image_bytes: bytes, prompt: str) -> str:
                 # Watch the job stream to detect concurrent modifications
                 pipe.watch(_JOB_STREAM)
 
-                # Check the current queue length
-                queue_len: int = int(_redis.xlen(_JOB_STREAM))
+                # Check the current pending depth (delivered but unacked)
+                queue_len: int = _get_pending_count()
 
                 # If the queue is at hard capacity, unwatch and raise an error
                 if queue_len >= _MAX_QUEUE_LEN_HARD:
@@ -138,7 +185,14 @@ def _enqueue_job(image_bytes: bytes, prompt: str) -> str:
                         "prompt": prompt,
                         "image_base64": image_b64,
                         "created_at": str(now_s),
+                        "request_id": request_id,
+                        "case_id": case_id,
+                        "client_id": client_id,
+                        "message_id": message_id,
+                        "channel": channel,
                     },
+                    maxlen=_STREAM_MAXLEN,
+                    approximate=True,
                 )
                 pipe.execute()
                 return job_id
@@ -178,7 +232,7 @@ def _enqueue_jobs_batch(jobs: list[tuple[bytes, str]]) -> list[str]:
         try:
             with _redis.pipeline(transaction=True) as pipe:
                 pipe.watch(_JOB_STREAM)
-                queue_len: int = int(_redis.xlen(_JOB_STREAM))
+                queue_len: int = _get_pending_count()
                 if queue_len + required_slots > _MAX_QUEUE_LEN_HARD:
                     pipe.unwatch()
                     raise QueueCapacityExceededError("queue is at hard capacity")
@@ -202,6 +256,8 @@ def _enqueue_jobs_batch(jobs: list[tuple[bytes, str]]) -> list[str]:
                             "image_base64": image_b64,
                             "created_at": now_s,
                         },
+                        maxlen=_STREAM_MAXLEN,
+                        approximate=True,
                     )
                 pipe.execute()
                 return job_ids
@@ -256,8 +312,8 @@ async def diagnose(
         image_bytes: bytes = await _read_upload_limited(image, max_bytes=MAX_IMAGE_BYTES)
         _validate_image_bytes(image_bytes)
 
-        # Check queue capacity
-        state, _ = await _wait_for_queue_capacity()
+        # Check queue capacity with retry
+        state, _ = await _wait_for_capacity_with_retry()
 
         if state == "red":
             raise HTTPException(
@@ -266,8 +322,8 @@ async def diagnose(
                 headers={"Retry-After": _RETRY_AFTER_SECONDS},
             )
 
-        # Enqueue job
-        job_id: str = await anyio.to_thread.run_sync(_enqueue_job, image_bytes, prompt)
+        # Enqueue job with retry on contention
+        job_id: str = await _enqueue_with_retry(_enqueue_job, image_bytes, prompt)
 
         return EnqueueResponse(job_id=job_id, status="queued")
 
@@ -354,8 +410,8 @@ async def diagnose_batch(
             _validate_image_bytes(img_bytes)
             enqueue_jobs.append((img_bytes, p))
 
-        # Check queue capacity
-        state, _ = await _wait_for_queue_capacity()
+        # Check queue capacity with retry
+        state, _ = await _wait_for_capacity_with_retry()
 
         if state == "red":
             raise HTTPException(
@@ -364,7 +420,7 @@ async def diagnose_batch(
                 headers={"Retry-After": _RETRY_AFTER_SECONDS},
             )
 
-        job_ids: list[str] = await anyio.to_thread.run_sync(_enqueue_jobs_batch, enqueue_jobs)
+        job_ids: list[str] = await _enqueue_with_retry(_enqueue_jobs_batch, enqueue_jobs)
 
         return BatchEnqueueResponse(job_ids=job_ids, status="queued")
         
@@ -428,8 +484,8 @@ async def diagnose_base64(
 
         _validate_image_bytes(image_bytes)
 
-        # Check queue capacity
-        state, _ = await _wait_for_queue_capacity()
+        # Check queue capacity with retry
+        state, _ = await _wait_for_capacity_with_retry()
 
         if state == "red":
             raise HTTPException(
@@ -438,7 +494,16 @@ async def diagnose_base64(
                 headers={"Retry-After": _RETRY_AFTER_SECONDS},
             )
 
-        job_id: str = await anyio.to_thread.run_sync(_enqueue_job, image_bytes, payload.prompt)
+        job_id: str = await _enqueue_with_retry(
+            _enqueue_job,
+            image_bytes,
+            payload.prompt,
+            str(payload.request_id or ""),
+            str(payload.case_id or payload.request_id or ""),
+            str(payload.client_id or ""),
+            str(payload.message_id or payload.request_id or ""),
+            str(payload.channel or ""),
+        )
         return EnqueueResponse(job_id=job_id, status="queued")
 
     except HTTPException:

@@ -4,8 +4,11 @@ Date: 2026-4-14
 Licence: MIT
 
 This module computes the diagnosis confidence score of the model.
-The logic here is extract the diagnosis text from the response, map its logarithmic probabilities, get the mean of the logarithmic probabilities,
-and return the exponential of the mean - the probability (which is in [0,1]).
+The logic here is:
+1. extract the diagnosis text from the response, 
+2. map its logarithmic probabilities, 
+3. get the mean of the logarithmic probabilities,
+4. return the exponential of the mean - the probability (which is in [0,1]).
 
 """
 

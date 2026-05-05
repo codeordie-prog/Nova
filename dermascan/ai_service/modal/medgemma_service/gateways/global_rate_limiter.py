@@ -28,7 +28,7 @@ from dermascan.shared.logger import get_logger
 
 
 _DEFAULT_CONFIGS: dict[str, int | str] = {
-    "request_per_minute": 70,
+    "request_per_minute": 90,
     "window_seconds": 60,
     "key_prefix": "medgemma:rate_limit:global",
 }

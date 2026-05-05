@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import os
 import socket
 import time
+import uuid
 from typing import Any
 
 from redis import Redis
@@ -38,7 +39,13 @@ _BATCH_WINDOW_S: int = float(os.environ.get("MEDGEMMA_BATCH_WINDOW_S", "2.0"))
 _BLOCK_MS: int = int(os.environ.get("MEDGEMMA_STREAM_BLOCK_MS", "500"))
 _MAX_INFLIGHT: int = max(1, int(os.environ.get("MEDGEMMA_MAX_INFLIGHT", "12")))
 _CONSUMER_GROUP: str = os.environ.get("MEDGEMMA_CONSUMER_GROUP", "medgemma-workers")
-_CONSUMER_NAME: str = os.environ.get("MEDGEMMA_CONSUMER_NAME", socket.gethostname())
+_CONSUMER_NAME_BASE: str = os.environ.get("MEDGEMMA_CONSUMER_NAME", "medgemma-worker")
+_CONSUMER_NAME: str = f"{_CONSUMER_NAME_BASE}-{socket.gethostname()}-{os.getpid()}"
+_EVENTS_STREAM: str = os.environ.get("EVENTS_STREAM", "events:stream")
+_ORCHESTRATOR_SIGNAL_STREAM: str = os.environ.get("ORCHESTRATOR_SIGNAL_STREAM", "orchestrator:signals")
+_ESCALATION_STREAM: str = os.environ.get("ESCALATION_STREAM", "escalation:jobs")
+_EVENTS_STREAM_MAXLEN: int = int(os.environ.get("WORKERS_STREAM_MAXLEN", "5000"))
+_DIAGNOSE_CONFIDENCE_THRESHOLD: float = float(os.environ.get("DIAGNOSE_CONFIDENCE_THRESHOLD", "0.75"))
 
 
 @dataclass
@@ -50,6 +57,199 @@ class _JobEntry:
     prompt: str
     image_bytes: bytes
     msg_id: str
+    request_id: str
+    case_id: str
+    client_id: str
+    message_id: str
+    channel: str
+
+
+def _to_str(value: Any) -> str:
+    """
+    Convert a value to a string, handling bytes and None.
+    
+    Args:
+        value: The value to convert
+        
+    Returns:
+        The string representation of the value
+    """
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="ignore")
+    return "" if value is None else str(value)
+
+
+def _to_float(value: Any) -> float | None:
+    """
+    Convert a value to a float, handling None.
+    
+    Args:
+        value: The value to convert
+        
+    Returns:
+        The float representation of the value, or None if conversion fails
+    """
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _emit_case_event(fields: dict[str, Any]) -> None:
+    """
+    Emit a case event to the events stream.
+    
+    Args:
+        fields: The fields to emit
+    """
+    try:
+        _redis.xadd(
+            _EVENTS_STREAM,
+            {k: _to_str(v) for k, v in fields.items()},
+            maxlen=_EVENTS_STREAM_MAXLEN,
+            approximate=True,
+        )
+    except Exception:
+        logger.exception("failed to append medgemma event")
+
+
+def _push_escalation(entry: _JobEntry, text: str, confidence: float | None) -> None:
+    """
+    Push an escalation event to the escalation stream.
+    
+    This is used when the confidence score is below the threshold.
+    
+    Args:
+        entry: The job entry
+        text: The diagnosis text
+        confidence: The confidence score
+    """
+    _redis.xadd(
+        _ESCALATION_STREAM,
+        {
+            "request_id": entry.request_id,
+            "case_id": entry.case_id,
+            "client_id": entry.client_id,
+            "message_id": entry.message_id,
+            "channel": entry.channel,
+            "source_agent": "medgemma",
+            "reason": "low_confidence",
+            "confidence": "" if confidence is None else str(confidence),
+            "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
+            "diagnosis_text": text,
+            "requires_human_review": "true",
+        },
+        maxlen=_EVENTS_STREAM_MAXLEN,
+        approximate=True,
+    )
+
+
+def _push_signal(entry: _JobEntry, text: str, confidence: float | None) -> None:
+    """
+    Push a signal to the orchestrator signal stream.
+    
+    This is used to notify the orchestrator that the diagnosis is complete.
+    
+    Args:
+        entry: The job entry
+        text: The diagnosis text
+        confidence: The confidence score
+    """
+    _redis.xadd(
+        _ORCHESTRATOR_SIGNAL_STREAM,
+        {
+            "signal_type": "diagnose_completed",
+            "signal_id": uuid.uuid4().hex,
+            "request_id": entry.request_id,
+            "case_id": entry.case_id,
+            "client_id": entry.client_id,
+            "message_id": entry.message_id,
+            "channel": entry.channel,
+            "source_event_id": "",
+            "payload": json.dumps(
+                {
+                    "diagnosis_text": text,
+                    "confidence": confidence,
+                    "threshold": _DIAGNOSE_CONFIDENCE_THRESHOLD,
+                    "escalation": False,
+                },
+                default=str,
+            ),
+            "notes": "The diagnosis inference completed above threshold",
+        },
+        maxlen=_EVENTS_STREAM_MAXLEN,
+        approximate=True,
+    )
+
+
+def _route_case_after_inference(entry: _JobEntry, text: str, confidence: float | None) -> bool:
+    """
+    Route the case after inference.
+    
+    This determines whether the case should be escalated based on the confidence score.
+    
+    Args:
+        entry: The job entry
+        text: The diagnosis text
+        confidence: The confidence score
+        
+    Returns:
+        True if the case should be escalated, False otherwise
+    """
+    escalate = confidence is None or confidence < _DIAGNOSE_CONFIDENCE_THRESHOLD
+
+    _emit_case_event(
+        {
+            "request_id": entry.request_id,
+            "case_id": entry.case_id,
+            "client_id": entry.client_id,
+            "message_id": entry.message_id,
+            "channel": entry.channel,
+            "agent": "medgemma",
+            "status": "diagnose_inference_completed",
+            "confidence": "" if confidence is None else str(confidence),
+            "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
+            "escalation": str(escalate).lower(),
+            "escalation_note":"Diagnosis confidence fell below threshold"
+        }
+    )
+
+    if escalate:
+        _push_escalation(entry, text, confidence)
+        _emit_case_event(
+            {
+                "request_id": entry.request_id,
+                "case_id": entry.case_id,
+                "client_id": entry.client_id,
+                "message_id": entry.message_id,
+                "channel": entry.channel,
+                "agent": "medgemma",
+                "status": "diagnose_escalated",
+                "confidence": "" if confidence is None else str(confidence),
+                "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
+                "escalation": "true",
+            }
+        )
+        return True
+
+    _push_signal(entry, text, confidence)
+    _emit_case_event(
+        {
+            "request_id": entry.request_id,
+            "case_id": entry.case_id,
+            "client_id": entry.client_id,
+            "message_id": entry.message_id,
+            "channel": entry.channel,
+            "agent": "medgemma",
+            "status": "diagnose_signal_emitted",
+            "confidence": "" if confidence is None else str(confidence),
+            "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
+            "escalation": "false",
+        }
+    )
+    return False
 
 # Generate a Redis key for a job
 def _job_key(job_id: str) -> str:
@@ -169,6 +369,7 @@ def _dispatch_message(msg_id: str, payload: dict[str, Any], service: MedGemmaSer
 
         # Acknowledge the message to remove it from the stream
         _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id)
+        _redis.xdel(_JOB_STREAM, msg_id)
         return
 
     attempts: int = _start_attempt(job_id)
@@ -181,6 +382,7 @@ def _dispatch_message(msg_id: str, payload: dict[str, Any], service: MedGemmaSer
 
         # Acknowledge the message to remove it from the stream
         _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id)
+        _redis.xdel(_JOB_STREAM, msg_id)
         return None
 
     # Extract prompt and image from payload
@@ -196,6 +398,7 @@ def _dispatch_message(msg_id: str, payload: dict[str, Any], service: MedGemmaSer
         
         # Acknowledge the message to remove it from the stream
         _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id)
+        _redis.xdel(_JOB_STREAM, msg_id)
         return None
 
     try:
@@ -212,6 +415,7 @@ def _dispatch_message(msg_id: str, payload: dict[str, Any], service: MedGemmaSer
         
         # Acknowledge the message to remove it from the stream
         _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id)
+        _redis.xdel(_JOB_STREAM, msg_id)
         logger.info("message acked after dispatch failure: msg_id=%s", msg_id)
         return None
 
@@ -261,6 +465,7 @@ def _collect_batch() -> list[_JobEntry]:
                 if not job_id:
                     # Malformed message
                     _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id_str)
+                    _redis.xdel(_JOB_STREAM, msg_id_str)
                     continue
 
                 image_b64_raw: Any = payload.get("image_base64")
@@ -279,6 +484,7 @@ def _collect_batch() -> list[_JobEntry]:
                     # Malformed message
                     _mark_status(job_id, status="failed", error="missing image_base64", finished_at=str(int(time.time())))
                     _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id_str)
+                    _redis.xdel(_JOB_STREAM, msg_id_str)
                     continue
                 
                 try:
@@ -288,12 +494,14 @@ def _collect_batch() -> list[_JobEntry]:
                     _mark_status(job_id, status = "failed", error = f"Failed to decode image_base64: {e}")
                     logger.error("Failed to decode image_base64: %s", e)
                     _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id_str)
+                    _redis.xdel(_JOB_STREAM, msg_id_str)
                     continue
 
                 attempts: int = _start_attempt(job_id)
                 if attempts > _MAX_ATTEMPTS:
                     _mark_status(job_id, status="failed", error="Max attempts reached")
                     _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id_str)
+                    _redis.xdel(_JOB_STREAM, msg_id_str)
                     continue
 
                 batch.append(
@@ -301,6 +509,11 @@ def _collect_batch() -> list[_JobEntry]:
                         job_id=job_id,
                         msg_id=msg_id_str,
                         image_bytes=image_bytes,
+                        request_id=_to_str(payload.get("request_id") or payload.get(b"request_id")),
+                        case_id=_to_str(payload.get("case_id") or payload.get(b"case_id")),
+                        client_id=_to_str(payload.get("client_id") or payload.get(b"client_id")),
+                        message_id=_to_str(payload.get("message_id") or payload.get(b"message_id")),
+                        channel=_to_str(payload.get("channel") or payload.get(b"channel")),
                         prompt=(
                             payload.get("prompt")
                             or payload.get(b"prompt")
@@ -332,22 +545,27 @@ def _collect_batch_result(batch: list[_JobEntry], call_handle: Any) -> None:
 
         for entry, text in zip(batch, texts, strict=True):
             text_str: str
-            confidence: str | None = None
+            confidence_str: str | None = None
+            confidence_num: float | None = None
             if isinstance(text, dict):
                 confidence_val = text.get("confidence")
-                confidence = str(confidence_val) if confidence_val is not None else None
+                confidence_num = _to_float(confidence_val)
+                confidence_str = str(confidence_val) if confidence_val is not None else None
                 text_str = json.dumps(text)
             else:
                 text_str = str(text)
+
+            _route_case_after_inference(entry, text_str, confidence_num)
             _mark_status(
                 entry.job_id,
                 status="done",
                 boot_id=boot_id,
                 text=text_str,
-                confidence=confidence,
+                confidence=confidence_str,
                 finished_at=str(int(time.time())),
             )
             _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, entry.msg_id)
+            _redis.xdel(_JOB_STREAM, entry.msg_id)
 
         logger.info("batch inference done: size=%s boot_id=%s", len(batch), boot_id)
 
@@ -361,6 +579,7 @@ def _collect_batch_result(batch: list[_JobEntry], call_handle: Any) -> None:
                 finished_at=str(int(time.time())),
             )
             _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, entry.msg_id)
+            _redis.xdel(_JOB_STREAM, entry.msg_id)
 
 def _collect_result(job_id: str, msg_id: str, call_handle: Any) -> None:
     """
@@ -391,11 +610,13 @@ def _collect_result(job_id: str, msg_id: str, call_handle: Any) -> None:
             finished_at=str(int(time.time())),
         )
         _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id)
+        _redis.xdel(_JOB_STREAM, msg_id)
         logger.info("message acked: msg_id=%s", msg_id)
     except Exception as e:
         logger.exception("inference failed: job_id=%s", job_id)
         _mark_status(job_id, status="failed", error=str(e), finished_at=str(int(time.time())))
         _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id)
+        _redis.xdel(_JOB_STREAM, msg_id)
         logger.info("message acked after failure: msg_id=%s", msg_id)
 
 
@@ -506,6 +727,7 @@ def run_worker_forever() -> None:
                             finished_at=str(int(time.time())),
                         )
                         _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, entry.msg_id)
+                        _redis.xdel(_JOB_STREAM, entry.msg_id)
 
 
 if __name__ == "__main__":

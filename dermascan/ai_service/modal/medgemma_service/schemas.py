@@ -17,6 +17,11 @@ class DiagnoseBase64Request(BaseModel):
 
     image_base64: str = Field(min_length=1)
     prompt: str = Field(min_length=1)
+    request_id: Optional[str] = None
+    case_id: Optional[str] = None
+    client_id: Optional[str] = None
+    message_id: Optional[str] = None
+    channel: Optional[str] = None
 
 # Pydantic model for response.
 class DiagnoseResponse(BaseModel):

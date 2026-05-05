@@ -50,6 +50,36 @@ See:
 - `dermascan/ai_service/modal/medgemma_service/README.md`
 - `dermascan/ai_service/modal/medgemma_service/gateways/README.md`
 
+## Backend Quickstart
+
+This section documents the backend API entrypoint and the currently active API endpoints.
+
+### Main entry point
+
+- FastAPI app module: `dermascan/backend/app/main.py`
+- App object: `app`
+
+Run on port `8087`:
+
+```bash
+poetry run uvicorn dermascan.backend.app.main:app --host 0.0.0.0 --port 8087 --reload
+```
+
+### API endpoints
+
+Router prefix is `/v1` (from `dermascan/backend/api/endpoints.py`).
+
+- `GET /health`
+- `POST /v1/orchestrator/requests`
+- `POST /v1/orchestrator/requests/batch`
+- `GET /v1/orchestrator/requests/{request_id}`
+- `POST /v1/media/test/upload`
+- `POST /v1/webhooks/whatsapp`
+- `POST /v1/webhooks/telegram`
+
+For worker startup and backend operational details, see:
+- `dermascan/backend/README.md`
+
 ## Project Structure
 
 - **frontend**: Web UI and client-side application.

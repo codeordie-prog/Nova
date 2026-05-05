@@ -12,27 +12,34 @@ import anyio
 import redis
 
 from dermascan.ai_service.modal.medgemma_service.redis_client import redis_client_from_env
-
+from dermascan.ai_service.modal.medgemma_service.worker import _ensure_consumer_group
 
 _MAX_QUEUE_LEN_SOFT = max(1, int(os.environ.get("MAX_QUEUE_LEN_SOFT", 200)))
 _MAX_QUEUE_LEN_HARD = max(_MAX_QUEUE_LEN_SOFT + 1, int(os.environ.get("MAX_QUEUE_LEN_HARD", 350)))
-_API_WAIT_BUDGET_MS = max(0, int(os.environ.get("API_WAIT_BUDGET_MS", 150)))
+_API_WAIT_BUDGET_MS = max(0, int(os.environ.get("API_WAIT_BUDGET_MS", 200)))
 _API_WAIT_STEP_MS = max(1, int(os.environ.get("API_WAIT_STEP_MS", 25)))
 
 _JOB_STREAM = os.environ.get("MEDGEMMA_JOB_STREAM", "medgemma:jobs")
+_CONSUMER_GROUP = os.environ.get("MEDGEMMA_CONSUMER_GROUP", "medgemma-workers")
 
 # get redis client
 _redis: redis.Redis = redis_client_from_env().get_redis()
 
 def _get_queue_depth() -> int:
     """
-    Get the current queue depth.
+    Get the current queue depth using pending (delivered, not yet acknowledged) messages.
+    This is more representative of actual backlog than raw XLEN, which includes tombstones.
     
     Returns:
-        int: The current queue depth.
+        int: The current pending depth.
     """
     try:
-        return _redis.xlen(_JOB_STREAM)
+        # Ensure consumer group first
+        _ensure_consumer_group()
+
+        summary = _redis.xpending(_JOB_STREAM, _CONSUMER_GROUP)
+        pending_count: int = int(summary.get("pending", 0)) if isinstance(summary, dict) else 0
+        return pending_count
     except redis.RedisError:
         raise
 

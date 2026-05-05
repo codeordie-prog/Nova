@@ -1,7 +1,7 @@
 
 {
     "rate_limiter": {
-        "max_requests_per_minute": 60,
+        "max_requests_per_minute": 90,
         "max_requests_per_hour": 1000
     },
     "max_concurrency":60,
@@ -9,7 +9,7 @@
     "rate_limit_window":60,
     
     "global_rate_limiter": {
-        "request_per_minute": 70,
+        "request_per_minute": 90,
         "window_seconds":60,
         "key_prefix":"medgemma:rate_limit:global"
     }
