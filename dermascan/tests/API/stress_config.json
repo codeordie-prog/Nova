@@ -1,0 +1,9 @@
+{
+  "base_url": "http://localhost:8080",
+  "prompt": "Diagnose skin condition",
+  "http_timeout": 120,
+  "concurrency_levels": [5, 10, 20, 40, 60, 70],
+  "p95_concurrency": 20,
+  "p95_rounds": 3,
+  "bucket_pause_seconds": 65
+}

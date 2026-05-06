@@ -1,0 +1,108 @@
+{
+
+    "diagnose_agents":[{
+
+        "name": "qutis-1.0-google",
+        "description": "Agent for diagnosing skin conditions",
+        "model":"gemini-2.5-flash",
+        "temperature": 0.0,
+        "max_tokens": 1000,
+        "top_p": 0.95,
+        "top_k": 40
+
+    },
+
+    {
+        "name": "qutis-1.0-openai",
+        "description": "Agent for diagnosing skin conditions",
+        "model":"gpt-4o",
+        "temperature": 0.0,
+        "max_tokens": 1000,
+        "top_p": 0.95,
+        "top_k": 40
+
+    }
+    ],
+
+    "orchestrator_agents": [{
+        "name": "orchestrator-google",
+        "description": "Conversational Agent for orchestrating the diagnosis process",
+        "model":"gemini-2.5-flash",
+        "temperature": 0.0,
+        "max_tokens": 1000,
+        "top_p": 0.95,
+        "top_k": 40
+    },
+    {
+        "name": "orchestrator-openai",
+        "description": "Conversational Agent for orchestrating the diagnosis process",
+        "model":"gpt-4o",
+        "temperature": 0.0,
+        "max_tokens": 1000,
+        "top_p": 0.95,
+        "top_k": 40
+    }
+
+    ],
+
+    "validation_agents": [{
+        "name": "validator_google",
+        "description": "Agent for validating user inputs and responses",
+        "model":"gemini-2.5-flash",
+        "temperature": 0.0,
+        "max_tokens": 1000,
+        "top_p": 0.95,
+        "top_k": 40
+    },
+    
+    {
+        "name":"validator_openai",
+        "description": "Agent for validating user inputs and responses",
+        "model":"gpt-4o",
+        "temperature": 0.0,
+        "max_tokens": 1000,
+        "top_p": 0.95,
+        "top_k": 40
+    }],
+
+    "escalation_agents": [{
+        "name": "escalation_google",
+        "description": "Agent for escalating the diagnosis process to the human physician",
+        "model":"gemini-3.0-flash",
+        "temperature": 0.0,
+        "max_tokens": 1000,
+        "top_p": 0.95,
+        "top_k": 40
+    },
+    {
+        "name": "escalation_openai",
+        "description": "Agent for escalating the diagnosis process to the human physician",
+        "model":"gpt-4o",
+        "temperature": 0.0,
+        "max_tokens": 1000,
+        "top_p": 0.95,
+        "top_k": 40
+    }],
+
+    "knowledge_agents":[{
+        "name": "knowledge_google",
+        "description": "Agent for retrieving medical knowledge base information",
+        "model":"gemini-3.0-flash",
+        "temperature": 0.0,
+        "max_tokens": 1000,
+        "top_p": 0.95,
+        "top_k": 40
+    },
+
+    {
+    "name": "knowledge_openai",
+    "description": "Agent for retrieving medical knowledge base information",
+    "model":"gpt-4o",
+    "temperature": 0.0,
+    "max_tokens": 1000,
+    "top_p": 0.95,
+    "top_k": 40
+}]
+
+
+}

@@ -1,0 +1,217 @@
+"""
+Author: Dermascan Team
+Date: 2026-4-29
+
+Description: This module contains the implementation of the Escalation logic post-processing
+
+The idea relies on the confidence score threshold bar set for the diagnosis model.
+
+If the calculated confidence score falls below the threshold, the case is ESCALATED
+to a certified Physician for further assesment.
+
+In-addition to this, there are other routing logic that involve passing certain cases to
+the Physician irregardless of the confidence score - This is purposefully to improve
+the quality of the product as time goes by.
+
+"""
+import os
+import json
+import uuid
+
+from dotenv import load_dotenv
+from typing import Dict, Any
+from dataclasses import dataclass
+
+from redis import Redis
+
+# load environment variables
+load_dotenv()
+
+# Get environment variables
+_REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+_ORCHESTRATOR_SIGNAL_STREAM: str = os.environ.get("ORCHESTRATOR_SIGNAL_STREAM", "orchestrator:signals")
+_EVENTS_STREAM: str = os.environ.get("EVENTS_STREAM","events:stream")
+_ESCALATION_STREAM: str = os.environ.get("ESCALATION_STREAM", "escalation:jobs")
+_EVENTS_STREAM_MAXLEN: int = int(os.environ.get("WORKERS_STREAM_MAXLEN", "5000"))
+_DIAGNOSE_CONFIDENCE_THRESHOLD: float = float(os.environ.get("DIAGNOSE_CONFIDENCE_THRESHOLD", "0.75"))
+_ESCALATION_DLQ_STREAM: str = os.environ.get("ESCALATION_DLQ_STREAM", "escalation:dlq")
+_EVENTS_DLQ_STREAM: str = os.environ.get("EVENTS_DLQ_STREAM","events:dlq")
+
+
+# Initialize REDIS client
+_redis: Redis = Redis.from_url(_REDIS_URL)
+
+@dataclass
+class _JobEntry:
+    """
+    One Job collected during batch window
+    """
+    job_id: str
+    prompt: str
+    image_bytes: bytes
+    msg_id: str
+    request_id: str
+    case_id: str
+    client_id: str
+    message_id: str
+    channel: str
+
+
+def _to_str(value: Any) -> str:
+    """
+    Convert a value to a string, handling bytes and None.
+    
+    Args:
+        value: The value to convert
+        
+    Returns:
+        The string representation of the value
+    """
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="ignore")
+    return "" if value is None else str(value)
+
+
+def _route_case_after_inference(entry: _JobEntry, text: str, confidence: float | None) -> bool:
+    """
+    Determines whether a case should be escalated to a human expert or NOT.
+    """
+    escalate: bool = confidence is None or confidence < _DIAGNOSE_CONFIDENCE_THRESHOLD
+    # push case to EVENT stream - regardless of confidence threshold
+    _push_event(
+        {
+            "request_id": entry.request_id,
+            "case_id": entry.case_id,
+            "client_id": entry.client_id,
+            "message_id": entry.message_id,
+            "channel": entry.channel,
+            "agent": "medgemma",
+            "status": "diagnose_inference_completed",
+            "confidence": "" if confidence is None else str(confidence),
+            "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
+            "escalation": str(escalate).lower(),
+            "escalation_note": "Diagnosis confidence fell below threshold" if escalate else "",
+        }
+    )
+
+    if escalate:
+
+        _push_escalation(entry, text, confidence)
+        _push_event(
+            {
+                "request_id": entry.request_id,
+                "case_id": entry.case_id,
+                "client_id": entry.client_id,
+                "message_id": entry.message_id,
+                "channel": entry.channel,
+                "agent": "medgemma",
+                "status": "diagnose_escalated",
+                "confidence": "" if confidence is None else str(confidence),
+                "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
+                "escalation": "true",
+            }
+        )
+
+        return True
+
+    _push_signal(entry, text, confidence)
+    _push_event(
+        {
+            "request_id": entry.request_id,
+            "case_id": entry.case_id,
+            "client_id": entry.client_id,
+            "message_id": entry.message_id,
+            "channel": entry.channel,
+            "agent": "medgemma",
+            "status": "diagnose_signal_emitted",
+            "confidence": "" if confidence is None else str(confidence),
+            "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
+            "escalation": "false",
+        }
+    )
+
+    return False
+
+
+def _push_escalation(entry: _JobEntry, text: str, confidence: float | None) -> None:
+    """
+    Push a case that falls below the confidence threshold to ESCALATION STREAM.
+
+    Args:
+        entry: The job entry
+        text: The diagnosis text
+        confidence: The confidence score
+    """
+    _redis.xadd(
+        _ESCALATION_STREAM,
+        {
+            "request_id": entry.request_id,
+            "case_id": entry.case_id,
+            "client_id": entry.client_id,
+            "message_id": entry.message_id,
+            "channel": entry.channel,
+            "source_agent": "medgemma",
+            "reason": "low_confidence",
+            "confidence": "" if confidence is None else str(confidence),
+            "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
+            "diagnosis_text": text,
+            "requires_human_review": "true",
+        },
+        maxlen=_EVENTS_STREAM_MAXLEN,
+        approximate=True,
+
+    )
+
+def _push_signal(entry: _JobEntry, text: str, confidence: float | None) -> None:
+    """
+    Push a case to SIGNAL STREAM.
+
+    Args:
+        entry: The job entry
+        text: The diagnosis text
+        confidence: The confidence score
+    """
+    _redis.xadd(
+        _ORCHESTRATOR_SIGNAL_STREAM,
+        {
+            "signal_type": "diagnose_completed",
+            "signal_id": uuid.uuid4().hex,
+            "request_id": entry.request_id,
+            "case_id": entry.case_id,
+            "client_id": entry.client_id,
+            "message_id": entry.message_id,
+            "channel": entry.channel,
+            "source_event_id": "",
+            "payload": json.dumps(
+                {
+                    "diagnosis_text": text,
+                    "confidence": confidence,
+                    "threshold": _DIAGNOSE_CONFIDENCE_THRESHOLD,
+                    "escalation": False,
+                },
+                default=str,
+            ),
+            "notes": "The diagnosis inference completed above confidence threshold",
+        },
+        maxlen=_EVENTS_STREAM_MAXLEN,
+        approximate=True,
+
+    )
+
+
+def _push_event(fields: Dict[str, Any]) -> None:
+    """
+    Push a case to EVENT STREAM.
+
+    Args:
+        fields: The fields to emit
+    """
+    
+    _redis.xadd(
+        _EVENTS_STREAM,
+        {
+            k: _to_str(v) for k, v in fields.items()
+        },
+        maxlen=_EVENTS_STREAM_MAXLEN,
+        approximate=True
+    )
