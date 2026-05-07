@@ -18,13 +18,13 @@ from dataclasses import dataclass
 import os
 import socket
 import time
-import uuid
 from typing import Any
 
 from redis import Redis
 
 from dermascan.ai_service.modal.medgemma_service.app import MedGemmaService, app as modal_app
 from dermascan.ai_service.modal.medgemma_service.redis_client import redis_client_from_env
+from dermascan.ai_service.postprocessing.escalation import route_case_after_inference
 from dermascan.shared.logger import get_logger
 
 _redis = redis_client_from_env().get_redis()
@@ -41,11 +41,6 @@ _MAX_INFLIGHT: int = max(1, int(os.environ.get("MEDGEMMA_MAX_INFLIGHT", "12")))
 _CONSUMER_GROUP: str = os.environ.get("MEDGEMMA_CONSUMER_GROUP", "medgemma-workers")
 _CONSUMER_NAME_BASE: str = os.environ.get("MEDGEMMA_CONSUMER_NAME", "medgemma-worker")
 _CONSUMER_NAME: str = f"{_CONSUMER_NAME_BASE}-{socket.gethostname()}-{os.getpid()}"
-_EVENTS_STREAM: str = os.environ.get("EVENTS_STREAM", "events:stream")
-_ORCHESTRATOR_SIGNAL_STREAM: str = os.environ.get("ORCHESTRATOR_SIGNAL_STREAM", "orchestrator:signals")
-_ESCALATION_STREAM: str = os.environ.get("ESCALATION_STREAM", "escalation:jobs")
-_EVENTS_STREAM_MAXLEN: int = int(os.environ.get("WORKERS_STREAM_MAXLEN", "5000"))
-_DIAGNOSE_CONFIDENCE_THRESHOLD: float = float(os.environ.get("DIAGNOSE_CONFIDENCE_THRESHOLD", "0.75"))
 
 
 @dataclass
@@ -96,160 +91,6 @@ def _to_float(value: Any) -> float | None:
     except Exception:
         return None
 
-
-def _emit_case_event(fields: dict[str, Any]) -> None:
-    """
-    Emit a case event to the events stream.
-    
-    Args:
-        fields: The fields to emit
-    """
-    try:
-        _redis.xadd(
-            _EVENTS_STREAM,
-            {k: _to_str(v) for k, v in fields.items()},
-            maxlen=_EVENTS_STREAM_MAXLEN,
-            approximate=True,
-        )
-    except Exception:
-        logger.exception("failed to append medgemma event")
-
-
-def _push_escalation(entry: _JobEntry, text: str, confidence: float | None) -> None:
-    """
-    Push an escalation event to the escalation stream.
-    
-    This is used when the confidence score is below the threshold.
-    
-    Args:
-        entry: The job entry
-        text: The diagnosis text
-        confidence: The confidence score
-    """
-    _redis.xadd(
-        _ESCALATION_STREAM,
-        {
-            "request_id": entry.request_id,
-            "case_id": entry.case_id,
-            "client_id": entry.client_id,
-            "message_id": entry.message_id,
-            "channel": entry.channel,
-            "source_agent": "medgemma",
-            "reason": "low_confidence",
-            "confidence": "" if confidence is None else str(confidence),
-            "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
-            "diagnosis_text": text,
-            "requires_human_review": "true",
-        },
-        maxlen=_EVENTS_STREAM_MAXLEN,
-        approximate=True,
-    )
-
-
-def _push_signal(entry: _JobEntry, text: str, confidence: float | None) -> None:
-    """
-    Push a signal to the orchestrator signal stream.
-    
-    This is used to notify the orchestrator that the diagnosis is complete.
-    
-    Args:
-        entry: The job entry
-        text: The diagnosis text
-        confidence: The confidence score
-    """
-    _redis.xadd(
-        _ORCHESTRATOR_SIGNAL_STREAM,
-        {
-            "signal_type": "diagnose_completed",
-            "signal_id": uuid.uuid4().hex,
-            "request_id": entry.request_id,
-            "case_id": entry.case_id,
-            "client_id": entry.client_id,
-            "message_id": entry.message_id,
-            "channel": entry.channel,
-            "source_event_id": "",
-            "payload": json.dumps(
-                {
-                    "diagnosis_text": text,
-                    "confidence": confidence,
-                    "threshold": _DIAGNOSE_CONFIDENCE_THRESHOLD,
-                    "escalation": False,
-                },
-                default=str,
-            ),
-            "notes": "The diagnosis inference completed above threshold",
-        },
-        maxlen=_EVENTS_STREAM_MAXLEN,
-        approximate=True,
-    )
-
-
-def _route_case_after_inference(entry: _JobEntry, text: str, confidence: float | None) -> bool:
-    """
-    Route the case after inference.
-    
-    This determines whether the case should be escalated based on the confidence score.
-    
-    Args:
-        entry: The job entry
-        text: The diagnosis text
-        confidence: The confidence score
-        
-    Returns:
-        True if the case should be escalated, False otherwise
-    """
-    escalate = confidence is None or confidence < _DIAGNOSE_CONFIDENCE_THRESHOLD
-
-    _emit_case_event(
-        {
-            "request_id": entry.request_id,
-            "case_id": entry.case_id,
-            "client_id": entry.client_id,
-            "message_id": entry.message_id,
-            "channel": entry.channel,
-            "agent": "medgemma",
-            "status": "diagnose_inference_completed",
-            "confidence": "" if confidence is None else str(confidence),
-            "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
-            "escalation": str(escalate).lower(),
-            "escalation_note":"Diagnosis confidence fell below threshold"
-        }
-    )
-
-    if escalate:
-        _push_escalation(entry, text, confidence)
-        _emit_case_event(
-            {
-                "request_id": entry.request_id,
-                "case_id": entry.case_id,
-                "client_id": entry.client_id,
-                "message_id": entry.message_id,
-                "channel": entry.channel,
-                "agent": "medgemma",
-                "status": "diagnose_escalated",
-                "confidence": "" if confidence is None else str(confidence),
-                "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
-                "escalation": "true",
-            }
-        )
-        return True
-
-    _push_signal(entry, text, confidence)
-    _emit_case_event(
-        {
-            "request_id": entry.request_id,
-            "case_id": entry.case_id,
-            "client_id": entry.client_id,
-            "message_id": entry.message_id,
-            "channel": entry.channel,
-            "agent": "medgemma",
-            "status": "diagnose_signal_emitted",
-            "confidence": "" if confidence is None else str(confidence),
-            "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
-            "escalation": "false",
-        }
-    )
-    return False
 
 # Generate a Redis key for a job
 def _job_key(job_id: str) -> str:
@@ -555,7 +396,7 @@ def _collect_batch_result(batch: list[_JobEntry], call_handle: Any) -> None:
             else:
                 text_str = str(text)
 
-            _route_case_after_inference(entry, text_str, confidence_num)
+            route_case_after_inference(entry, text_str, confidence_num)
             _mark_status(
                 entry.job_id,
                 status="done",

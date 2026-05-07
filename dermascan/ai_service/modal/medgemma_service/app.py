@@ -77,14 +77,17 @@ app: modal.App = modal.App("dermascan-medgemma")
 # Logger initialization
 log: logging.Logger = get_logger(__name__)
 
-# System prompt to force structured JSON output for diagnosis responses
+# System prompt to force structured JSON output for diagnosis/product review responses
 _STRUCTURED_SYSTEM_PROMPT: str = (
-    "You are a medical diagnosis assistant. Respond only with compact JSON of the form "
-    '{"diagnosis": "<short diagnosis>", "rationale": "<1-3 bullet sentences>"}, "summary": "<1-2 sentence summary>", "treatment": "<1-2 sentence treatment if requested>". '
+    "You are a dermatology medical assistant. Respond only with compact JSON and no extra text. "
+    "Return exactly these keys: "
+    '{"diagnosis":"<short diagnosis or empty>","rationale":"<1-3 bullet sentences or empty>","summary":"<1-2 sentence summary or empty>","treatment":"<1-2 sentence treatment if requested or empty>","product_name":"<product name or empty>","description":"<product description or empty>","indications":"<indications or empty>","safety_in_pregnancy":"<pregnancy safety guidance or empty>","contraindications":"<contraindications or empty>","how_to_use":"<how to use or empty>","special_instructions":"<special instructions or empty>"}. '
+    "For product review tasks, set diagnosis, rationale, summary, and treatment to empty strings. "
+    "For diagnosis tasks, set product-related fields to empty strings. "
     "Do not include Markdown, preamble, or extra keys."
 )
 
-# Create class for MedGemma service, runs on A10G GPU with specified image and secrets
+# Create class for MedGemma service, runs on A10G/L4 GPU with specified image and secrets
 @app.cls(
     gpu="L4",
     image=image,

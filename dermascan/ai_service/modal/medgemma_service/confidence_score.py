@@ -3,18 +3,32 @@ Author: Dermascan Team
 Date: 2026-4-14
 Licence: MIT
 
-This module computes the diagnosis confidence score of the model.
+This module computes the diagnosis/product review confidence score of the model.
 The logic here is:
+IF diagnosis:
 1. extract the diagnosis text from the response, 
 2. map its logarithmic probabilities, 
 3. get the mean of the logarithmic probabilities,
 4. return the exponential of the mean - the probability (which is in [0,1]).
+
+ELSE IF Product review:
+1. Extract 3 key fields - 'product_name','how_to_use','safety_in_pregnancy'
+2. Collect logprobs for tokens that overlap for each field extracted
+3. get the mean of the logarithmic probabilities
+4. Return the exponential of the mean
 
 """
 
 import json
 import math
 from typing import Any
+
+
+_PRODUCT_CONFIDENCE_FIELDS: tuple[str, ...] = (
+    "product_name",
+    "how_to_use",
+    "safety_in_pregnancy",
+)
 
 
 def _tokens_for_span(tokens: list[dict[str, Any]], full_text: str, span_start: int, span_end: int) -> list[float]:
@@ -72,12 +86,14 @@ def compute_confidence_score(data: dict) -> float:
 
     # Parse the JSON content to get the diagnosis text
     diagnosis_text = ""
+    parsed: dict[str, Any] = {}
     content = (choice.get("message") or {}).get("content") or ""
     try:
         parsed = json.loads(content)
         diagnosis_text = str(parsed.get("diagnosis") or "").strip()
     except Exception:
         diagnosis_text = ""
+        parsed = {}
 
     # Extract logprobs
     logprobs = choice.get("logprobs") or {}
@@ -90,7 +106,7 @@ def compute_confidence_score(data: dict) -> float:
     # Reconstruct the full text emitted by the model
     full_text = "".join((tok.get("token") or "") for tok in tokens)
 
-    # Find the diagnosis span in the emitted text
+    # Find the target field spans in the emitted text
     span_logprobs: list[float] = []
     if diagnosis_text:
         start_search = full_text.find("\"diagnosis\"")
@@ -100,6 +116,21 @@ def compute_confidence_score(data: dict) -> float:
 
             # Extract the logprobs that overlap with the diagnosis text
             span_logprobs = _tokens_for_span(tokens, full_text, start_idx, end_idx)
+    else:
+        # Product-review case: diagnosis is intentionally empty.
+        # Build confidence from product_name + how_to_use + safety_in_pregnancy spans.
+        for field_name in _PRODUCT_CONFIDENCE_FIELDS:
+            field_text: str = str(parsed.get(field_name) or "").strip()
+            if not field_text:
+                continue
+
+            start_search = full_text.find(f'"{field_name}"')
+            start_idx = full_text.find(field_text, start_search if start_search != -1 else 0)
+            if start_idx == -1:
+                continue
+
+            end_idx = start_idx + len(field_text)
+            span_logprobs.extend(_tokens_for_span(tokens, full_text, start_idx, end_idx))
 
     # Fallback: use all tokens if we couldn't align the diagnosis span
     if not span_logprobs:

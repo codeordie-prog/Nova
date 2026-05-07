@@ -72,11 +72,62 @@ def _to_str(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def _route_case_after_inference(entry: _JobEntry, text: str, confidence: float | None) -> bool:
+def _extract_structured_fields(text: str) -> dict[str, str]:
+    """
+    Parse MedGemma JSON output and extract diagnose/product fields.
+
+    Args:
+        text: The JSON text to parse
+        
+    Returns:
+        A dictionary containing the extracted fields
+    """
+    fields = {
+        "diagnosis": "",
+        "product_name": "",
+        "description": "",
+        "indications": "",
+        "safety_in_pregnancy": "",
+        "contraindications": "",
+        "how_to_use": "",
+        "special_instructions": "",
+    }
+    try:
+        parsed: dict[str, Any] = json.loads(text)
+    except Exception:
+        return fields
+
+    for key in fields:
+        fields[key] = _to_str(parsed.get(key)).strip()
+    return fields
+
+
+def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | None) -> bool:
     """
     Determines whether a case should be escalated to a human expert or NOT.
+
+    Args:
+        entry: The job entry containing case information
+        text: The JSON text to parse
+        confidence: The confidence score of the diagnosis
+        
+    Returns:
+        True if the case should be escalated, False otherwise
     """
+    structured = _extract_structured_fields(text)
     escalate: bool = confidence is None or confidence < _DIAGNOSE_CONFIDENCE_THRESHOLD
+
+    base_fields = {
+        "product_name": structured["product_name"],
+        "description": structured["description"],
+        "indications": structured["indications"],
+        "safety_in_pregnancy": structured["safety_in_pregnancy"],
+        "contraindications": structured["contraindications"],
+        "how_to_use": structured["how_to_use"],
+        "special_instructions": structured["special_instructions"],
+        "diagnosis_text": structured["diagnosis"],
+    }
+
     # push case to EVENT stream - regardless of confidence threshold
     _push_event(
         {
@@ -91,12 +142,13 @@ def _route_case_after_inference(entry: _JobEntry, text: str, confidence: float |
             "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
             "escalation": str(escalate).lower(),
             "escalation_note": "Diagnosis confidence fell below threshold" if escalate else "",
+            **base_fields,
         }
     )
 
     if escalate:
 
-        _push_escalation(entry, text, confidence)
+        _push_escalation(entry, text, confidence, base_fields)
         _push_event(
             {
                 "request_id": entry.request_id,
@@ -109,12 +161,13 @@ def _route_case_after_inference(entry: _JobEntry, text: str, confidence: float |
                 "confidence": "" if confidence is None else str(confidence),
                 "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
                 "escalation": "true",
+                **base_fields,
             }
         )
 
         return True
 
-    _push_signal(entry, text, confidence)
+    _push_signal(entry, text, confidence, base_fields)
     _push_event(
         {
             "request_id": entry.request_id,
@@ -127,13 +180,18 @@ def _route_case_after_inference(entry: _JobEntry, text: str, confidence: float |
             "confidence": "" if confidence is None else str(confidence),
             "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
             "escalation": "false",
+            **base_fields,
         }
     )
 
     return False
 
 
-def _push_escalation(entry: _JobEntry, text: str, confidence: float | None) -> None:
+def _route_case_after_inference(entry: _JobEntry, text: str, confidence: float | None) -> bool:
+    return route_case_after_inference(entry, text, confidence)
+
+
+def _push_escalation(entry: _JobEntry, text: str, confidence: float | None, base_fields: dict[str, str]) -> None:
     """
     Push a case that falls below the confidence threshold to ESCALATION STREAM.
 
@@ -154,15 +212,22 @@ def _push_escalation(entry: _JobEntry, text: str, confidence: float | None) -> N
             "reason": "low_confidence",
             "confidence": "" if confidence is None else str(confidence),
             "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
-            "diagnosis_text": text,
+            "diagnosis_text": base_fields.get("diagnosis_text") or text,
             "requires_human_review": "true",
+            "product_name": base_fields.get("product_name", ""),
+            "description": base_fields.get("description", ""),
+            "indications": base_fields.get("indications", ""),
+            "safety_in_pregnancy": base_fields.get("safety_in_pregnancy", ""),
+            "contraindications": base_fields.get("contraindications", ""),
+            "how_to_use": base_fields.get("how_to_use", ""),
+            "special_instructions": base_fields.get("special_instructions", ""),
         },
         maxlen=_EVENTS_STREAM_MAXLEN,
         approximate=True,
 
     )
 
-def _push_signal(entry: _JobEntry, text: str, confidence: float | None) -> None:
+def _push_signal(entry: _JobEntry, text: str, confidence: float | None, base_fields: dict[str, str]) -> None:
     """
     Push a case to SIGNAL STREAM.
 
@@ -184,10 +249,17 @@ def _push_signal(entry: _JobEntry, text: str, confidence: float | None) -> None:
             "source_event_id": "",
             "payload": json.dumps(
                 {
-                    "diagnosis_text": text,
+                    "diagnosis_text": base_fields.get("diagnosis_text") or text,
                     "confidence": confidence,
                     "threshold": _DIAGNOSE_CONFIDENCE_THRESHOLD,
                     "escalation": False,
+                    "product_name": base_fields.get("product_name", ""),
+                    "description": base_fields.get("description", ""),
+                    "indications": base_fields.get("indications", ""),
+                    "safety_in_pregnancy": base_fields.get("safety_in_pregnancy", ""),
+                    "contraindications": base_fields.get("contraindications", ""),
+                    "how_to_use": base_fields.get("how_to_use", ""),
+                    "special_instructions": base_fields.get("special_instructions", ""),
                 },
                 default=str,
             ),
