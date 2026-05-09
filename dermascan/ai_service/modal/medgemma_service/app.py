@@ -89,7 +89,7 @@ _STRUCTURED_SYSTEM_PROMPT: str = (
 
 # Create class for MedGemma service, runs on A10G/L4 GPU with specified image and secrets
 @app.cls(
-    gpu="L4",
+    gpu="A10",
     image=image,
     secrets=[hf_secret],
     max_containers=2,

@@ -1,6 +1,7 @@
 """
 Author: Dermascan Team
 Date: 2026-4-29
+Licence: MIT
 
 Description: This module contains the implementation of the Escalation logic post-processing
 
