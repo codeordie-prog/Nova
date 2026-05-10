@@ -22,6 +22,10 @@ TELEGRAM_HTTP_TIMEOUT_S: float = float(os.getenv("TELEGRAM_HTTP_TIMEOUT_S", "20"
 TELEGRAM_TLS_VERIFY: str = os.getenv("TELEGRAM_TLS_VERIFY", "false")
 TELEGRAM_CA_BUNDLE: str = os.getenv("TELEGRAM_CA_BUNDLE", "")
 
+QUTIS_BASE_URL: str = os.getenv("QUTIS_BASE_URL", "")
+QUTIS_INTERNAL_SECRET: str = os.getenv("QUTIS_INTERNAL_SECRET", "")
+QUTIS_HTTP_TIMEOUT_S: float = float(os.getenv("QUTIS_HTTP_TIMEOUT_S", "15"))
+
 OUTBOUND_STREAM: str = os.getenv("OUTBOUND_STREAM", "outbound:messages")
 OUTBOUND_CONSUMER_GROUP: str = os.getenv("OUTBOUND_CONSUMER_GROUP", "outbound-sender-workers")
 OUTBOUND_CONSUMER_NAME_BASE: str = os.getenv("OUTBOUND_CONSUMER_NAME", "outbound-sender-worker")
@@ -107,6 +111,32 @@ def _send_telegram(chat_id: str, text: str, reply_to_message_id: int | None = No
             raise RuntimeError(f"telegram send non-ok: {payload}")
 
 
+def _send_whatsapp(to: str, text: str, reply_to_wamid: str | None = None) -> None:
+    """
+    Send a WhatsApp text message via the qutis /send endpoint.
+
+    qutis owns the 360dialog credential and rate-limit envelope; this worker
+    only POSTs an internal-secret-authenticated request. Threading is achieved
+    by passing reply_to_wamid which qutis maps to context.message_id on the
+    outbound 360dialog payload.
+    """
+    if not QUTIS_BASE_URL:
+        raise RuntimeError("QUTIS_BASE_URL is missing")
+    if not QUTIS_INTERNAL_SECRET:
+        raise RuntimeError("QUTIS_INTERNAL_SECRET is missing")
+
+    url = f"{QUTIS_BASE_URL.rstrip('/')}/send"
+    headers = {"X-Internal-Secret": QUTIS_INTERNAL_SECRET, "Content-Type": "application/json"}
+    payload: dict[str, Any] = {"to": to, "kind": "text", "text": text}
+    if reply_to_wamid:
+        payload["reply_to_wamid"] = reply_to_wamid
+
+    resp = requests.post(url, json=payload, headers=headers, timeout=QUTIS_HTTP_TIMEOUT_S)
+    if resp.status_code >= 400:
+        body = resp.text[:500]
+        raise RuntimeError(f"qutis /send failed ({resp.status_code}): {body}")
+
+
 def _to_int(value: Any) -> int | None:
     """
     Convert a value to an integer.
@@ -148,6 +178,19 @@ def _deliver(fields: dict[str, Any], reply_to_message_id: int | None = None) -> 
             raise ValueError("missing case_id for telegram outbound")
         _send_telegram(case_id, text, reply_to_message_id=reply_to_message_id)
         return
+
+    # Send to WhatsApp via qutis
+    if channel == "whatsapp":
+        client_id = str(fields.get("client_id") or "").strip()
+        to = client_id or case_id
+        if not to:
+            raise ValueError("missing client_id/case_id for whatsapp outbound")
+        # WhatsApp wamids are strings; the orchestrator stores them in the same
+        # field telegram uses for its int message ids. Read raw, do not _to_int.
+        reply_to_wamid = str(fields.get("reply_to_message_id") or "").strip() or None
+        _send_whatsapp(to=to, text=text, reply_to_wamid=reply_to_wamid)
+        return
+
     raise ValueError(f"unsupported channel: {channel}")
 
 
