@@ -76,23 +76,15 @@ def _validate_image_bytes(image_bytes: bytes) -> None:
         raise HTTPException(status_code=400, detail="Unsupported or invalid image format")
 
 
-# Extract whatsapp message - This logic may change when we get the META API 
-def _extract_whatsapp_message(payload: dict[str, Any]) -> dict[str, Any] | None:
-    for entry in payload.get("entry", []):
-        for change in entry.get("changes", []):
-            value = change.get("value", {})
-
-            message_obj = value.get("message")
-            if isinstance(message_obj, dict) and message_obj:
-                return message_obj
-
-            # Backward compatibility fallback for older shape.
-            legacy_messages = value.get("messages") or []
-            if isinstance(legacy_messages, list) and legacy_messages:
-                first = legacy_messages[0]
-                if isinstance(first, dict):
-                    return first
-    return None
+def _extract_whatsapp_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for entry in payload.get("entry", []) or []:
+        for change in entry.get("changes", []) or []:
+            value = change.get("value", {}) or {}
+            for msg in value.get("messages", []) or []:
+                if isinstance(msg, dict) and msg:
+                    out.append(msg)
+    return out
 
 
 # Extract telegram message
@@ -291,15 +283,19 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
         media_ref: str = str(image_obj.get("media_ref") or "")
         mime_type: str = str(image_obj.get("mime_type") or "image/*")
         image_b64: str = str(image_obj.get("base64") or image_obj.get("data_base64") or "")
+        image_url: str = str(image_obj.get("url") or "").strip()
 
-        if image_b64:
+        if image_url:
+            source = AttachmentSource(kind="url", value=image_url)
+            size_bytes: int | None = image_obj.get("file_size")
+        elif image_b64:
             try:
                 image_bytes: bytes = base64.b64decode(image_b64, validate=True)
             except (binascii.Error, ValueError) as exc:
                 raise HTTPException(status_code=400, detail="Invalid image base64") from exc
             _validate_image_bytes(image_bytes)
             source = AttachmentSource(kind="base64", value=image_b64)
-            size_bytes: int | None = len(image_bytes)
+            size_bytes = len(image_bytes)
         elif media_ref:
             source = AttachmentSource(kind="blob_ref", value=media_ref)
             size_bytes = None
@@ -326,6 +322,12 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
 
         media_id: str = str(document_obj.get("id") or "")
         mime_type: str = str(document_obj.get("mime_type") or "application/octet-stream")
+        document_url: str = str(document_obj.get("url") or "").strip()
+
+        if document_url:
+            doc_source = AttachmentSource(kind="url", value=document_url)
+        else:
+            doc_source = AttachmentSource(kind="whatsapp_media_id", value=media_id or "unknown")
 
         attachments.append(
             AttachmentItem(
@@ -334,7 +336,7 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
                 mime_type=mime_type,
                 filename=document_obj.get("filename"),
                 size_bytes=document_obj.get("file_size"),
-                source=AttachmentSource(kind="whatsapp_media_id", value=media_id or "unknown"),
+                source=doc_source,
             )
         )
 
@@ -566,34 +568,41 @@ async def whatsapp_webhook(
     if _redis is None:
         raise HTTPException(status_code=500, detail="REDIS_URL is not configured")
 
-    message = _extract_whatsapp_message(payload)
-    if not message:
+    messages = _extract_whatsapp_messages(payload)
+    if not messages:
         return {"status": "ignored", "queued_count": 0, "request_ids": []}
 
-    try:
-        normalized = _normalize_message(message)
-    except HTTPException as exc:
-        logger.warning("Skipping invalid whatsapp message: detail=%s", exc.detail)
+    request_ids: list[str] = []
+    for message in messages:
+        try:
+            normalized = _normalize_message(message)
+        except HTTPException as exc:
+            logger.warning("Skipping invalid whatsapp message: detail=%s", exc.detail)
+            continue
+
+        try:
+            _redis.xadd(
+                _ORCHESTRATOR_JOB_STREAM,
+                {
+                    "request_id": normalized.request_id,
+                    "case_id": normalized.case_id,
+                    "client_id": normalized.client_id,
+                    "message_id": normalized.message_id,
+                    "channel": normalized.channel,
+                    "payload": _payload_content_json(normalized),
+                },
+                maxlen=_WORKERS_STREAM_MAXLEN,
+                approximate=True,
+            )
+        except redis.RedisError as exc:
+            raise HTTPException(status_code=503, detail="Redis unavailable") from exc
+
+        request_ids.append(normalized.request_id)
+
+    if not request_ids:
         return {"status": "ignored", "queued_count": 0, "request_ids": []}
 
-    try:
-        _redis.xadd(
-            _ORCHESTRATOR_JOB_STREAM,
-            {
-                "request_id": normalized.request_id,
-                "case_id": normalized.case_id,
-                "client_id": normalized.client_id,
-                "message_id": normalized.message_id,
-                "channel": normalized.channel,
-                "payload": _payload_content_json(normalized),
-            },
-            maxlen=_WORKERS_STREAM_MAXLEN,
-            approximate=True,
-        )
-    except redis.RedisError as exc:
-        raise HTTPException(status_code=503, detail="Redis unavailable") from exc
-
-    return {"status": "queued", "queued_count": 1, "request_ids": [normalized.request_id]}
+    return {"status": "queued", "queued_count": len(request_ids), "request_ids": request_ids}
 
 
 @router.post("/webhooks/telegram")

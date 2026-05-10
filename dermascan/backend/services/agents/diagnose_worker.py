@@ -122,6 +122,16 @@ def _resolve_image(payload: dict[str, Any]) -> tuple[bytes, str, str]:
                 logger.exception("invalid base64 attachment")
                 continue
 
+        if kind == "url":
+            try:
+                with httpx.Client(timeout=30.0) as client:
+                    resp = client.get(value)
+                    resp.raise_for_status()
+                    return resp.content, mime_type, kind
+            except Exception:
+                logger.exception("failed to fetch image from url: %s", value)
+                continue
+
         if kind == "blob_ref":
             raw = _redis_binary.get(value)
             if raw:
