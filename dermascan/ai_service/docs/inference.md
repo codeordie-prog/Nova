@@ -398,7 +398,10 @@ $$
 Per request (assuming average context length \(L = 1024\) tokens):
 
 $$
-136 \text{ KB} \cdot 1024 = 139,264 \text{ KB} \approx 136 \text{ MB}
+\begin{aligned}
+136 \text{ KB} \cdot 1024 &= 139,264 \text{ KB} \\
+&\approx 136 \text{ MB}
+\end{aligned}
 $$
 but lets cap it at 200MB due to context length variation.
 
