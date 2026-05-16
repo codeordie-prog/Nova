@@ -8,10 +8,10 @@ This document analyzes the optimal inference serving configuration for MedGemma-
 - Theoretical compute-memory crossover: 208-417 concurrent requests
 - Practical KV cache limit: 50 concurrent requests
 - Inference is **memory-bound** in practice
-- Safe vLLM parameters: `max_num_seqs=50`, `max_num_batched_tokens=76800`, `gpu_memory_utilization=0.85`
+- Safe vLLM parameters: `max\_num\_seqs=50`, `max\_num\_batched\_tokens=76800`, `gpu\_memory\_utilization=0.85`
 
 **Configuration File:**
-- `dermascan/ai_service/modal/model_config/config.json`
+- `dermascan/ai\_service/modal/model\_config/config.json`
 
 ---
 
@@ -294,19 +294,19 @@ $$
 Memory time (converting parameters to bytes):
 
 $$
-t_m = \frac{N_{\text{params}} \cdot \text{bytes\_per\_param}}{\text{memory\_bandwidth}}
+t_m = \frac{N_{\text{params}} \cdot \text{bytes per param}}{\text{memory bandwidth}}
 $$
 
 Setting \(t_c = t_m\):
 
 $$
-\frac{B \cdot 2 \cdot N_{\text{params}}}{\text{FLOPS}} = \frac{N_{\text{params}} \cdot \text{bytes\_per\_param}}{\text{memory\_bandwidth}}
+\frac{B \cdot 2 \cdot N_{\text{params}}}{\text{FLOPS}} = \frac{N_{\text{params}} \cdot \text{bytes per param}}{\text{memory bandwidth}}
 $$
 
-For BF16, bytes\_per\_param = 2:
+For BF16, bytes per param = 2:
 
 $$
-\frac{B \cdot 2 \cdot N_{\text{params}}}{\text{FLOPS}} = \frac{N_{\text{params}} \cdot 2}{\text{memory\_bandwidth}}
+\frac{B \cdot 2 \cdot N_{\text{params}}}{\text{FLOPS}} = \frac{N_{\text{params}} \cdot 2}{\text{memory bandwidth}}
 $$
 
 Cancel params and the factor of 2:
@@ -374,19 +374,19 @@ we have to find a sweet spot that avoids hitting memory capacity while still uti
 For a transformer with Grouped Query Attention (GQA), KV cache per token is:
 
 $$
-\text{KV cache per token} = 2 \cdot N_{\text{layers}} \cdot N_{\text{kv\_heads}} \cdot d_{\text{head}} \cdot \text{bytes\_per\_param}
+\text{KV cache per token} = 2 \cdot N_{\text{layers}} \cdot N_{\text{kv heads}} \cdot d_{\text{head}} \cdot \text{bytes per param}
 $$
 
 Where:
 - \(N_{\text{layers}}\) = number of transformer layers
-- \(N_{\text{kv\_heads}}\) = number of key-value heads (GQA shares these across query heads)
+- \(N_{\text{kv heads}}\) = number of key-value heads (GQA shares these across query heads)
 - \(d_{\text{head}}\) = head dimension
-- bytes_per_param = 2 (for BF16)
+- bytes per param = 2 (for BF16)
 - Factor of 2 accounts for both K and V matrices
 
 For MedGemma-4B (Gemma 3 4B architecture):
 - \(N_{\text{layers}} = 34\)
-- \(N_{\text{kv\_heads}} = 4\)
+- \(N_{\text{kv heads}} = 4\)
 - \(d_{\text{head}} = 256\)
 
 Per token KV cache:
@@ -416,22 +416,22 @@ Based on the above analysis, we can set the following parameters for the inferen
 
 ### vLLM Configuration (config.json)
 
-**`gpu_memory_utilization: 0.85`**
+**`gpu\_memory\_utilization: 0.85`**
 - Caps GPU memory usage to avoid hitting memory floor
 - Leaves headroom for CUDA operations and stability
 
-**`max_model_len: 1536`**
+**`max\_model\_len: 1536`**
 - Maximum sequence length the model can process
-- 1024 context + 512 max_new_tokens
+- 1024 context + 512 max\_new\_tokens
 - Provides headroom for context length variations
 
-**`max_num_seqs: 50`**
+**`max\_num\_seqs: 50`**
 - Maximum concurrent sequences (batch size)
 - Derived from: 10 GB KV budget / 200 MB per request
 - Practical limit due to KV cache memory constraints
 - Below theoretical crossover (208), confirming memory-bound inference
 
-**`max_num_batched_tokens: 76800`**
+**`max\_num\_batched\_tokens: 76800`**
 - Maximum total tokens vLLM processes in a single batch
 - Calculated as: 50 sequences × 1536 max tokens
 - Ensures vLLM can handle worst-case batch without exceeding memory
