@@ -294,19 +294,19 @@ $$
 Memory time (converting parameters to bytes):
 
 $$
-t_m = \frac{N_{\text{params}} \cdot \text{bytes\_per\_param}}{\text{memory bandwidth}}
+t_m = \frac{N_{\text{params}} \cdot \text{bytes\_per\_param}}{\text{memory\_bandwidth}}
 $$
 
 Setting \(t_c = t_m\):
 
 $$
-\frac{B \cdot 2 \cdot N_{\text{params}}}{\text{FLOPS}} = \frac{N_{\text{params}} \cdot \text{bytes\_per\_param}}{\text{memory bandwidth}}
+\frac{B \cdot 2 \cdot N_{\text{params}}}{\text{FLOPS}} = \frac{N_{\text{params}} \cdot \text{bytes\_per\_param}}{\text{memory\_bandwidth}}
 $$
 
-For BF16, bytes_per_param = 2:
+For BF16, bytes\_per\_param = 2:
 
 $$
-\frac{B \cdot 2 \cdot N_{\text{params}}}{\text{FLOPS}} = \frac{N_{\text{params}} \cdot 2}{\text{memory bandwidth}}
+\frac{B \cdot 2 \cdot N_{\text{params}}}{\text{FLOPS}} = \frac{N_{\text{params}} \cdot 2}{\text{memory\_bandwidth}}
 $$
 
 Cancel params and the factor of 2:
