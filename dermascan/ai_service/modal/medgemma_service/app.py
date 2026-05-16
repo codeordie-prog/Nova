@@ -7,6 +7,9 @@ Modal app for MedGemma inference.
 
 Model loads once per container in `@enter`. Inference runs in `run`.
 Use `modal run app.py` from the project root (where pyproject.toml lives).
+
+Documentation for the inference parameter configurations is provided in:
+`dermascan\ai_services\docs\inference.md`
 """
 
 import base64
@@ -89,7 +92,7 @@ _STRUCTURED_SYSTEM_PROMPT: str = (
 
 # Create class for MedGemma service, runs on A10G/L4 GPU with specified image and secrets
 @app.cls(
-    gpu="A10",
+    gpu="L4",
     image=image,
     secrets=[hf_secret],
     max_containers=2,

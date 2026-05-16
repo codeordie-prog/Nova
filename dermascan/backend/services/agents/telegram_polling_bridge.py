@@ -24,7 +24,7 @@ logger = get_logger("agents")
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_LOCAL_WEBHOOK_URL: str = os.getenv(
     "TELEGRAM_LOCAL_WEBHOOK_URL",
-    "http://127.0.0.1:8000/v1/webhooks/telegram",
+    "http://127.0.0.1:8088/v1/webhooks/telegram",
 )
 TELEGRAM_POLL_TIMEOUT_S: int = int(os.getenv("TELEGRAM_POLL_TIMEOUT_S", "30"))
 TELEGRAM_POLL_LIMIT: int = int(os.getenv("TELEGRAM_POLL_LIMIT", "20"))

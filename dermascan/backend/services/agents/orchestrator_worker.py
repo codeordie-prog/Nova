@@ -25,7 +25,11 @@ from pydantic import BaseModel
 import redis
 
 
-from dermascan.backend.services.tools.orchestrator.orchestrator_tools import orchestrator_tools
+from dermascan.backend.services.tools.orchestrator.orchestrator_tools import (
+    orchestrator_tools,
+    internet_search,
+    wikipedia_search,
+)
 from dermascan.backend.services.agents.loader import load_agent_configurations
 from dermascan.backend.services.agents.build import (
     open_checkpointer_url,
@@ -960,6 +964,7 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
 def _build_signal_input(
     fields: dict[str, Any],
     conversation_entries: Optional[List[dict[str, Any]]] = None,
+    research_context: Optional[dict[str, Any]] = None,
 ) -> str:
     """
     Build the input prompt for processing an internal orchestrator signal.
@@ -983,7 +988,15 @@ def _build_signal_input(
     lines = [
         "You are processing an internal orchestrator signal.",
         "This signal comes from an internal update of the case under processing.",
+        "This signal is from an internal dermatological review; avoid definitive language.",
+        "If the signal provided a diagnosis in the signal payload, state that diagnosis clearly to the user.",
+        "Do not deny or withhold condition information from the internal signal payload.",
+        "Use non-definitive framing, such as 'the model suggests' or 'this appears consistent with'.",
         "This is proactive communication flow. Respond for the client as needed.",
+        "Format the response in plain, easy-to-read text using short sections and concise bullets.",
+        "Do not use markdown emphasis markers such as **, __, or * for styling.",
+        "For research responses, always include sections in this order: Overview, Key points, What to do next, Live sources.",
+        "In Live sources, output raw links only, one per line.",
         "signal_json:",
         json.dumps(signal_payload, default=str),
     ]
@@ -992,7 +1005,94 @@ def _build_signal_input(
             "recent_conversation_context_json:",
             json.dumps(conversation_entries, default=str),
         ])
+    if research_context:
+        lines.extend([
+            "research_context_json:",
+            json.dumps(research_context, default=str),
+        ])
     return "\n".join(lines)
+
+
+def _safe_json_loads(raw: str) -> dict[str, Any]:
+    """
+    Parse JSON object string safely and return an empty dict on failure.
+    """
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _extract_signal_research_query(fields: dict[str, Any]) -> str:
+    """
+    Build a focused research query from a signal payload.
+    """
+    signal_type = str(fields.get("signal_type") or "").strip().lower()
+    payload = _safe_json_loads(str(fields.get("payload") or "{}"))
+
+    mode = str(payload.get("mode") or "").strip().lower()
+    if not mode:
+        mode = "product_review" if signal_type.startswith("product_review_") else "diagnose"
+
+    if mode == "product_review":
+        product_name = str(payload.get("product_name") or "").strip()
+        description = str(payload.get("description") or "").strip()
+        subject = product_name or description
+        if not subject:
+            return ""
+        return (
+            f"{subject} manufacturer and clinical-use summary, including indications, "
+            "contraindications, pregnancy/breastfeeding safety, and practical usage cautions"
+        )
+
+    diagnosis = str(payload.get("diagnosis") or "").strip()
+    diagnosis_text = str(payload.get("diagnosis_text") or "").strip()
+    subject = diagnosis or diagnosis_text
+    if not subject:
+        return ""
+    return (
+        f"{subject} overview including likely causes, evidence-based management options, "
+        "and urgent red-flag symptoms"
+    )
+
+
+def _perform_signal_research(fields: dict[str, Any]) -> dict[str, Any]:
+    """
+    Run search tools before composing a proactive signal message.
+    """
+    query = _extract_signal_research_query(fields)
+    if not query:
+        return {
+            "status": "skipped",
+            "reason": "no_research_query",
+            "query": "",
+            "internet_search": "",
+            "wikipedia_search": "",
+        }
+
+    result: dict[str, Any] = {
+        "status": "ok",
+        "query": query,
+        "internet_search": "",
+        "wikipedia_search": "",
+    }
+
+    try:
+        internet_raw = internet_search.invoke({"query": query, "max_results": 6})
+        result["internet_search"] = str(internet_raw)
+    except Exception as exc:
+        result["status"] = "partial"
+        result["internet_error"] = str(exc)
+
+    try:
+        wiki_raw = wikipedia_search.invoke({"query": query, "max_results": 3})
+        result["wikipedia_search"] = str(wiki_raw)
+    except Exception as exc:
+        result["status"] = "partial"
+        result["wikipedia_error"] = str(exc)
+
+    return result
 
 
 def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> None:
@@ -1044,9 +1144,11 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
 
         # Read recent conversations first and build an input for the signal
         conversation_entries = _read_conversation_log(client_id, CONVERSATION_LOG_INCLUDE_N)
+        research_context = _perform_signal_research(fields)
         signal_prompt = _build_signal_input(
             fields,
             conversation_entries=conversation_entries,
+            research_context=research_context,
         )
         config: RunnableConfig = {
             "configurable": {

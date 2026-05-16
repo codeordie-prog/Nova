@@ -6,14 +6,23 @@ Description: Orchestrator tools for the orchestrator Agent
 """
 
 import os
+from logging import Logger
 from uuid import uuid4
 from datetime import datetime
 from dotenv import load_dotenv
 
 from langchain.tools import tool
 from redis import Redis
+from tavily import TavilyClient
+
+from dermascan.shared.logger import get_logger
 
 load_dotenv()
+
+TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "")
+
+# Initialize Logger
+logger: Logger = get_logger(__name__)
 
 REDIS_URL: str = os.getenv("REDIS_URL", "")
 DIAGNOSE_JOB_STREAM: str = os.getenv("DIAGNOSE_JOB_STREAM", "diagnose:jobs")
@@ -28,11 +37,11 @@ CASE_STATUS_HISTORY: int = max(1, int(os.getenv("CASE_STATUS_HISTORY", "5")))
 _redis: Redis | None = Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
 @tool
-def get_time(*args, **kwargs):
+def get_time() -> str:
     """
     Useful when you need to know the current time
     """
-    return datetime.now()
+    return datetime.now().isoformat()
 
 
 @tool
@@ -43,8 +52,6 @@ def enque_to_diagnose_stream(
     message_id: str,
     payload: str,
     channel: str,
-    *args,
-    **kwargs
 ) -> dict[str, str]:
     """
     Enqueue a normalized diagnose job into the Redis `diagnose:jobs` stream.
@@ -132,7 +139,7 @@ def _event_matches_case(event: dict, case_id: str, request_id: str) -> bool:
 
 
 @tool
-def read_status_of_a_case(case_id: str, request_id: str = "", *args, **kwargs) -> dict:
+def read_status_of_a_case(case_id: str, request_id: str = "") -> dict:
     """
     Read the current real-time status of a case from the events stream.
 
@@ -242,7 +249,7 @@ def read_status_of_a_case(case_id: str, request_id: str = "", *args, **kwargs) -
 
 
 @tool
-def read_soul_md(*args, **kwargs) -> str:
+def read_soul_md() -> str:
     """
     Read the soul.md file.
     Use this tool when you need to understand your inner self, the role you play beyond the immediate
@@ -268,9 +275,76 @@ def read_soul_md(*args, **kwargs) -> str:
 
 
 
+
+def _get_tavily_client() -> TavilyClient | None:
+    if not TAVILY_API_KEY:
+        return None
+    return TavilyClient(api_key=TAVILY_API_KEY)
+
+
+@tool
+def wikipedia_search(query: str, max_results: int = 5) -> str:
+    """
+    Search Wikipedia content through Tavily.
+
+    Use this tool when you need background explanations, definitions, and
+    high-level context. Do not rely on this tool alone for critical medical
+    safety claims; cross-check key claims with broader web sources.
+
+    Args:
+        query: Search query string.
+        max_results: Maximum number of results to retrieve (capped internally).
+    """
+    client = _get_tavily_client()
+    if client is None:
+        return "Tavily is not configured. Set TAVILY_API_KEY to enable internet research."
+
+    try:
+        result = client.search(
+            query=query,
+            max_results=max(1, min(max_results, 8)),
+            include_domains=["wikipedia.org"],
+        )
+        return str(result)
+    except Exception as exc:
+        return f"Wikipedia search failed: {exc}"
+
+
+@tool
+def internet_search(query: str, max_results: int = 8) -> str:
+    """
+    Perform general web research through Tavily.
+
+    Use this as the primary research tool for up-to-date and credible external
+    sources (guidelines, journals, hospital/public-health pages, and trusted
+    references). Prefer this tool for safety checks and practical guidance.
+
+    Args:
+        query: Search query string.
+        max_results: Maximum number of results to retrieve (capped internally).
+    """
+    client = _get_tavily_client()
+    if client is None:
+        return "Tavily is not configured. Set TAVILY_API_KEY to enable internet research."
+
+    try:
+        result = client.search(
+            query=query,
+            max_results=max(1, min(max_results, 10)),
+            search_depth="advanced",
+            include_domains=["mayoclinic.org", "webmd.com", "healthline.com", "cdc.gov", "nih.gov", "mydawa.com"],
+        )
+        return str(result)
+    except Exception as exc:
+        return f"Internet search failed: {exc}"
+
+
+
 orchestrator_tools: list = [
     get_time,
     enque_to_diagnose_stream,
     read_status_of_a_case,
     read_soul_md,
+    wikipedia_search,
+    internet_search,
 ]

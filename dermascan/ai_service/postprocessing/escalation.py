@@ -17,7 +17,6 @@ the quality of the product as time goes by.
 """
 import os
 import json
-import uuid
 
 from dotenv import load_dotenv
 from typing import Dict, Any
@@ -35,6 +34,7 @@ _EVENTS_STREAM: str = os.environ.get("EVENTS_STREAM","events:stream")
 _ESCALATION_STREAM: str = os.environ.get("ESCALATION_STREAM", "escalation:jobs")
 _EVENTS_STREAM_MAXLEN: int = int(os.environ.get("WORKERS_STREAM_MAXLEN", "5000"))
 _DIAGNOSE_CONFIDENCE_THRESHOLD: float = float(os.environ.get("DIAGNOSE_CONFIDENCE_THRESHOLD", "0.75"))
+_PRODUCT_REVIEW_CONFIDENCE_THRESHOLD: float = float(os.environ.get("PRODUCT_REVIEW_CONFIDENCE_THRESHOLD", "0.60"))
 _ESCALATION_DLQ_STREAM: str = os.environ.get("ESCALATION_DLQ_STREAM", "escalation:dlq")
 _EVENTS_DLQ_STREAM: str = os.environ.get("EVENTS_DLQ_STREAM","events:dlq")
 
@@ -73,7 +73,7 @@ def _to_str(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def _extract_structured_fields(text: str) -> dict[str, str]:
+def _extract_structured_fields(text: str) -> tuple[dict[str, str], bool]:
     """
     Parse MedGemma JSON output and extract diagnose/product fields.
 
@@ -81,10 +81,12 @@ def _extract_structured_fields(text: str) -> dict[str, str]:
         text: The JSON text to parse
         
     Returns:
-        A dictionary containing the extracted fields
+        A tuple of (fields dictionary, parse_success)
     """
     fields = {
         "diagnosis": "",
+        "summary": "",
+        "treatment": "",
         "product_name": "",
         "description": "",
         "indications": "",
@@ -96,11 +98,11 @@ def _extract_structured_fields(text: str) -> dict[str, str]:
     try:
         parsed: dict[str, Any] = json.loads(text)
     except Exception:
-        return fields
+        return fields, False
 
     for key in fields:
         fields[key] = _to_str(parsed.get(key)).strip()
-    return fields
+    return fields, True
 
 
 def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | None) -> bool:
@@ -115,8 +117,44 @@ def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | 
     Returns:
         True if the case should be escalated, False otherwise
     """
-    structured = _extract_structured_fields(text)
-    escalate: bool = confidence is None or confidence < _DIAGNOSE_CONFIDENCE_THRESHOLD
+    structured, parsed_ok = _extract_structured_fields(text)
+    product_fields = (
+        "product_name",
+        "description",
+        "indications",
+        "safety_in_pregnancy",
+        "contraindications",
+        "how_to_use",
+        "special_instructions",
+    )
+
+    diagnosis_present = bool(structured["diagnosis"])
+    product_present = any(bool(structured.get(k)) for k in product_fields)
+
+    if diagnosis_present:
+        mode = "diagnose"
+    elif product_present:
+        mode = "product_review"
+    else:
+        # Safe fallback for malformed or empty payloads.
+        mode = "diagnose"
+
+    threshold_used = (
+        _PRODUCT_REVIEW_CONFIDENCE_THRESHOLD if mode == "product_review" else _DIAGNOSE_CONFIDENCE_THRESHOLD
+    )
+    escalate: bool = confidence is None or confidence < threshold_used
+
+    if not parsed_ok:
+        escalate = True
+
+    completed_status = f"{mode}_inference_completed"
+    escalated_status = f"{mode}_escalated"
+    escalation_note = (
+        "Model response was not valid JSON"
+        if not parsed_ok
+        else ("Product review confidence fell below threshold" if mode == "product_review" and escalate
+              else ("Diagnosis confidence fell below threshold" if escalate else ""))
+    )
 
     base_fields = {
         "product_name": structured["product_name"],
@@ -126,7 +164,9 @@ def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | 
         "contraindications": structured["contraindications"],
         "how_to_use": structured["how_to_use"],
         "special_instructions": structured["special_instructions"],
-        "diagnosis_text": structured["diagnosis"],
+        "diagnosis": structured["diagnosis"],
+        "summary": structured["summary"],
+        "treatment": structured["treatment"],
     }
 
     # push case to EVENT stream - regardless of confidence threshold
@@ -138,18 +178,19 @@ def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | 
             "message_id": entry.message_id,
             "channel": entry.channel,
             "agent": "medgemma",
-            "status": "diagnose_inference_completed",
+            "mode": mode,
+            "status": completed_status,
             "confidence": "" if confidence is None else str(confidence),
-            "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
+            "threshold": str(threshold_used),
             "escalation": str(escalate).lower(),
-            "escalation_note": "Diagnosis confidence fell below threshold" if escalate else "",
+            "escalation_note": escalation_note,
             **base_fields,
         }
     )
 
     if escalate:
 
-        _push_escalation(entry, text, confidence, base_fields)
+        _push_escalation(entry, text, confidence, base_fields, threshold_used, mode)
         _push_event(
             {
                 "request_id": entry.request_id,
@@ -158,41 +199,41 @@ def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | 
                 "message_id": entry.message_id,
                 "channel": entry.channel,
                 "agent": "medgemma",
-                "status": "diagnose_escalated",
+                "mode": mode,
+                "status": escalated_status,
                 "confidence": "" if confidence is None else str(confidence),
-                "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
+                "threshold": str(threshold_used),
                 "escalation": "true",
                 **base_fields,
             }
         )
 
-        return True
-
-    _push_signal(entry, text, confidence, base_fields)
-    _push_event(
-        {
-            "request_id": entry.request_id,
-            "case_id": entry.case_id,
-            "client_id": entry.client_id,
-            "message_id": entry.message_id,
-            "channel": entry.channel,
-            "agent": "medgemma",
-            "status": "diagnose_signal_emitted",
-            "confidence": "" if confidence is None else str(confidence),
-            "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
-            "escalation": "false",
-            **base_fields,
-        }
+    _push_signal(
+        entry=entry,
+        text=text,
+        confidence=confidence,
+        threshold_used=threshold_used,
+        mode=mode,
+        escalated=escalate,
+        base_fields=base_fields,
+        parsed_ok=parsed_ok,
     )
 
-    return False
+    return escalate
 
 
 def _route_case_after_inference(entry: _JobEntry, text: str, confidence: float | None) -> bool:
     return route_case_after_inference(entry, text, confidence)
 
 
-def _push_escalation(entry: _JobEntry, text: str, confidence: float | None, base_fields: dict[str, str]) -> None:
+def _push_escalation(
+    entry: _JobEntry,
+    text: str,
+    confidence: float | None,
+    base_fields: dict[str, str],
+    threshold_used: float,
+    mode: str,
+) -> None:
     """
     Push a case that falls below the confidence threshold to ESCALATION STREAM.
 
@@ -210,10 +251,11 @@ def _push_escalation(entry: _JobEntry, text: str, confidence: float | None, base
             "message_id": entry.message_id,
             "channel": entry.channel,
             "source_agent": "medgemma",
+            "mode": mode,
             "reason": "low_confidence",
             "confidence": "" if confidence is None else str(confidence),
-            "threshold": str(_DIAGNOSE_CONFIDENCE_THRESHOLD),
-            "diagnosis_text": base_fields.get("diagnosis_text") or text,
+            "threshold": str(threshold_used),
+            "diagnosis_text": base_fields.get("diagnosis") or text,
             "requires_human_review": "true",
             "product_name": base_fields.get("product_name", ""),
             "description": base_fields.get("description", ""),
@@ -228,20 +270,37 @@ def _push_escalation(entry: _JobEntry, text: str, confidence: float | None, base
 
     )
 
-def _push_signal(entry: _JobEntry, text: str, confidence: float | None, base_fields: dict[str, str]) -> None:
+def _push_signal(
+    entry: _JobEntry,
+    text: str,
+    confidence: float | None,
+    threshold_used: float,
+    mode: str,
+    escalated: bool,
+    base_fields: dict[str, str],
+    parsed_ok: bool,
+) -> None:
     """
-    Push a case to SIGNAL STREAM.
+    Push a completion/escalation signal to ORCHESTRATOR SIGNAL STREAM.
 
     Args:
         entry: The job entry
-        text: The diagnosis text
+        text: The model response text
         confidence: The confidence score
     """
+    signal_type = f"{mode}_escalated" if escalated else f"{mode}_completed"
+    if not parsed_ok:
+        notes = "The model response was not valid JSON"
+    elif escalated:
+        notes = "The diagnosis inference completed below confidence threshold"
+    else:
+        notes = "The diagnosis inference completed above threshold"
+
     _redis.xadd(
         _ORCHESTRATOR_SIGNAL_STREAM,
         {
-            "signal_type": "diagnose_completed",
-            "signal_id": uuid.uuid4().hex,
+            "signal_type": signal_type,
+            "signal_id": entry.msg_id,
             "request_id": entry.request_id,
             "case_id": entry.case_id,
             "client_id": entry.client_id,
@@ -250,10 +309,11 @@ def _push_signal(entry: _JobEntry, text: str, confidence: float | None, base_fie
             "source_event_id": "",
             "payload": json.dumps(
                 {
-                    "diagnosis_text": base_fields.get("diagnosis_text") or text,
+                    "diagnosis_text": text,
                     "confidence": confidence,
-                    "threshold": _DIAGNOSE_CONFIDENCE_THRESHOLD,
-                    "escalation": False,
+                    "threshold": threshold_used,
+                    "escalation": escalated,
+                    "mode": mode,
                     "product_name": base_fields.get("product_name", ""),
                     "description": base_fields.get("description", ""),
                     "indications": base_fields.get("indications", ""),
@@ -261,10 +321,9 @@ def _push_signal(entry: _JobEntry, text: str, confidence: float | None, base_fie
                     "contraindications": base_fields.get("contraindications", ""),
                     "how_to_use": base_fields.get("how_to_use", ""),
                     "special_instructions": base_fields.get("special_instructions", ""),
-                },
-                default=str,
+                }
             ),
-            "notes": "The diagnosis inference completed above confidence threshold",
+            "notes": notes,
         },
         maxlen=_EVENTS_STREAM_MAXLEN,
         approximate=True,

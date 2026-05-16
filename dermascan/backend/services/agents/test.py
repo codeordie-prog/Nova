@@ -104,7 +104,7 @@ def get_safety_profile(cid: int) -> Dict[str, Any]:
 # 5. Example usage
 # -----------------------------
 if __name__ == "__main__":
-    niacinamide_cid = 243
+    niacinamide_cid = 119034
 
 
     result = get_safety_profile(niacinamide_cid)

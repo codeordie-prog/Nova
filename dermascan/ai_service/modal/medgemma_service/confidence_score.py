@@ -17,6 +17,9 @@ ELSE IF Product review:
 3. get the mean of the logarithmic probabilities
 4. Return the exponential of the mean
 
+
+The mathematical description is provided in the `confidence_score_algorithm.md` file.
+
 """
 
 import json
