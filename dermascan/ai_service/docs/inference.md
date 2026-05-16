@@ -544,11 +544,9 @@ This reveals an important transformer-serving property:
 
 Therefore:
 
-$$
-\boxed{
-Transformer\ inference\ is\ usually\ memory-bound\ in\ practice
-}
-$$
+
+With a given Hardware configuration with respect to Batch size sensitivity below crossover point, Inference Cost in Transformers is usually memory-bound in practice
+
 
 ---
 
