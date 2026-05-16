@@ -1,6 +1,6 @@
 # Inference Optimization Analysis
 
-This document analyzes the optimal inference serving configuration for MedGemma-4B on NVIDIA A10/L4 GPUs, determining safe vLLM parameters based on compute/memory bounds and KV cache constraints.
+This document analyzes the optimal inference serving configuration for MedGemma-4B on NVIDIA A10 GPUs, determining safe vLLM parameters based on compute/memory bounds and KV cache constraints.
 
 ## Quick Summary
 
