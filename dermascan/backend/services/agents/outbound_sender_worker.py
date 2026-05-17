@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import socket
+import time
 from collections import defaultdict
 from typing import Any
 
@@ -156,15 +157,19 @@ def _to_int(value: Any) -> int | None:
         return None
 
 
-def _deliver(fields: dict[str, Any], reply_to_message_id: int | None = None) -> None:
+def _deliver(
+    fields: dict[str, Any],
+    should_thread: bool = False,
+    thread_target: int | None = None,
+) -> None:
     """
     Deliver a message to a channel.
 
-    NB Only Telegram channel has been implemented : should be mutated later to include other channels.
-
-    
     Args:
-        fields: The fields to deliver.
+        fields: The outbound message fields.
+        should_thread: Whether to send as a threaded reply.
+        thread_target: Telegram int message id to reply to (only used for telegram).
+                       For WhatsApp the wamid is read from fields when should_thread=True.
     """
     channel = str(fields.get("channel") or "")
     case_id = str(fields.get("case_id") or "")
@@ -172,22 +177,39 @@ def _deliver(fields: dict[str, Any], reply_to_message_id: int | None = None) -> 
     if not text:
         return
 
-    # Send to Telegram
     if channel == "telegram":
         if not case_id:
             raise ValueError("missing case_id for telegram outbound")
-        _send_telegram(case_id, text, reply_to_message_id=reply_to_message_id)
+        _send_telegram(case_id, text, reply_to_message_id=thread_target if should_thread else None)
         return
 
-    # Send to WhatsApp via qutis
     if channel == "whatsapp":
         client_id = str(fields.get("client_id") or "").strip()
         to = client_id or case_id
         if not to:
             raise ValueError("missing client_id/case_id for whatsapp outbound")
-        # WhatsApp wamids are strings; the orchestrator stores them in the same
-        # field telegram uses for its int message ids. Read raw, do not _to_int.
-        reply_to_wamid = str(fields.get("reply_to_message_id") or "").strip() or None
+
+        # Fire typing indicator just before delivery so it appears ~1.5s before the message.
+        inbound_wamid = str(fields.get("reply_to_message_id") or "").strip()
+        if inbound_wamid and QUTIS_BASE_URL and QUTIS_INTERNAL_SECRET:
+            try:
+                requests.post(
+                    f"{QUTIS_BASE_URL.rstrip('/')}/typing",
+                    json={"message_id": inbound_wamid},
+                    headers={
+                        "X-Internal-Secret": QUTIS_INTERNAL_SECRET,
+                        "Content-Type": "application/json",
+                    },
+                    timeout=5.0,
+                )
+                time.sleep(1.5)
+            except Exception:
+                pass
+
+        reply_to_wamid = (
+            str(fields.get("reply_to_message_id") or "").strip() or None
+            if should_thread else None
+        )
         _send_whatsapp(to=to, text=text, reply_to_wamid=reply_to_wamid)
         return
 
@@ -328,23 +350,30 @@ def _inbound_ts_ms(fields: dict[str, Any]) -> int:
 def _threading_decision(fields: dict[str, Any], chaos_mode: bool) -> tuple[bool, int | None]:
     """
     Determine if the message should be threaded and the reply target.
-    
-    Args:
-        fields: The fields of the message.
-        chaos_mode: Whether chaos mode is enabled.
-        
+
+    WhatsApp policy:
+    - Signal updates (diagnosis results) → always thread, so the reply is visually
+      tied to the image the user sent.
+    - Job replies (conversational) → never thread; plain chat should flow naturally.
+
+    Telegram policy: unchanged (thread signals and chaos-mode job replies).
+
     Returns:
-        A tuple of (should_thread, reply_target).
+        (should_thread, telegram_int_target) — target is always None for WhatsApp.
     """
+    channel = str(fields.get("channel") or "").strip()
+
+    if channel == "whatsapp":
+        if _is_signal_kind(fields):
+            return (True, None)
+        return (False, None)
+
+    # Telegram (and any other channel): existing behaviour unchanged.
     target = _reply_target(fields)
     if _is_signal_kind(fields):
         return (target is not None, target)
-
-    # If its a job reply and chaos mode is detected, thread it
     if _is_job_kind(fields) and chaos_mode:
         return (target is not None, target)
-    
-    # Otherwise, don't thread
     return (False, None)
 
 
@@ -644,9 +673,8 @@ def run_worker_forever() -> None:
                         continue
                 try:
 
-                    # How do we reply - if chaos Mode reply to target, otherwise reply to message id
                     should_thread, target = _threading_decision(fields, chaos_mode)
-                    _deliver(fields, reply_to_message_id=target if should_thread else None)
+                    _deliver(fields, should_thread=should_thread, thread_target=target)
                     _ack_delete(mid)
                     
                 except Exception as exc:
