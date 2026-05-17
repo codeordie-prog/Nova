@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import socket
+from urllib.parse import quote
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import Any
 
@@ -19,6 +20,7 @@ import redis
 from dotenv import load_dotenv
 
 from dermascan.shared.logger import get_logger
+from dermascan.shared.payload_log import dumps_compact, dumps_pretty
 
 load_dotenv()
 
@@ -27,6 +29,10 @@ MEDGEMMA_GATEWAY_URL: str = os.getenv("MEDGEMMA_GATEWAY_URL", "http://127.0.0.1:
 MEDGEMMA_AUTH_HEADER: str = os.getenv("MEDGEMMA_AUTH_HEADER", "")
 MEDGEMMA_AUTH_VALUE: str = os.getenv("MEDGEMMA_AUTH_VALUE", "")
 MEDGEMMA_HTTP_TIMEOUT_S: float = float(os.getenv("MEDGEMMA_HTTP_TIMEOUT_S", "60"))
+
+QUTIS_BASE_URL: str = os.getenv("QUTIS_BASE_URL", "").strip()
+QUTIS_INTERNAL_SECRET: str = os.getenv("QUTIS_INTERNAL_SECRET", "").strip()
+QUTIS_MEDIA_HTTP_TIMEOUT_S: float = float(os.getenv("QUTIS_MEDIA_HTTP_TIMEOUT_S", "120"))
 
 DIAGNOSE_JOB_STREAM: str = os.getenv("DIAGNOSE_JOB_STREAM", "diagnose:jobs")
 DIAGNOSE_CONSUMER_GROUP: str = os.getenv("DIAGNOSE_CONSUMER_GROUP", "diagnose-workers")
@@ -100,45 +106,144 @@ def _resolve_image(payload: dict[str, Any]) -> tuple[bytes, str, str]:
     """
     content = payload.get("content") or {}
     attachments = content.get("attachments") or []
+    logger.info(
+        "[DIAGNOSE-RESOLVE] payload has %d attachment(s); content_keys=%s",
+        len(attachments),
+        list(content.keys()),
+    )
 
-    for attachment in attachments:
+    for idx, attachment in enumerate(attachments):
         if not isinstance(attachment, dict):
+            logger.warning("[DIAGNOSE-RESOLVE] attachment[%d] is not a dict — skipped", idx)
             continue
         attachment_type = str(attachment.get("type") or "")
         mime_type = str(attachment.get("mime_type") or "image/jpeg")
         if attachment_type != "image" and not mime_type.startswith("image/"):
+            logger.info(
+                "[DIAGNOSE-RESOLVE] attachment[%d] type=%s mime=%s — not an image, skipped",
+                idx, attachment_type, mime_type,
+            )
             continue
 
         source = attachment.get("source") or {}
         kind = str(source.get("kind") or "")
         value = str(source.get("value") or "")
+        logger.info(
+            "[DIAGNOSE-RESOLVE] attachment[%d] type=%s mime=%s source.kind=%s source.value=%s",
+            idx, attachment_type, mime_type, kind or "(none)",
+            (value[:160] if value else "(empty)"),
+        )
         if not value:
+            logger.warning("[DIAGNOSE-RESOLVE] attachment[%d] has empty source.value — skipped", idx)
             continue
 
         if kind == "base64":
             try:
-                return base64.b64decode(value, validate=True), mime_type, kind
+                decoded = base64.b64decode(value, validate=True)
+                logger.info(
+                    "[DIAGNOSE-RESOLVE] attachment[%d] base64 decoded OK — %d bytes",
+                    idx, len(decoded),
+                )
+                return decoded, mime_type, kind
             except Exception:
-                logger.exception("invalid base64 attachment")
+                logger.exception("[DIAGNOSE-RESOLVE] attachment[%d] invalid base64", idx)
                 continue
 
         if kind == "url":
+            lowered = value.lower()
+            if "lookaside.fbsbx.com" in lowered or "fbcdn.net" in lowered:
+                logger.warning(
+                    "[DIAGNOSE-RESOLVE] attachment[%d] Skipping WhatsApp Meta CDN URL "
+                    "(server GET returns 401); qutis must rehost media and forward a "
+                    "Spaces presigned URL: %s",
+                    idx, value[:160],
+                )
+                continue
+            logger.info("[DIAGNOSE-RESOLVE] attachment[%d] fetching url: %s", idx, value)
             try:
                 with httpx.Client(timeout=30.0) as client:
                     resp = client.get(value)
+                    logger.info(
+                        "[DIAGNOSE-RESOLVE] attachment[%d] url fetch status=%s content_type=%s bytes=%s",
+                        idx, resp.status_code,
+                        resp.headers.get("content-type"),
+                        len(resp.content) if resp.is_success else 0,
+                    )
                     resp.raise_for_status()
+                    logger.info(
+                        "[DIAGNOSE-RESOLVE] attachment[%d] url fetch OK — %d bytes",
+                        idx, len(resp.content),
+                    )
                     return resp.content, mime_type, kind
             except Exception:
-                logger.exception("failed to fetch image from url: %s", value)
+                logger.exception(
+                    "[DIAGNOSE-RESOLVE] attachment[%d] failed to fetch image from url: %s",
+                    idx, value,
+                )
                 continue
 
         if kind == "blob_ref":
             raw = _redis_binary.get(value)
             if raw:
+                logger.info(
+                    "[DIAGNOSE-RESOLVE] attachment[%d] blob_ref hit — %d bytes", idx, len(raw),
+                )
                 return raw, mime_type, kind
-            logger.warning("media_ref not found or expired: %s", value)
+            logger.warning(
+                "[DIAGNOSE-RESOLVE] attachment[%d] media_ref not found or expired: %s", idx, value,
+            )
             continue
 
+        if kind == "whatsapp_media_id":
+            mid = value.strip()
+            if not mid or mid == "unknown":
+                logger.warning(
+                    "[DIAGNOSE-RESOLVE] attachment[%d] whatsapp_media_id is empty/unknown — skipped",
+                    idx,
+                )
+                continue
+            base = QUTIS_BASE_URL.rstrip("/")
+            if not base or not QUTIS_INTERNAL_SECRET:
+                logger.warning(
+                    "[DIAGNOSE-RESOLVE] attachment[%d] whatsapp_media_id attachment but "
+                    "QUTIS_BASE_URL / QUTIS_INTERNAL_SECRET not set (base=%s secret_set=%s mid=%s)",
+                    idx, base or "(none)", bool(QUTIS_INTERNAL_SECRET), mid[:24],
+                )
+                continue
+            fetch_url = f"{base}/internal/whatsapp-media/{quote(mid, safe='')}"
+            logger.info(
+                "[DIAGNOSE-RESOLVE] attachment[%d] fetching whatsapp media via qutis: %s",
+                idx, fetch_url,
+            )
+            try:
+                with httpx.Client(timeout=QUTIS_MEDIA_HTTP_TIMEOUT_S) as client:
+                    resp = client.get(
+                        fetch_url,
+                        headers={"X-Internal-Secret": QUTIS_INTERNAL_SECRET},
+                    )
+                    logger.info(
+                        "[DIAGNOSE-RESOLVE] attachment[%d] qutis media fetch status=%s bytes=%s",
+                        idx, resp.status_code,
+                        len(resp.content) if resp.is_success else 0,
+                    )
+                    resp.raise_for_status()
+                    logger.info(
+                        "[DIAGNOSE-RESOLVE] attachment[%d] qutis media fetch OK — %d bytes",
+                        idx, len(resp.content),
+                    )
+                    return resp.content, mime_type, kind
+            except Exception:
+                logger.exception(
+                    "[DIAGNOSE-RESOLVE] attachment[%d] failed to fetch whatsapp media via qutis: %s",
+                    idx, fetch_url,
+                )
+                continue
+
+        logger.warning(
+            "[DIAGNOSE-RESOLVE] attachment[%d] unrecognised source.kind=%s — skipped", idx, kind,
+        )
+
+    logger.warning("[DIAGNOSE-RESOLVE] no usable image resolved from any attachment")
     return b"", "image/jpeg", ""
 
 
@@ -175,6 +280,10 @@ def _post_to_medgemma_base64(
 
     # Encode raw bytes to base64
     image_b64 = base64.b64encode(image_bytes).decode("ascii")
+    logger.info(
+        "[DIAGNOSE-MEDGEMMA] POST %s  request_id=%s  image_bytes=%d  prompt_chars=%d",
+        endpoint, request_id, len(image_bytes), len(prompt),
+    )
     response = httpx.post(
         endpoint,
         json={
@@ -188,6 +297,11 @@ def _post_to_medgemma_base64(
         },
         headers=headers or None,
         timeout=MEDGEMMA_HTTP_TIMEOUT_S,
+    )
+    logger.info(
+        "[DIAGNOSE-MEDGEMMA] response status=%s  request_id=%s  body=%s",
+        response.status_code, request_id,
+        (response.text[:500] if response.content else "(empty)"),
     )
     response.raise_for_status()
     data: dict[str, Any] = response.json() if response.content else {}
@@ -217,6 +331,13 @@ def _process_stream_message(msg_id: str, fields: dict[str, Any]) -> None:
             payload: dict[str, Any] = json.loads(payload_json)
         except Exception:
             payload = {}
+
+        logger.info(
+            "[DIAGNOSE-JOB] received  msg_id=%s  request_id=%s  case_id=%s  client_id=%s  "
+            "message_id=%s  channel=%s\n  diagnose_payload=\n%s",
+            msg_id, request_id, case_id, client_id, message_id, channel,
+            dumps_pretty(payload) if payload else payload_json,
+        )
 
         # Extract user prompt
         prompt = str(((payload.get("content") or {}).get("text") or "")).strip()
