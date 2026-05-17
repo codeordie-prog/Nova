@@ -31,6 +31,9 @@ from dermascan.backend.services.agents.build import (
     open_checkpointer_url,
     build_google_credentials,
 )
+from dermascan.backend.services.agents.memory.redis_checkpointer import (
+    default_redis_connection_kwargs,
+)
 from dermascan.shared.logger import get_logger
 from langchain_core.runnables import RunnableConfig
 from langchain.agents import create_agent
@@ -132,7 +135,11 @@ INFLIGHT_WAIT_TIMEOUT_MS: int = max(0, int(os.getenv("ORCHESTRATOR_INFLIGHT_WAIT
 INFLIGHT_WAIT_POLL_MS: int = max(50, int(os.getenv("ORCHESTRATOR_INFLIGHT_WAIT_POLL_MS", "200")))
 
 # Initialize REDIS client
-_redis: redis.Redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+_redis: redis.Redis = redis.Redis.from_url(
+    REDIS_URL,
+    decode_responses=True,
+    **default_redis_connection_kwargs(),
+)
 
 
 class StructuredResponse(BaseModel):
@@ -838,6 +845,28 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
     username = str(fields.get("username") or "").strip()
     payload_json = str(fields.get("payload") or "{}")
 
+    logger.info(
+        "[ORCH-JOB] picked up job  msg_id=%s  request_id=%s  case_id=%s  client_id=%s  "
+        "message_id=%s  channel=%s\n  job_payload=%s",
+        msg_id,
+        request_id,
+        case_id,
+        client_id,
+        message_id,
+        channel,
+        payload_json,
+    )
+
+    # Store the inbound wamid in Redis so the signal handler can thread diagnosis
+    # replies correctly, regardless of what message_id the LLM passes to the tool.
+    if channel == "whatsapp" and message_id.startswith("wamid."):
+        _redis.setex(f"orchestrator:wamid:{case_id}", 7200, message_id)
+        logger.info(
+            "[ORCH-JOB] stored inbound wamid for threading  case_id=%s  wamid=%s",
+            case_id,
+            message_id,
+        )
+
     try:
         # If a signal flow is currently processing a proactive update for this
         # client, wait briefly so the proactive_log is refreshed before we
@@ -1023,7 +1052,14 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
     request_id = str(fields.get("request_id") or "")
     signal_type = str(fields.get("signal_type") or "")
     source_message_id = str(fields.get("message_id") or "").strip()
-    reply_to_message_id = source_message_id if signal_type.startswith("diagnose_") else ""
+    reply_to_message_id = ""
+    if signal_type.startswith("diagnose_"):
+        if source_message_id.startswith("wamid."):
+            reply_to_message_id = source_message_id
+        elif channel == "whatsapp":
+            # LLM may have passed wrong message_id to the tool; fall back to the
+            # wamid stored when the original job was first processed.
+            reply_to_message_id = str(_redis.get(f"orchestrator:wamid:{case_id}") or "").strip()
 
     try:
         # Mark signal-in-flight so a concurrent job flow knows to wait briefly
