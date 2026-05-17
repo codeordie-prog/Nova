@@ -5,6 +5,7 @@ Description: Orchestrator tools for the orchestrator Agent
 
 """
 
+import json
 import os
 from uuid import uuid4
 from datetime import datetime
@@ -13,7 +14,13 @@ from dotenv import load_dotenv
 from langchain.tools import tool
 from redis import Redis
 
+from dermascan.backend.services.agents.memory.redis_checkpointer import default_redis_connection_kwargs
+from dermascan.shared.logger import get_logger
+from dermascan.shared.payload_log import dumps_compact, dumps_pretty
+
 load_dotenv()
+
+logger = get_logger(__name__)
 
 REDIS_URL: str = os.getenv("REDIS_URL", "")
 DIAGNOSE_JOB_STREAM: str = os.getenv("DIAGNOSE_JOB_STREAM", "diagnose:jobs")
@@ -25,7 +32,10 @@ CASE_STATUS_SCAN_MAX: int = max(CASE_STATUS_SCAN_PAGE, int(os.getenv("CASE_STATU
 CASE_STATUS_HISTORY: int = max(1, int(os.getenv("CASE_STATUS_HISTORY", "5")))
 
 
-_redis: Redis | None = Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+_redis: Redis | None = (
+    Redis.from_url(REDIS_URL, decode_responses=True, **default_redis_connection_kwargs())
+    if REDIS_URL else None
+)
 
 @tool
 def get_time(*args, **kwargs):
@@ -74,6 +84,43 @@ def enque_to_diagnose_stream(
     cid = client_id or "anonymous"
     csid = case_id or rid
 
+    # Inspect the payload the orchestrator agent (LLM) built. This is the point
+    # where a dropped / mangled image attachment first becomes visible — the LLM
+    # passes `payload` as a free-form string, so it can lose `content.attachments`.
+    try:
+        parsed_payload = json.loads(payload) if payload else {}
+    except Exception:
+        parsed_payload = {}
+    payload_attachments = ((parsed_payload.get("content") or {}).get("attachments")) or []
+    attachment_summary = [
+        {
+            "type": a.get("type"),
+            "mime_type": a.get("mime_type"),
+            "source_kind": (a.get("source") or {}).get("kind"),
+            "source_value_prefix": str((a.get("source") or {}).get("value") or "")[:120],
+        }
+        for a in payload_attachments
+        if isinstance(a, dict)
+    ]
+    logger.info(
+        "[ENQUEUE-DIAGNOSE] tool called  request_id=%s  case_id=%s  client_id=%s  message_id=%s  "
+        "channel=%s\n  payload_attachments=%d  attachment_summary=%s\n  full_payload=\n%s",
+        rid,
+        csid,
+        cid,
+        mid,
+        channel,
+        len(payload_attachments),
+        dumps_compact(attachment_summary),
+        dumps_pretty(parsed_payload) if parsed_payload else payload,
+    )
+    if not payload_attachments:
+        logger.warning(
+            "[ENQUEUE-DIAGNOSE] request_id=%s  payload has NO attachments — the diagnose worker "
+            "will report 'diagnose job missing image'. The orchestrator agent dropped the image.",
+            rid,
+        )
+
     stream_id = _redis.xadd(
         DIAGNOSE_JOB_STREAM,
         {
@@ -87,6 +134,12 @@ def enque_to_diagnose_stream(
         },
         maxlen=WORKERS_STREAM_MAXLEN,
         approximate=True,
+    )
+    logger.info(
+        "[ENQUEUE-DIAGNOSE] queued to %s  stream_id=%s  request_id=%s",
+        DIAGNOSE_JOB_STREAM,
+        stream_id,
+        rid,
     )
 
     _redis.xadd(
