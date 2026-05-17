@@ -25,6 +25,7 @@ from dermascan.backend.models.requests import (
     RoutingHint,
 )
 from dermascan.shared.logger import get_logger
+from dermascan.shared.payload_log import dumps_compact, dumps_pretty
 
 load_dotenv()
 
@@ -32,6 +33,13 @@ router = APIRouter(prefix="/v1", tags=["orchestrator"])
 
 
 logger = get_logger(__name__)
+
+
+def _is_whatsapp_meta_cdn_url(url: str) -> bool:
+    """Meta-hosted attachment URLs 401 on anonymous GET; never treat them as fetchable URLs."""
+    u = (url or "").strip().lower()
+    return "lookaside.fbsbx.com" in u or "fbcdn.net" in u
+
 
 _REDIS_URL: str = os.getenv("REDIS_URL", "")
 _ORCHESTRATOR_JOB_STREAM: str = os.getenv("ORCHESTRATOR_JOB_STREAM", "orchestrator:jobs")
@@ -283,7 +291,12 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
         media_ref: str = str(image_obj.get("media_ref") or "")
         mime_type: str = str(image_obj.get("mime_type") or "image/*")
         image_b64: str = str(image_obj.get("base64") or image_obj.get("data_base64") or "")
-        image_url: str = str(image_obj.get("url") or "").strip()
+        raw_image_url: str = str(image_obj.get("url") or "").strip()
+        image_url: str = raw_image_url
+        meta_cdn_blanked: bool = False
+        if image_url and _is_whatsapp_meta_cdn_url(image_url):
+            image_url = ""
+            meta_cdn_blanked = True
 
         if image_url:
             source = AttachmentSource(kind="url", value=image_url)
@@ -302,6 +315,25 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
         else:
             source = AttachmentSource(kind="whatsapp_media_id", value=media_id or "unknown")
             size_bytes = None
+
+        logger.info(
+            "[NOVA-INGRESS] normalize IMAGE  wamid=%s  raw_url_from_qutis=%s  meta_cdn_blanked=%s  "
+            "has_base64=%s  media_ref=%s  media_id=%s  →  source.kind=%s  source.value=%s",
+            message_id,
+            raw_image_url or "(none)",
+            meta_cdn_blanked,
+            bool(image_b64),
+            media_ref or "(none)",
+            media_id or "(none)",
+            source.kind,
+            (source.value[:120] if source.value else "(empty)"),
+        )
+        if source.kind == "whatsapp_media_id" and source.value == "unknown":
+            logger.warning(
+                "[NOVA-INGRESS] wamid=%s  IMAGE has no url / base64 / media_ref / media_id — "
+                "diagnose worker will not be able to resolve an image",
+                message_id,
+            )
 
         attachments.append(
             AttachmentItem(
@@ -323,6 +355,8 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
         media_id: str = str(document_obj.get("id") or "")
         mime_type: str = str(document_obj.get("mime_type") or "application/octet-stream")
         document_url: str = str(document_obj.get("url") or "").strip()
+        if document_url and _is_whatsapp_meta_cdn_url(document_url):
+            document_url = ""
 
         if document_url:
             doc_source = AttachmentSource(kind="url", value=document_url)
@@ -569,7 +603,13 @@ async def whatsapp_webhook(
         raise HTTPException(status_code=500, detail="REDIS_URL is not configured")
 
     messages = _extract_whatsapp_messages(payload)
+    logger.info(
+        "[NOVA-INGRESS] POST /v1/webhooks/whatsapp  messages=%d\nraw_payload_from_qutis=\n%s",
+        len(messages),
+        dumps_pretty(payload),
+    )
     if not messages:
+        logger.info("[NOVA-INGRESS] no messages in payload — ignored")
         return {"status": "ignored", "queued_count": 0, "request_ids": []}
 
     request_ids: list[str] = []
@@ -577,9 +617,10 @@ async def whatsapp_webhook(
         try:
             normalized = _normalize_message(message)
         except HTTPException as exc:
-            logger.warning("Skipping invalid whatsapp message: detail=%s", exc.detail)
+            logger.warning("[NOVA-INGRESS] skipping invalid whatsapp message: detail=%s", exc.detail)
             continue
 
+        content_json = _payload_content_json(normalized)
         try:
             _redis.xadd(
                 _ORCHESTRATOR_JOB_STREAM,
@@ -589,7 +630,7 @@ async def whatsapp_webhook(
                     "client_id": normalized.client_id,
                     "message_id": normalized.message_id,
                     "channel": normalized.channel,
-                    "payload": _payload_content_json(normalized),
+                    "payload": content_json,
                 },
                 maxlen=_WORKERS_STREAM_MAXLEN,
                 approximate=True,
@@ -597,11 +638,27 @@ async def whatsapp_webhook(
         except redis.RedisError as exc:
             raise HTTPException(status_code=503, detail="Redis unavailable") from exc
 
+        logger.info(
+            "[NOVA-INGRESS] enqueued orchestrator job  stream=%s  request_id=%s  case_id=%s  "
+            "client_id=%s  message_id=%s\n  job_payload=\n%s",
+            _ORCHESTRATOR_JOB_STREAM,
+            normalized.request_id,
+            normalized.case_id,
+            normalized.client_id,
+            normalized.message_id,
+            dumps_pretty(json.loads(content_json)) if content_json else "{}",
+        )
         request_ids.append(normalized.request_id)
 
     if not request_ids:
+        logger.info("[NOVA-INGRESS] no valid messages queued — ignored")
         return {"status": "ignored", "queued_count": 0, "request_ids": []}
 
+    logger.info(
+        "[NOVA-INGRESS] webhook done — queued_count=%d  request_ids=%s",
+        len(request_ids),
+        request_ids,
+    )
     return {"status": "queued", "queued_count": len(request_ids), "request_ids": request_ids}
 
 
