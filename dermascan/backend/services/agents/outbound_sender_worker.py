@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import socket
+import threading
 from collections import defaultdict
 from typing import Any
 
@@ -13,6 +14,7 @@ import requests
 from dotenv import load_dotenv
 
 from dermascan.shared.logger import get_logger
+from dermascan.backend.services.agents import reclaim_logic
 
 load_dotenv()
 
@@ -21,6 +23,15 @@ TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_HTTP_TIMEOUT_S: float = float(os.getenv("TELEGRAM_HTTP_TIMEOUT_S", "20"))
 TELEGRAM_TLS_VERIFY: str = os.getenv("TELEGRAM_TLS_VERIFY", "false")
 TELEGRAM_CA_BUNDLE: str = os.getenv("TELEGRAM_CA_BUNDLE", "")
+WHATSAPP_API_BASE_URL: str = os.getenv("WHATSAPP_API_BASE_URL", "http://127.0.0.1:8000")
+WHATSAPP_API_SEND_PATH: str = os.getenv("WHATSAPP_API_SEND_PATH", "/send")
+WHATSAPP_HTTP_TIMEOUT_S: float = float(os.getenv("WHATSAPP_HTTP_TIMEOUT_S", "20"))
+WHATSAPP_TLS_VERIFY: str = os.getenv("WHATSAPP_TLS_VERIFY", "true")
+WHATSAPP_CA_BUNDLE: str = os.getenv("WHATSAPP_CA_BUNDLE", "")
+WHATSAPP_INTERNAL_API_SECRET: str = os.getenv(
+    "WHATSAPP_INTERNAL_API_SECRET",
+    os.getenv("INTERNAL_API_SECRET", ""),
+)
 
 OUTBOUND_STREAM: str = os.getenv("OUTBOUND_STREAM", "outbound:messages")
 OUTBOUND_CONSUMER_GROUP: str = os.getenv("OUTBOUND_CONSUMER_GROUP", "outbound-sender-workers")
@@ -37,6 +48,9 @@ WORKERS_STREAM_MAXLEN: int = int(os.getenv("WORKERS_STREAM_MAXLEN", "5000"))
 
 logger: logging.Logger = get_logger("agents")
 _redis: redis.Redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+# Initialize reclaim_logic with the Redis client
+reclaim_logic.set_redis_client(_redis)
 
 
 def _ensure_consumer_group() -> None:
@@ -107,6 +121,70 @@ def _send_telegram(chat_id: str, text: str, reply_to_message_id: int | None = No
             raise RuntimeError(f"telegram send non-ok: {payload}")
 
 
+def _normalize_whatsapp_recipient(case_id: str) -> str:
+    """
+    Normalize recipient into E.164 digits expected by qutis /send.
+
+    Args:
+        case_id: Outbound case identifier from stream.
+
+    Returns:
+        Digits-only phone number without the leading plus sign.
+    """
+    normalized = str(case_id or "").strip()
+    if normalized.startswith("+"):
+        normalized = normalized[1:]
+    return normalized
+
+
+def _send_whatsapp(case_id: str, text: str, reply_to_wamid: str | None = None) -> None:
+    """
+    Send a text message to WhatsApp through qutis sidecar /send endpoint.
+
+    Args:
+        case_id: Recipient identity (phone number).
+        text: Message text body.
+        reply_to_wamid: Optional WhatsApp message id for threading.
+    """
+    if not WHATSAPP_INTERNAL_API_SECRET:
+        raise RuntimeError("WHATSAPP_INTERNAL_API_SECRET (or INTERNAL_API_SECRET) is missing")
+
+    to = _normalize_whatsapp_recipient(case_id)
+    if not to:
+        raise ValueError("missing case_id for whatsapp outbound")
+
+    verify: bool | str = True
+    if WHATSAPP_CA_BUNDLE.strip():
+        verify = WHATSAPP_CA_BUNDLE.strip()
+    elif WHATSAPP_TLS_VERIFY.strip().lower() in {"0", "false", "no", "off"}:
+        verify = False
+
+    base_url = WHATSAPP_API_BASE_URL.rstrip("/")
+    send_path = WHATSAPP_API_SEND_PATH if WHATSAPP_API_SEND_PATH.startswith("/") else f"/{WHATSAPP_API_SEND_PATH}"
+    url = f"{base_url}{send_path}"
+    payload: dict[str, Any] = {"to": to, "kind": "text", "text": text}
+    reply_target = str(reply_to_wamid or "").strip()
+    if reply_target:
+        payload["reply_to_wamid"] = reply_target
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Internal-Secret": WHATSAPP_INTERNAL_API_SECRET,
+    }
+    response = requests.post(
+        url,
+        json=payload,
+        headers=headers,
+        timeout=WHATSAPP_HTTP_TIMEOUT_S,
+        verify=verify,
+    )
+    response.raise_for_status()
+    response_payload = response.json() if response.content else {}
+    status_value = str(response_payload.get("status") or "").strip().lower()
+    if status_value != "sent":
+        raise RuntimeError(f"whatsapp send non-sent response: {response_payload}")
+
+
 def _to_int(value: Any) -> int | None:
     """
     Convert a value to an integer.
@@ -147,6 +225,11 @@ def _deliver(fields: dict[str, Any], reply_to_message_id: int | None = None) -> 
         if not case_id:
             raise ValueError("missing case_id for telegram outbound")
         _send_telegram(case_id, text, reply_to_message_id=reply_to_message_id)
+        return
+
+    if channel == "whatsapp":
+        reply_to_wamid = str(fields.get("reply_to_message_id") or "").strip()
+        _send_whatsapp(case_id, text, reply_to_wamid=reply_to_wamid or None)
         return
     raise ValueError(f"unsupported channel: {channel}")
 
@@ -541,6 +624,66 @@ def _compact_case_items(items: list[tuple[str, dict[str, Any]]]) -> list[tuple[s
 
     return sorted(kept, key=_delivery_order_key)
 
+def _start_reclaim_thread(
+    stop_event: threading.Event,
+) -> threading.Thread:
+    """
+    Start a background thread that periodically reclaims stale pending messages.
+
+    Args:
+        stop_event: Cooperative shutdown flag.
+
+    Returns:
+        The started reclaim thread.
+    """
+    def _reclaim_loop() -> None:
+        while not stop_event.is_set():
+            try:
+                def _reclaim_handler(msg_id: str, fields: dict[str, Any]) -> None:
+                    # Mark as processed before handling to ensure idempotency
+                    if reclaim_logic.mark_processed(OUTBOUND_STREAM, msg_id):
+                        try:
+                            # Re-process the message by adding it back to the stream
+                            # This is a simplified approach - the message will be re-read normally
+                            _redis.xadd(OUTBOUND_STREAM, fields)
+                            # Ack and delete the reclaimed message
+                            _redis.xack(OUTBOUND_STREAM, OUTBOUND_CONSUMER_GROUP, msg_id)
+                            _redis.xdel(OUTBOUND_STREAM, msg_id)
+                        except Exception:
+                            logger.exception(
+                                "reclaim handler failed: stream=%s msg_id=%s",
+                                OUTBOUND_STREAM, msg_id,
+                            )
+                            # Mark as not processed so it can be retried
+                            _redis.delete(reclaim_logic.processed_key(OUTBOUND_STREAM, msg_id))
+
+                reclaimed = reclaim_logic.reclaim_stale_pending(
+                    stream=OUTBOUND_STREAM,
+                    group=OUTBOUND_CONSUMER_GROUP,
+                    consumer=OUTBOUND_CONSUMER_NAME,
+                    handler=_reclaim_handler,
+                    dlq_stream=OUTBOUND_DLQ_STREAM,
+                )
+                if reclaimed > 0:
+                    logger.info(
+                        "reclaim pass completed: stream=%s reclaimed=%d",
+                        OUTBOUND_STREAM, reclaimed,
+                    )
+            except Exception:
+                logger.exception("reclaim loop error: stream=%s", OUTBOUND_STREAM)
+
+            # Wait for the interval or stop event
+            stop_event.wait(timeout=reclaim_logic.RECLAIM_INTERVAL_SEC)
+
+    thread = threading.Thread(
+        target=_reclaim_loop,
+        name=f"outbound-reclaim-{OUTBOUND_STREAM}",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def _compact_client_items(items: list[tuple[str, dict[str, Any]]]) -> list[tuple[str, dict[str, Any]]]:
     by_case: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
     for item in items:
@@ -560,56 +703,71 @@ def run_worker_forever() -> None:
     _ensure_consumer_group()
     logger.info("outbound sender started: stream=%s group=%s consumer=%s", OUTBOUND_STREAM, OUTBOUND_CONSUMER_GROUP, OUTBOUND_CONSUMER_NAME)
 
-    while True:
-        resp = _redis.xreadgroup(
-            groupname=OUTBOUND_CONSUMER_GROUP,
-            consumername=OUTBOUND_CONSUMER_NAME,
-            streams={OUTBOUND_STREAM: ">"},
-            count=OUTBOUND_BATCH_MAX,
-            block=OUTBOUND_BLOCK_MS,
-        )
-        messages = [(str(mid), fields) for _, batch in (resp or []) for mid, fields in batch]
-        if not messages:
-            continue
+    stop_event = threading.Event()
 
-        grouped: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
-        for mid, fields in messages:
-            grouped[str(fields.get("client_id") or "anonymous")].append((mid, fields))
+    # Start reclaim thread
+    reclaim_thread = _start_reclaim_thread(stop_event)
 
-        for client_id, items in grouped.items():
-            selected_items = _compact_client_items(items)
-            selected_ids = {mid for mid, _ in selected_items}
+    try:
+        while not stop_event.is_set():
+            resp = _redis.xreadgroup(
+                groupname=OUTBOUND_CONSUMER_GROUP,
+                consumername=OUTBOUND_CONSUMER_NAME,
+                streams={OUTBOUND_STREAM: ">"},
+                count=OUTBOUND_BATCH_MAX,
+                block=OUTBOUND_BLOCK_MS,
+            )
+            messages = [(str(mid), fields) for _, batch in (resp or []) for mid, fields in batch]
+            if not messages:
+                continue
 
-            # Detect chaos mode - essential for threading logic
-            chaos_mode = _detect_chaos_mode(client_id, selected_items)
-            if chaos_mode:
-                logger.debug("outbound chaos mode active: client_id=%s selected=%d", client_id, len(selected_items))
+            grouped: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+            for mid, fields in messages:
+                grouped[str(fields.get("client_id") or "anonymous")].append((mid, fields))
 
-            ordered_items = sorted(selected_items, key=_delivery_order_key)
+            for client_id, items in grouped.items():
+                selected_items = _compact_client_items(items)
+                selected_ids = {mid for mid, _ in selected_items}
 
-            # Ack/drop compacted-away records so they do not get redelivered.
-            for mid, _ in items:
-                if mid not in selected_ids:
-                    _ack_delete(mid)
+                # Detect chaos mode - essential for threading logic
+                chaos_mode = _detect_chaos_mode(client_id, selected_items)
+                if chaos_mode:
+                    logger.debug("outbound chaos mode active: client_id=%s selected=%d", client_id, len(selected_items))
 
-            for mid, fields in ordered_items:
-                dedupe_key = str(fields.get("dedupe_key") or "")
-                if dedupe_key:
-                    seen_key = f"outbound:sent:{dedupe_key}"
-                    if not _redis.set(seen_key, "1", nx=True, ex=OUTBOUND_DEDUPE_TTL_SEC):
+                ordered_items = sorted(selected_items, key=_delivery_order_key)
+
+                # Ack/drop compacted-away records so they do not get redelivered.
+                for mid, _ in items:
+                    if mid not in selected_ids:
                         _ack_delete(mid)
-                        continue
-                try:
 
-                    # How do we reply - if chaos Mode reply to target, otherwise reply to message id
-                    should_thread, target = _threading_decision(fields, chaos_mode)
-                    _deliver(fields, reply_to_message_id=target if should_thread else None)
-                    _ack_delete(mid)
-                    
-                except Exception as exc:
-                    _dlq(mid, fields, str(exc))
-                    _ack_delete(mid)
-                    logger.exception("outbound delivery failed: msg_id=%s", mid)
+                for mid, fields in ordered_items:
+                    dedupe_key = str(fields.get("dedupe_key") or "")
+                    if dedupe_key:
+                        seen_key = f"outbound:sent:{dedupe_key}"
+                        if not _redis.set(seen_key, "1", nx=True, ex=OUTBOUND_DEDUPE_TTL_SEC):
+                            _ack_delete(mid)
+                            continue
+                    try:
+
+                        # How do we reply - if chaos Mode reply to target, otherwise reply to message id
+                        should_thread, target = _threading_decision(fields, chaos_mode)
+                        _deliver(fields, reply_to_message_id=target if should_thread else None)
+                        _ack_delete(mid)
+
+                        # Mark as processed for idempotency
+                        reclaim_logic.mark_processed(OUTBOUND_STREAM, mid)
+
+                    except Exception as exc:
+                        _dlq(mid, fields, str(exc))
+                        _ack_delete(mid)
+                        logger.exception("outbound delivery failed: msg_id=%s", mid)
+    except KeyboardInterrupt:
+        logger.info("outbound sender received KeyboardInterrupt; shutting down")
+    finally:
+        stop_event.set()
+        reclaim_thread.join(timeout=5.0)
+        logger.info("outbound sender stopped")
 
 
 if __name__ == "__main__":

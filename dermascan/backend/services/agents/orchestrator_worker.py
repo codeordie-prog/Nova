@@ -16,6 +16,7 @@ import os
 import time
 import logging
 import json
+import re
 import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +27,7 @@ import redis
 
 
 from dermascan.backend.services.tools.orchestrator.orchestrator_tools import (
+    cache_ingress_payload,
     orchestrator_tools,
     internet_search,
     wikipedia_search,
@@ -35,6 +37,13 @@ from dermascan.backend.services.agents.build import (
     open_checkpointer_url,
     build_google_credentials,
 )
+from dermascan.backend.services.agents.product_rules_signal_helper import (
+    run_product_signal_rules_flow,
+    run_skin_signal_rules_flow,
+)
+from dermascan.backend.services.agents.group_report_aggregator import (
+    collect_and_compile_if_ready,
+)
 from dermascan.shared.logger import get_logger
 from langchain_core.runnables import RunnableConfig
 from langchain.agents import create_agent
@@ -42,13 +51,14 @@ from langchain.agents.middleware import SummarizationMiddleware, wrap_model_call
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dermascan.backend.services.agents.prompts.orchestrator_prompt import system_prompt
+from dermascan.backend.services.agents import reclaim_logic
 
 
 # Load environment variables
 load_dotenv()
 
 # Get env variables
-OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY_QUTIS", "")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY_QUTIS", "")
 CRED_PATH: str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_QUTIS", "")
 PROJECT_ID: str = os.getenv("GOOGLE_CLOUD_PROJECT_QUTIS", "qutisai")
@@ -56,6 +66,37 @@ LOCATION: str = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 REDIS_URL: str = os.getenv("REDIS_URL", "")
 BASE_DIR: str = os.path.dirname(__file__)
 CONFIG_PATH: str = os.path.join(BASE_DIR, "configurations", "agents_config.json")
+
+# Self-hosted Qwen primary model (Modal vLLM OpenAI-compatible endpoint).
+# Supports both the newer concise names and the existing .env names used by
+# earlier Qwen experiments.
+QWEN_BASE_URL: str = (
+    os.getenv("QWEN_BASE_URL")
+    or os.getenv("QWEN_OPENAI_BASE_URL")
+    or ""
+).strip()
+QWEN_SERVED_MODEL_NAME: str = (
+    os.getenv("QWEN_SERVED_MODEL_NAME")
+    or os.getenv("QWEN_MODEL_NAME")
+    or "qwen-3-8b"
+).strip()
+QWEN_API_KEY: str = (
+    os.getenv("QWEN_API_KEY")
+    or os.getenv("QWEN_OPENAI_API_KEY")
+    or "EMPTY"
+)
+QWEN_TEMPERATURE: float = float(os.getenv("QWEN_TEMPERATURE", "0.0"))
+QWEN_MAX_TOKENS: int = int(os.getenv("QWEN_MAX_TOKENS", "512"))
+QWEN_REQUEST_TIMEOUT_S: float = float(os.getenv("QWEN_REQUEST_TIMEOUT_S", "45"))
+# Mirror the serving-side max_model_len so memory middleware can reserve
+# enough budget for system prompt + tools + output tokens before summarizing.
+QWEN_MAX_MODEL_LEN: int = int(os.getenv("QWEN_MAX_MODEL_LEN", "16384"))
+# Qwen3 emits <think> blocks by default; disable so the orchestrator receives
+# clean, tool-callable completions. vLLM honors this chat-template kwarg.
+QWEN_ENABLE_THINKING: bool = os.getenv("QWEN_ENABLE_THINKING", "false").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+OPENAI_REQUEST_TIMEOUT_S: float = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"))
 
 # Define default configurations
 DEFAULT_CONFIG: List[Dict[str, Any]] = [{
@@ -138,6 +179,19 @@ INFLIGHT_WAIT_POLL_MS: int = max(50, int(os.getenv("ORCHESTRATOR_INFLIGHT_WAIT_P
 # Initialize REDIS client
 _redis: redis.Redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
+# Initialize reclaim_logic with the Redis client
+reclaim_logic.set_redis_client(_redis)
+
+
+def _strip_markdown_formatting(text: str) -> str:
+    cleaned = str(text or "")
+    cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"__(.*?)__", r"\1", cleaned)
+    cleaned = re.sub(r"`([^`]*)`", r"\1", cleaned)
+    cleaned = re.sub(r"^\s{0,3}#{1,6}\s*", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"\r\n", "\n", cleaned)
+    return cleaned.strip()
+
 
 class StructuredResponse(BaseModel):
     """
@@ -202,6 +256,96 @@ def _is_resource_exhaustion_error(exc: Exception) -> bool:
     """
     text: str = str(exc).lower()
     return "429" in text or "resource exhausted" in text or "rate limit" in text
+
+
+def _iter_exception_chain(exc: BaseException) -> list[BaseException]:
+    """
+    Flatten an exception and its ``__cause__`` / ``__context__`` chain.
+
+    Args:
+        exc: Root exception.
+
+    Returns:
+        list[BaseException]: Root-first exception chain (deduplicated).
+    """
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    cursor: BaseException | None = exc
+    while cursor is not None and id(cursor) not in seen:
+        chain.append(cursor)
+        seen.add(id(cursor))
+        cursor = cursor.__cause__ or cursor.__context__
+    return chain
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    """
+    Detect timeout failures across wrapped SDK/network exceptions.
+
+    Args:
+        exc: Raised exception from provider invocation.
+
+    Returns:
+        bool: True when the failure is timeout-related.
+    """
+    for current in _iter_exception_chain(exc):
+        # Direct timeout class checks first.
+        if isinstance(current, TimeoutError):
+            return True
+
+        # Fallback to robust class/text heuristics for wrapped client errors.
+        class_name: str = current.__class__.__name__.lower()
+        text: str = str(current).lower()
+        if "timeout" in class_name:
+            return True
+        if "timed out" in text or "timeout" in text or "deadline exceeded" in text:
+            return True
+    return False
+
+
+def _should_fallback(exc: Exception) -> bool:
+    """
+    Decide whether a model failure warrants trying the next provider.
+
+    Covers resource exhaustion (rate limits / quota) plus transient availability
+    failures that are common with a self-hosted endpoint (cold start, scaledown,
+    network blips, gateway errors). Logic/validation errors are NOT swallowed so
+    genuine bugs still surface.
+
+    Args:
+        exc (Exception): The exception raised by a model invocation.
+
+    Returns:
+        bool: True if the orchestrator should fall through to the next model.
+    """
+    # Check 429 status code
+    if _is_resource_exhaustion_error(exc):
+        return True
+    if _is_timeout_error(exc):
+        return True
+
+    text: str = str(exc).lower()
+    transient_markers: tuple[str, ...] = (
+        "maximum context length",
+        "context length",
+        "input_tokens",
+        "reduce the length",
+        "timeout",
+        "timed out",
+        "connection",
+        "connect error",
+        "service unavailable",
+        "temporarily unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "see other",
+        "303",
+        "502",
+        "503",
+        "504",
+    )
+    return any(marker in text for marker in transient_markers)
+
 
 def _proactive_log_key(client_id: str) -> str:
     """
@@ -633,26 +777,77 @@ def _ensure_consumer_group(stream: str = "orchestrator_job") -> None:
         raise
 
 
+def _build_qwen_model() -> Optional[ChatOpenAI]:
+    """
+    Build the self-hosted Qwen primary model client, if configured.
+
+    The Modal vLLM service exposes an OpenAI-compatible API, so a standard
+    ``ChatOpenAI`` client targets it via ``base_url``. Qwen3 "thinking" is
+    disabled through the vLLM chat-template kwarg for clean tool-calling output.
+
+    Returns:
+        Optional[ChatOpenAI]: Configured Qwen client, or None when
+        ``QWEN_BASE_URL`` is not set.
+    """
+    if not QWEN_BASE_URL:
+        logger.warning(
+            "Qwen primary DISABLED: QWEN_BASE_URL is not set; OpenAI Provider will act as "
+            "primary. Set QWEN_BASE_URL to the Modal vLLM endpoint to make Qwen primary."
+        )
+        return None
+
+    # Normalize to the OpenAI v1 base path expected by the client.
+    base_url: str = QWEN_BASE_URL.rstrip("/")
+    if not base_url.endswith("/v1"):
+        base_url = f"{base_url}/v1"
+
+    logger.info(
+        "Qwen primary ENABLED: base_url=%s, model=%s, max_tokens=%s, timeout=%ss, enable_thinking=%s",
+        base_url,
+        QWEN_SERVED_MODEL_NAME,
+        QWEN_MAX_TOKENS,
+        QWEN_REQUEST_TIMEOUT_S,
+        QWEN_ENABLE_THINKING,
+    )
+    return ChatOpenAI(
+        model=QWEN_SERVED_MODEL_NAME,
+        base_url=base_url,
+        api_key=QWEN_API_KEY,
+        timeout=QWEN_REQUEST_TIMEOUT_S,
+        temperature=QWEN_TEMPERATURE,
+        max_tokens=QWEN_MAX_TOKENS,
+        extra_body={"chat_template_kwargs": {"enable_thinking": QWEN_ENABLE_THINKING}}
+    )
+
+
 def _build_dynamic_agent(*, checkpointer: Any) -> Any:
     """
-    Build a dynamic agent with Google and OpenAI providers.
-    This dynamic Logic is important for creating fallbacks.
-    
+    Build a dynamic agent with an ordered model fallback chain.
+
+    The chain is, in priority order: self-hosted Qwen (primary, when
+    ``QWEN_BASE_URL`` is set) -> OpenAI -> Google Gemini. A middleware tries each
+    provider in turn, falling through on rate-limit/availability failures so a
+    single overloaded or cold provider never breaks a turn.
+
+    Args:
+        checkpointer: The conversation checkpointer to attach to the agent.
+
     Returns:
-        Any: A dynamic agent with Google and OpenAI providers
+        Any: A LangChain agent backed by the fallback chain.
+
+    Raises:
+        RuntimeError: If neither Qwen nor OpenAI is configured (no usable
+            primary provider).
     """
     # Get config files
     google_cfg = get_config_file(CONFIG_PATH, "google")
     openai_cfg = get_config_file(CONFIG_PATH, "openai")
 
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is required for fallback provider")
-
     # Get Google service account access credentials
     creds = build_google_credentials(path=CRED_PATH)
 
-    # Define Primary model
-    primary_model = ChatGoogleGenerativeAI(
+    # Define Gemini provider (final fallback)
+    gemini_model = ChatGoogleGenerativeAI(
         model=google_cfg["model"],
         credentials=creds,
         temperature=google_cfg["temperature"],
@@ -662,65 +857,120 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         project=PROJECT_ID,
         api_key=GEMINI_API_KEY,
     )
-    
-    # Define Fallback model
-    fallback_model = ChatOpenAI(
-        model=openai_cfg["model"],
-        temperature=openai_cfg["temperature"],
-        max_tokens=openai_cfg["max_tokens"],
-        api_key=OPENAI_API_KEY,
+
+    # Define OpenAI provider (secondary)
+    openai_model: Optional[ChatOpenAI] = (
+        ChatOpenAI(
+            model=openai_cfg["model"],
+            temperature=openai_cfg["temperature"],
+            max_tokens=openai_cfg["max_tokens"],
+            api_key=OPENAI_API_KEY,
+            timeout=OPENAI_REQUEST_TIMEOUT_S,
+        )
+        if OPENAI_API_KEY
+        else None
+    )
+
+    # Define Qwen provider (primary, when configured)
+    qwen_model: Optional[ChatOpenAI] = _build_qwen_model()
+
+    # Assemble the ordered fallback chain: Qwen -> OpenAI -> Gemini. Each entry
+    # is paired with a human-readable name for logging. Unconfigured providers
+    # are skipped so the chain only contains usable models.
+    model_chain: List[tuple[str, Any]] = []
+    if qwen_model is not None:
+        model_chain.append((f"qwen:{QWEN_SERVED_MODEL_NAME}", qwen_model))
+    if openai_model is not None:
+        model_chain.append((f"openai:{openai_cfg['model']}", openai_model))
+    model_chain.append((f"gemini:{google_cfg['model']}", gemini_model))
+
+    if model_chain[0][1] is gemini_model:
+        # Only Gemini is available; Qwen/OpenAI both unconfigured. This is almost
+        # certainly a misconfiguration for a "Qwen-primary" deployment.
+        raise RuntimeError(
+            "No primary provider configured: set QWEN_BASE_URL or OPENAI_API_KEY_QUTIS"
+        )
+
+    # The first model in the chain is the default bound to the agent; the
+    # middleware overrides it per call to implement the fallback ordering.
+    primary_model: Any = model_chain[0][1]
+    logger.info(
+        "orchestrator model chain: %s",
+        " -> ".join(name for name, _ in model_chain),
     )
 
     # Define dynamic model selection MIDDLEWARE
     @wrap_model_call
     def dynamic_model_selection(request: ModelRequest, handler) -> ModelResponse:
         """
-        Dynamic model selection middleware that tries primary model first,
-        and falls back to fallback model if primary model is exhausted.
-        This Logic tries to address the common 429 error (rate limit exceeded)
-        by switching to a different provider when the current one is overloaded.
-        
+        Try each provider in the fallback chain until one succeeds.
+
+        Iterates ``model_chain`` in priority order. On a rate-limit/availability
+        failure it falls through to the next provider; on a non-transient error
+        (or after the last provider) it re-raises so real bugs are not masked.
+
         Args:
-            request: The model request
-            handler: The model handler
-            
+            request: The model request.
+            handler: The model handler.
+
         Returns:
-            ModelResponse: The model response
+            ModelResponse: The first successful model response.
         """
-        primary_request = request.override(model=primary_model)
-        try:
-            return handler(primary_request)
+        last_exc: Optional[Exception] = None
+        for index, (name, model) in enumerate(model_chain):
+            role: str = "primary" if index == 0 else f"fallback#{index}"
+            try:
+                logger.info("invoking model: %s (%s)", name, role)
+                response: ModelResponse = handler(request.override(model=model))
+                logger.info("model replied: %s (%s)", name, role)
+                return response
+            except Exception as exc:
+                last_exc = exc
+                is_last: bool = index == len(model_chain) - 1
+                if is_last or not _should_fallback(exc):
+                    raise
+                logger.warning(
+                    "model %s failed (%s); falling back to next provider",
+                    name,
+                    exc,
+                )
+        # Defensive: the loop always returns or raises, but satisfy type-checkers.
+        raise last_exc if last_exc is not None else RuntimeError("model chain empty")
 
-        except Exception as exc:
-            if not _is_resource_exhaustion_error(exc):
-                raise
-            logger.warning("Primary model exhausted; retrying with fallback model")
-            fallback_request = request.override(model=fallback_model)
-            return handler(fallback_request)
-
-    soul_str = ""
-
-    # Load Soul.md
-    soul_path = os.path.join(BASE_DIR, "soul.md")
-    try:
-        with open(soul_path, "r", encoding="utf-8") as soul_file:
-            soul_content = soul_file.read()
-            if soul_content:
-                soul_str = f"Here is your core values and origin provided in this soul description: \n\n{soul_content}"
-    except Exception:
-        logger.warning("failed to load soul.md from %s; continuing with base system prompt", soul_path)
-    
+    # Dynamic summarization trigger:
+    # Uses Qwen3's max_model_len to calculate the summarization trigger tokens.
+    # - Reserve explicit output budget.
+    # - Reserve extra context for system prompt, tool schemas/results, and
+    #   serialization overhead.
+    # - Trigger summarization only when conversational history exceeds this
+    #   remaining budget.
+    reserved_output_tokens: int = max(128, QWEN_MAX_TOKENS)
+    reserved_overhead_tokens: int = max(
+        2048,
+        int(QWEN_MAX_MODEL_LEN * 0.20),
+    )
+    summarization_trigger_tokens: int = max(
+        1500,
+        QWEN_MAX_MODEL_LEN - reserved_output_tokens - reserved_overhead_tokens,
+    )
+    logger.info(
+        "summarization budget: model_len=%s output_reserve=%s overhead_reserve=%s trigger_tokens=%s",
+        QWEN_MAX_MODEL_LEN,
+        reserved_output_tokens,
+        reserved_overhead_tokens,
+        summarization_trigger_tokens,
+    )
 
     return create_agent(
         model=primary_model,
         tools=orchestrator_tools,
-        system_prompt=soul_str + system_prompt,
+        system_prompt=system_prompt,
         middleware=[
             dynamic_model_selection,
             SummarizationMiddleware(
                 model=primary_model,
-                trigger=("tokens", 1000),
-                keep=("messages", 10),
+                trigger=("tokens", summarization_trigger_tokens),
+                keep=("messages", 6),
             ),
         ],
         checkpointer=checkpointer,
@@ -825,6 +1075,74 @@ def _reader_loop(
             pool.submit(_run)
 
 
+def _start_reclaim_thread(
+    stream: str,
+    group: str,
+    consumer: str,
+    handler: Callable[[Any, str, dict[str, Any]], None],
+    agent: Any,
+    dlq_stream: Optional[str],
+    stop_event: threading.Event,
+) -> threading.Thread:
+    """
+    Start a background thread that periodically reclaims stale pending messages.
+
+    Args:
+        stream: Redis stream key.
+        group: Consumer group name.
+        consumer: Consumer name to reclaim messages to.
+        handler: The message handler (takes agent, msg_id, fields).
+        agent: The agent instance to pass to the handler.
+        dlq_stream: DLQ stream for messages exceeding max reclaim attempts.
+        stop_event: Cooperative shutdown flag.
+
+    Returns:
+        The started reclaim thread.
+    """
+    def _reclaim_loop() -> None:
+        while not stop_event.is_set():
+            try:
+                # Create a closure that adapts the handler signature
+                def _reclaim_handler(msg_id: str, fields: dict[str, Any]) -> None:
+                    # Mark as processed before handling to ensure idempotency
+                    if reclaim_logic.mark_processed(stream, msg_id):
+                        try:
+                            handler(agent, msg_id, fields)
+                        except Exception:
+                            logger.exception(
+                                "reclaim handler failed: stream=%s msg_id=%s",
+                                stream, msg_id,
+                            )
+                            # Mark as not processed so it can be retried
+                            _redis.delete(reclaim_logic.processed_key(stream, msg_id))
+
+                reclaimed = reclaim_logic.reclaim_stale_pending(
+                    stream=stream,
+                    group=group,
+                    consumer=consumer,
+                    handler=_reclaim_handler,
+                    dlq_stream=dlq_stream,
+                )
+                if reclaimed > 0:
+                    logger.info(
+                        "reclaim pass completed: stream=%s reclaimed=%d",
+                        stream, reclaimed,
+                    )
+            except Exception:
+                logger.exception("reclaim loop error: stream=%s", stream)
+
+            # Wait for the interval or stop event
+            stop_event.wait(timeout=reclaim_logic.RECLAIM_INTERVAL_SEC)
+
+    thread = threading.Thread(
+        target=_reclaim_loop,
+        name=f"orchestrator-reclaim-{stream}",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> None:
     """
     Process a message from the orchestrator job stream.
@@ -884,6 +1202,15 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                 "checkpoint_ns": "orchestrator",
             }
         }
+        cache_ingress_payload(
+            request_id=request_id,
+            case_id=case_id,
+            client_id=client_id,
+            message_id=message_id,
+            channel=channel,
+            payload=payload_json,
+        )
+
         res = agent.invoke(
             {"messages": [{"role": "user", "content": user_prompt}]},
             config=config,
@@ -893,6 +1220,7 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             if isinstance(res, dict) and res.get("structured_response") is not None
             else str(res)
         )
+        reply = _strip_markdown_formatting(reply)
 
         print(reply)
         logger.info("Orchestrator reply: %s", reply)
@@ -934,6 +1262,9 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         # Acknowledge the job stream message and delete it from the stream
         _redis.xack(ORCHESTRATOR_JOB_STREAM, ORCHESTRATOR_CONSUMER_GROUP, msg_id)
         _redis.xdel(ORCHESTRATOR_JOB_STREAM, msg_id)
+
+        # Mark as processed for idempotency
+        reclaim_logic.mark_processed(ORCHESTRATOR_JOB_STREAM, msg_id)
 
     except Exception as exc:
 
@@ -1123,9 +1454,24 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
     request_id = str(fields.get("request_id") or "")
     signal_type = str(fields.get("signal_type") or "")
     source_message_id = str(fields.get("message_id") or "").strip()
-    reply_to_message_id = source_message_id if signal_type.startswith("diagnose_") else ""
+    reply_to_message_id = (source_message_id if signal_type.startswith("diagnose_")
+    or signal_type.startswith("product_review_") else "")
 
+    logger.info("___-------------------_______")
+    logger.info(f"THIS IS THE SIGNAL TYPE: {signal_type}")
+    logger.info("___-------------------_______")
     try:
+        payload_obj: dict[str, Any] = {}
+        try:
+            payload_obj = json.loads(str(fields.get("payload") or "{}"))
+        except Exception:
+            payload_obj = {}
+        metadata_obj = payload_obj.get("metadata") or {}
+        extras_obj = metadata_obj.get("extras") if isinstance(metadata_obj, dict) else {}
+        extras_obj = extras_obj if isinstance(extras_obj, dict) else {}
+        group_id = str(extras_obj.get("group_id") or "").strip()
+        group_expected_count = int(str(extras_obj.get("group_expected_count") or "1"))
+
         # Mark signal-in-flight so a concurrent job flow knows to wait briefly
         # for this signal's proactive_log write before composing its reply.
         # Signals are higher priority and never wait on the job marker
@@ -1142,34 +1488,98 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             },
         )
 
-        # Read recent conversations first and build an input for the signal
-        conversation_entries = _read_conversation_log(client_id, CONVERSATION_LOG_INCLUDE_N)
-        research_context = _perform_signal_research(fields)
-        signal_prompt = _build_signal_input(
-            fields,
-            conversation_entries=conversation_entries,
-            research_context=research_context,
-        )
-        config: RunnableConfig = {
-            "configurable": {
-                "thread_id": client_id,
-                # Separate namespace prevents races with concurrent job-flow
-                # invokes on the same client_id (jobs use ns="orchestrator").
-                "checkpoint_ns": "orchestrator:signal",
+        if signal_type.startswith("product_review_"):
+            logger.info(
+                "processing product-review signal through rules flow: request_id=%s case_id=%s client_id=%s signal_type=%s",
+                request_id,
+                case_id,
+                client_id,
+                signal_type,
+            )
+            rules_result = run_product_signal_rules_flow(
+                fields=fields,
+                context=_read_conversation_log(client_id, 10),    
+            )
+            summary = str(rules_result.get("summary") or "").strip()
+            friendly_report = str(rules_result.get("user_friendly_report") or "").strip()
+            sources = rules_result.get("sources") or []
+            sources_text = "\n".join(str(item) for item in sources if str(item).strip())
+            primary_text = friendly_report or summary
+            reply = primary_text if not sources_text else f"{primary_text}\n\nSources:\n{sources_text}"
+       
+        elif signal_type.startswith("diagnose_") or signal_type.startswith("skin_"):
+            logger.info(
+                "processing skin-review signal through rules flow: request_id=%s case_id=%s client_id=%s signal_type=%s",
+                request_id,
+                case_id,
+                client_id,
+                signal_type,
+            )
+            rules_result = run_skin_signal_rules_flow(
+                fields=fields,
+                context=_read_conversation_log(client_id, 10)
+            )
+            summary = str(rules_result.get("summary") or "").strip()
+            friendly_report = str(rules_result.get("user_friendly_report") or "").strip()
+            sources = rules_result.get("sources") or []
+            sources_text = "\n".join(str(item) for item in sources if str(item).strip())
+            primary_text = friendly_report or summary
+            reply = primary_text if not sources_text else f"{primary_text}\n\nSources:\n{sources_text}"
+        else:
+            # Read recent conversations first and build an input for the signal
+            conversation_entries = _read_conversation_log(client_id, CONVERSATION_LOG_INCLUDE_N)
+            research_context = _perform_signal_research(fields)
+            signal_prompt = _build_signal_input(
+                fields,
+                conversation_entries=conversation_entries,
+                research_context=research_context,
+            )
+            config: RunnableConfig = {
+                "configurable": {
+                    "thread_id": client_id,
+                    # Separate namespace prevents races with concurrent job-flow
+                    # invokes on the same client_id (jobs use ns="orchestrator").
+                    "checkpoint_ns": "orchestrator:signal",
+                }
             }
-        }
-        res = agent.invoke(
-            {"messages": [{"role": "user", "content": signal_prompt}]},
-            config=config,
-        )
-        reply = (
-            res.get("structured_response").response
-            if isinstance(res, dict) and res.get("structured_response") is not None
-            else str(res)
-        )
+            res = agent.invoke(
+                {"messages": [{"role": "user", "content": signal_prompt}]},
+                config=config,
+            )
+            reply = (
+                res.get("structured_response").response
+                if isinstance(res, dict) and res.get("structured_response") is not None
+                else str(res)
+            )
+
+        reply = _strip_markdown_formatting(reply)
 
         print(reply)
         logger.info("Orchestrator proactive reply: %s", reply)
+
+        # If the signal is part of a group, aggregate the replies
+        if group_id and group_expected_count > 1:
+            logger.info("___-------------------_______")
+            logger.info(f"THIS IS THE GROUP ID: {group_id}")
+            logger.info(f"THIS IS THE GROUP EXPECTED COUNT: {group_expected_count}")
+            logger.info("___-------------------_______")
+            aggregate_result = collect_and_compile_if_ready(
+                group_id=group_id,
+                expected_count=group_expected_count,
+                request_id=request_id,
+                signal_type=signal_type,
+                item_text=reply,
+                item_payload={
+                    "fields": fields,
+                    "reply": reply,
+                },
+            )
+            if not aggregate_result.should_send:
+                _redis.xack(ORCHESTRATOR_SIGNAL_STREAM, ORCHESTRATOR_SIGNAL_CONSUMER_GROUP, msg_id)
+                _redis.xdel(ORCHESTRATOR_SIGNAL_STREAM, msg_id)
+                reclaim_logic.mark_processed(ORCHESTRATOR_SIGNAL_STREAM, msg_id)
+                return
+            reply = aggregate_result.compiled_text
 
         _enqueue_outbound(
             client_id=client_id,
@@ -1199,6 +1609,9 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
 
         _redis.xack(ORCHESTRATOR_SIGNAL_STREAM, ORCHESTRATOR_SIGNAL_CONSUMER_GROUP, msg_id)
         _redis.xdel(ORCHESTRATOR_SIGNAL_STREAM, msg_id)
+
+        # Mark as processed for idempotency
+        reclaim_logic.mark_processed(ORCHESTRATOR_SIGNAL_STREAM, msg_id)
     except Exception as exc:
         _redis.xadd(
             ORCHESTRATOR_SIGNAL_DLQ_STREAM,
@@ -1302,6 +1715,26 @@ def run_worker_forever() -> None:
             daemon=True,
         )
 
+        # Start reclaim threads for both streams
+        job_reclaim_thread = _start_reclaim_thread(
+            stream=ORCHESTRATOR_JOB_STREAM,
+            group=ORCHESTRATOR_CONSUMER_GROUP,
+            consumer=ORCHESTRATOR_CONSUMER_NAME,
+            handler=_process_stream_message,
+            agent=agent,
+            dlq_stream=ORCHESTRATOR_DLQ_STREAM,
+            stop_event=stop_event,
+        )
+        signal_reclaim_thread = _start_reclaim_thread(
+            stream=ORCHESTRATOR_SIGNAL_STREAM,
+            group=ORCHESTRATOR_SIGNAL_CONSUMER_GROUP,
+            consumer=ORCHESTRATOR_SIGNAL_CONSUMER_NAME,
+            handler=_process_signal_message,
+            agent=agent,
+            dlq_stream=ORCHESTRATOR_SIGNAL_DLQ_STREAM,
+            stop_event=stop_event,
+        )
+
         job_thread.start()
         signal_thread.start()
 
@@ -1310,6 +1743,8 @@ def run_worker_forever() -> None:
             while (
                 job_thread.is_alive()
                 and signal_thread.is_alive()
+                and job_reclaim_thread.is_alive()
+                and signal_reclaim_thread.is_alive()
             ):
                 stop_event.wait(timeout=1.0)
                 if stop_event.is_set():
@@ -1320,6 +1755,8 @@ def run_worker_forever() -> None:
             stop_event.set()
             job_thread.join(timeout=5.0)
             signal_thread.join(timeout=5.0)
+            job_reclaim_thread.join(timeout=5.0)
+            signal_reclaim_thread.join(timeout=5.0)
             try:
                 checkpointer_ctx.__exit__(None, None, None)
             except Exception:

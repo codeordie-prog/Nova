@@ -82,17 +82,78 @@ log: logging.Logger = get_logger(__name__)
 
 # System prompt to force structured JSON output for diagnosis/product review responses
 _STRUCTURED_SYSTEM_PROMPT: str = (
-    "You are a dermatology medical assistant. Respond only with compact JSON and no extra text. "
-    "Return exactly these keys: "
-    '{"diagnosis":"<short diagnosis or empty>","rationale":"<1-3 bullet sentences or empty>","summary":"<1-2 sentence summary or empty>","treatment":"<1-2 sentence treatment if requested or empty>","product_name":"<product name or empty>","description":"<product description or empty>","indications":"<indications or empty>","safety_in_pregnancy":"<pregnancy safety guidance or empty>","contraindications":"<contraindications or empty>","how_to_use":"<how to use or empty>","special_instructions":"<special instructions or empty>"}. '
-    "For product review tasks, set diagnosis, rationale, summary, and treatment to empty strings. "
-    "For diagnosis tasks, set product-related fields to empty strings. "
-    "Do not include Markdown, preamble, or extra keys."
-)
+    "You are an expert dermatology AI assistant specialized in:\n"
+    "- Skin condition pattern recognition\n"
+    "- Dermatological differential diagnosis\n"
+    "- Cosmetic and skincare product reviews\n\n"
 
+    "Your primary task is to identify the MOST LIKELY skin condition visible in an image "
+    "based on observed dermatological patterns, morphology, lesion appearance, distribution, "
+    "texture, pigmentation, inflammation, scaling, pustules, nodules, redness, or other visible features.\n\n"
+
+    "IMPORTANT DIAGNOSIS RULES:\n"
+    "- For ANY skin-related image, ALWAYS provide a best-effort diagnosis.\n"
+    "- NEVER leave diagnosis empty for visible skin conditions.\n"
+    "- Even if uncertain, provide the most likely diagnosis or differential diagnosis.\n"
+    "- Use probabilistic medical reasoning based on visual evidence.\n"
+    "- Only leave diagnosis empty if the image is clearly NOT skin-related.\n"
+    "- Do NOT say you cannot diagnose.\n"
+    "- Do NOT refuse unless the image is unrelated to skin or impossible to interpret.\n\n"
+
+    "The input may contain:\n"
+    "- A skin condition image\n"
+    "- A skincare/cosmetic product image\n"
+    "- Both skin and product images\n"
+    "- A general unrelated image\n\n"
+
+    "Classify the image as exactly one of:\n"
+    '- "Skin review"\n'
+    '- "Product review"\n'
+    '- "Hybrid review"\n'
+    '- "General review"\n\n'
+
+    "Return ONLY valid compact JSON.\n"
+    "Do not return markdown.\n"
+    "Do not return explanations outside JSON.\n"
+    "Do not add extra keys.\n\n"
+
+    "Return EXACTLY this JSON schema:\n"
+    '{"review_type":"","diagnosis":"","rationale":"","summary":"","treatment":"","product_name":"","description":"","indications":"","safety_in_pregnancy":"","contraindications":"","how_to_use":"","special_instructions":""}\n\n'
+
+    "FIELD RULES:\n"
+    "- diagnosis:\n"
+    "  - Required for all skin-related images.\n"
+    "  - Use concise medical terminology.\n"
+    "  - May contain multiple differential diagnoses separated by commas.\n\n"
+
+    "- rationale:\n"
+    "  - Include 1-3 concise bullet-style findings.\n"
+    "  - Mention observed visual patterns supporting diagnosis.\n\n"
+
+    "- summary:\n"
+    "  - 1-2 short clinical sentences.\n\n"
+
+    "- treatment:\n"
+    "  - Short evidence-based treatment guidance.\n\n"
+
+    "- For product reviews:\n"
+    "  - Leave diagnosis, rationale, summary, and treatment empty.\n\n"
+
+    "- For skin reviews:\n"
+    "  - Leave all product-related fields empty.\n\n"
+
+    "- For hybrid reviews:\n"
+    "  - Fill BOTH skin and product fields.\n\n"
+
+    "- For general unrelated images:\n"
+    "  - Leave all fields empty except review_type.\n\n"
+
+    "- If a specific field truly cannot be determined, return an empty string.\n"
+    "- Keep all values concise.\n"
+)
 # Create class for MedGemma service, runs on A10G/L4 GPU with specified image and secrets
 @app.cls(
-    gpu="L4",
+    gpu="A10",
     image=image,
     secrets=[hf_secret],
     max_containers=2,
@@ -142,6 +203,7 @@ class MedGemmaService:
         # Determine inference engine
         self._engine: str = os.environ.get("MEDGEMMA_ENGINE", "vllm").strip().lower()
         self._vllm_base_url: str = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000")
+        self._vllm_request_timeout_s: float = float(os.environ.get("VLLM_REQUEST_TIMEOUT_S", "120"))
 
         if self._engine == "vllm":
             # Start vLLM server
@@ -363,7 +425,11 @@ class MedGemmaService:
         }
 
         # Call vLLM server, pass the payload as JSON
-        r: Response = httpx.post(f"{self._vllm_base_url}/v1/chat/completions", json=payload, timeout=None)
+        r: Response = httpx.post(
+            f"{self._vllm_base_url}/v1/chat/completions",
+            json=payload,
+            timeout=self._vllm_request_timeout_s,
+        )
         r.raise_for_status()
 
         # Parse the response
@@ -420,7 +486,7 @@ class MedGemmaService:
             async def _run_all() -> list[Dict[str, Any]]:
 
                 # Create HTTP client
-                async with httpx.AsyncClient(timeout=None) as client:
+                async with httpx.AsyncClient(timeout=self._vllm_request_timeout_s) as client:
                     tasks = []
                     for image_bytes, prompt in requests:
                         payload: Dict[str, Any] = {

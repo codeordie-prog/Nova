@@ -22,6 +22,8 @@ class DiagnoseBase64Request(BaseModel):
     client_id: Optional[str] = None
     message_id: Optional[str] = None
     channel: Optional[str] = None
+    group_id: Optional[str] = None
+    group_expected_count: Optional[int] = None
 
 # Pydantic model for response.
 class DiagnoseResponse(BaseModel):

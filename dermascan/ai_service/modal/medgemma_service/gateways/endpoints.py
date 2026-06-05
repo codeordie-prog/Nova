@@ -121,6 +121,8 @@ def _enqueue_job(
     client_id: str = "",
     message_id: str = "",
     channel: str = "",
+    group_id: str = "",
+    group_expected_count: int = 0,
 ) -> str:
     """
     Enqueue a job to the Redis stream.
@@ -190,6 +192,8 @@ def _enqueue_job(
                         "client_id": client_id,
                         "message_id": message_id,
                         "channel": channel,
+                        "group_id": group_id,
+                        "group_expected_count": str(group_expected_count),
                     },
                     maxlen=_STREAM_MAXLEN,
                     approximate=True,
@@ -503,6 +507,8 @@ async def diagnose_base64(
             str(payload.client_id or ""),
             str(payload.message_id or payload.request_id or ""),
             str(payload.channel or ""),
+            str(payload.group_id or ""),
+            int(payload.group_expected_count or 0),
         )
         return EnqueueResponse(job_id=job_id, status="queued")
 

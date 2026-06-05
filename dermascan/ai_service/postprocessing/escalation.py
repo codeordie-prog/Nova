@@ -56,6 +56,8 @@ class _JobEntry:
     client_id: str
     message_id: str
     channel: str
+    group_id: str = ""
+    group_expected_count: int = 0
 
 
 def _to_str(value: Any) -> str:
@@ -84,7 +86,9 @@ def _extract_structured_fields(text: str) -> tuple[dict[str, str], bool]:
         A tuple of (fields dictionary, parse_success)
     """
     fields = {
+        "review_type": "",
         "diagnosis": "",
+        "rationale": "",
         "summary": "",
         "treatment": "",
         "product_name": "",
@@ -128,13 +132,20 @@ def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | 
         "special_instructions",
     )
 
+    review_type = structured.get("review_type", "").strip().lower()
     diagnosis_present = bool(structured["diagnosis"])
     product_present = any(bool(structured.get(k)) for k in product_fields)
 
-    if diagnosis_present:
+    if review_type in ("product review", "product_review", "product", "hybrid review", "hybrid_review", "hybrid"):
+        mode = "product_review"
+    elif review_type in ("skin review", "skin_review", "skin", "general review", "general_review", "general"):
         mode = "diagnose"
+    elif product_present and diagnosis_present:
+        mode = "hybrid"
     elif product_present:
         mode = "product_review"
+    elif diagnosis_present:
+        mode = "diagnose"
     else:
         # Safe fallback for malformed or empty payloads.
         mode = "diagnose"
@@ -157,6 +168,8 @@ def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | 
     )
 
     base_fields = {
+        "review_type": structured["review_type"],
+        "rationale": structured["rationale"],
         "product_name": structured["product_name"],
         "description": structured["description"],
         "indications": structured["indications"],
@@ -292,9 +305,9 @@ def _push_signal(
     if not parsed_ok:
         notes = "The model response was not valid JSON"
     elif escalated:
-        notes = "The diagnosis inference completed below confidence threshold"
+        notes = f"The {mode} inference completed below confidence threshold"
     else:
-        notes = "The diagnosis inference completed above threshold"
+        notes = f"The {mode} inference completed above threshold"
 
     _redis.xadd(
         _ORCHESTRATOR_SIGNAL_STREAM,
@@ -309,7 +322,12 @@ def _push_signal(
             "source_event_id": "",
             "payload": json.dumps(
                 {
-                    "diagnosis_text": text,
+                    "review_type": base_fields.get("review_type", ""),
+                    "diagnosis": base_fields.get("diagnosis") or "",
+                    "diagnosis_text": base_fields.get("diagnosis") or text,
+                    "rationale": base_fields.get("rationale", ""),
+                    "summary": base_fields.get("summary", ""),
+                    "treatment": base_fields.get("treatment", ""),
                     "confidence": confidence,
                     "threshold": threshold_used,
                     "escalation": escalated,
@@ -321,6 +339,12 @@ def _push_signal(
                     "contraindications": base_fields.get("contraindications", ""),
                     "how_to_use": base_fields.get("how_to_use", ""),
                     "special_instructions": base_fields.get("special_instructions", ""),
+                    "metadata": {
+                        "extras": {
+                            "group_id": entry.group_id,
+                            "group_expected_count": str(entry.group_expected_count),
+                        }
+                    },
                 }
             ),
             "notes": notes,

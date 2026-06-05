@@ -8,6 +8,6 @@
     "dtype": "bfloat16",
     "gpu_memory_utilization": 0.85,
     "max_model_len": 1536,
-    "max_num_seqs": 50,
-    "max_num_batched_tokens": 76800
+    "max_num_seqs": 22,
+    "max_num_batched_tokens": 8196
 }

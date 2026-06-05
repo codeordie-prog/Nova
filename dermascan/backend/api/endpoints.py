@@ -6,13 +6,15 @@ These are contract-first placeholders and intentionally contain no implementatio
 
 import base64
 import binascii
+import asyncio
+import hmac
 import json
 import os
 import uuid
 from typing import Any, Dict
 from dotenv import load_dotenv
 
-from fastapi import APIRouter, Body, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Body, File, Header, HTTPException, Request, UploadFile
 import redis
 import requests
 
@@ -24,6 +26,13 @@ from dermascan.backend.models.requests import (
     RequestMetadata,
     RoutingHint,
 )
+from dermascan.backend.api.group_media_helper import (
+    append_to_media_batch,
+    claim_media_batch,
+    enrich_payload_with_group_metadata,
+    wait_for_media_batch_quiet,
+)
+from dermascan.shared.firebase_storage import upload_client_image
 from dermascan.shared.logger import get_logger
 
 load_dotenv()
@@ -42,6 +51,12 @@ _TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _TELEGRAM_HTTP_TIMEOUT_S: float = float(os.getenv("TELEGRAM_HTTP_TIMEOUT_S", "30"))
 _TELEGRAM_TLS_VERIFY: str = os.getenv("TELEGRAM_TLS_VERIFY", "true")
 _TELEGRAM_CA_BUNDLE: str = os.getenv("TELEGRAM_CA_BUNDLE", "")
+_TELEGRAM_MEDIA_GROUP_WINDOW_S: float = float(os.getenv("TELEGRAM_MEDIA_GROUP_WINDOW_S", "1.2"))
+_TELEGRAM_MEDIA_GROUP_MAX_WAIT_S: float = float(os.getenv("TELEGRAM_MEDIA_GROUP_MAX_WAIT_S", "4.0"))
+_WHATSAPP_INGRESS_SECRET: str = os.getenv(
+    "WHATSAPP_INGRESS_SECRET",
+    os.getenv("INTERNAL_API_SECRET", ""),
+)
 
 # Initialize redis client
 _redis = redis.Redis.from_url(_REDIS_URL, decode_responses=True) if _REDIS_URL else None
@@ -76,23 +91,51 @@ def _validate_image_bytes(image_bytes: bytes) -> None:
         raise HTTPException(status_code=400, detail="Unsupported or invalid image format")
 
 
-# Extract whatsapp message - This logic may change when we get the META API 
-def _extract_whatsapp_message(payload: dict[str, Any]) -> dict[str, Any] | None:
+def _verify_whatsapp_ingress_secret(header_value: str | None) -> None:
+    """
+    Verify shared secret for internal WhatsApp webhook ingress.
+
+    Args:
+        header_value: Value from `X-Internal-Secret` header.
+    """
+    expected = _WHATSAPP_INGRESS_SECRET.strip()
+    if not expected:
+        logger.warning(
+            "WHATSAPP_INGRESS_SECRET not configured; allowing /v1/webhooks/whatsapp without internal auth"
+        )
+        return
+    if not header_value or not hmac.compare_digest(header_value, expected):
+        raise HTTPException(status_code=401, detail="invalid ingress secret")
+
+
+# Extract whatsapp messages - This logic may change when we get the META API
+def _extract_whatsapp_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Extract all WhatsApp message objects from the webhook payload.
+
+    Args:
+        payload: Raw webhook payload.
+
+    Returns:
+        A list of message objects in source order.
+    """
+    out: list[dict[str, Any]] = []
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {})
 
+            # Backward compatibility for legacy/custom shape.
             message_obj = value.get("message")
             if isinstance(message_obj, dict) and message_obj:
-                return message_obj
+                out.append(message_obj)
 
-            # Backward compatibility fallback for older shape.
+            # Current Cloud API shape.
             legacy_messages = value.get("messages") or []
-            if isinstance(legacy_messages, list) and legacy_messages:
-                first = legacy_messages[0]
-                if isinstance(first, dict):
-                    return first
-    return None
+            if isinstance(legacy_messages, list):
+                for raw_message in legacy_messages:
+                    if isinstance(raw_message, dict) and raw_message:
+                        out.append(raw_message)
+    return out
 
 
 # Extract telegram message
@@ -249,6 +292,7 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
 
         attachment_id = str(raw_attachment.get("id") or "")
         media_ref = str(raw_attachment.get("media_ref") or raw_attachment.get("blob_ref") or "")
+        attachment_url = str(raw_attachment.get("url") or "").strip()
         media_id = str(raw_attachment.get("media_id") or "")
         image_b64 = str(raw_attachment.get("base64") or raw_attachment.get("data_base64") or raw_attachment.get("image_base64") or "")
 
@@ -262,6 +306,9 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
             size_bytes: int | None = len(image_bytes)
         elif media_ref:
             source = AttachmentSource(kind="blob_ref", value=media_ref)
+            size_bytes = raw_attachment.get("size_bytes")
+        elif attachment_url.lower().startswith(("http://", "https://")):
+            source = AttachmentSource(kind="url", value=attachment_url)
             size_bytes = raw_attachment.get("size_bytes")
         else:
             source = AttachmentSource(kind="whatsapp_media_id", value=media_id or "unknown")
@@ -289,6 +336,7 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
 
         media_id: str = str(image_obj.get("id") or "")
         media_ref: str = str(image_obj.get("media_ref") or "")
+        image_url: str = str(image_obj.get("url") or "").strip()
         mime_type: str = str(image_obj.get("mime_type") or "image/*")
         image_b64: str = str(image_obj.get("base64") or image_obj.get("data_base64") or "")
 
@@ -303,6 +351,9 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
         elif media_ref:
             source = AttachmentSource(kind="blob_ref", value=media_ref)
             size_bytes = None
+        elif image_url.lower().startswith(("http://", "https://")):
+            source = AttachmentSource(kind="url", value=image_url)
+            size_bytes = image_obj.get("file_size")
         else:
             source = AttachmentSource(kind="whatsapp_media_id", value=media_id or "unknown")
             size_bytes = None
@@ -325,7 +376,20 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
             text_parts.append(caption)
 
         media_id: str = str(document_obj.get("id") or "")
+        media_ref: str = str(document_obj.get("media_ref") or "")
+        document_url: str = str(document_obj.get("url") or "").strip()
+        doc_b64: str = str(document_obj.get("base64") or document_obj.get("data_base64") or "")
         mime_type: str = str(document_obj.get("mime_type") or "application/octet-stream")
+        source: AttachmentSource
+
+        if doc_b64:
+            source = AttachmentSource(kind="base64", value=doc_b64)
+        elif media_ref:
+            source = AttachmentSource(kind="blob_ref", value=media_ref)
+        elif document_url.lower().startswith(("http://", "https://")):
+            source = AttachmentSource(kind="url", value=document_url)
+        else:
+            source = AttachmentSource(kind="whatsapp_media_id", value=media_id or "unknown")
 
         attachments.append(
             AttachmentItem(
@@ -334,7 +398,7 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
                 mime_type=mime_type,
                 filename=document_obj.get("filename"),
                 size_bytes=document_obj.get("file_size"),
-                source=AttachmentSource(kind="whatsapp_media_id", value=media_id or "unknown"),
+                source=source,
             )
         )
 
@@ -392,10 +456,15 @@ def _normalize_telegram_message(message: Dict[str, Any]) -> OrchestratorIngressR
     if caption:
         text_parts.append(caption)
 
+    metadata_extras: dict[str, str] = {
+        "telegram_chat_type": str(chat_obj.get("type") or ""),
+        "telegram_username": str(from_obj.get("username") or ""),
+    }
+
     # Get photos
     photos: list = message.get("photo") or []
     if photos:
-        if _redis_binary is None:
+        if _redis is None:
             raise HTTPException(status_code=500, detail="REDIS_URL is not configured")
 
         # Get largest photo - Telegram sends multiple sizes, we want the largest for best quality
@@ -415,10 +484,39 @@ def _normalize_telegram_message(message: Dict[str, Any]) -> OrchestratorIngressR
             if file_id:
                 image_bytes, mime_type = _download_telegram_file(file_id)
                 _validate_image_bytes(image_bytes)
-                
-                # Create an image reference and store it as a REDIS HASH
-                media_ref = f"media:telegram:{uuid.uuid4().hex}"
-                _redis_binary.setex(media_ref, _MEDIA_TTL_S, image_bytes)
+
+                try:
+                    download_url = upload_client_image(
+                        client_id=client_id,
+                        image_bytes=image_bytes,
+                        mime_type=mime_type,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Firebase client image upload failed: client_id=%s message_id=%s",
+                        client_id,
+                        message_id,
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Failed to store image",
+                    ) from exc
+
+                media_ref = f"media:telegram:{client_id}:{uuid.uuid4().hex}"
+                try:
+                    _redis.setex(media_ref, _MEDIA_TTL_S, download_url)
+                except redis.RedisError as exc:
+                    logger.exception(
+                        "Redis media URL cache failed: media_ref=%s client_id=%s",
+                        media_ref,
+                        client_id,
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Redis unavailable",
+                    ) from exc
+
+                metadata_extras["telegram_media_ref"] = media_ref
 
                 attachments.append(
                     AttachmentItem(
@@ -427,7 +525,7 @@ def _normalize_telegram_message(message: Dict[str, Any]) -> OrchestratorIngressR
                         mime_type=mime_type,
                         filename=None,
                         size_bytes=len(image_bytes),
-                        source=AttachmentSource(kind="blob_ref", value=media_ref),
+                        source=AttachmentSource(kind="url", value=download_url),
                     )
                 )
 
@@ -445,12 +543,7 @@ def _normalize_telegram_message(message: Dict[str, Any]) -> OrchestratorIngressR
         channel="telegram",
         content=content,
         routing=RoutingHint(ingress_stream=_ORCHESTRATOR_JOB_STREAM, priority="normal"),
-        metadata=RequestMetadata(
-            extras={
-                "telegram_chat_type": str(chat_obj.get("type") or ""),
-                "telegram_username": str(from_obj.get("username") or ""),
-            }
-        ),
+        metadata=RequestMetadata(extras=metadata_extras),
     )
 
 
@@ -473,15 +566,103 @@ def _payload_content_json(normalized: OrchestratorIngressRequest) -> str:
         for att in content.attachments
     ]
 
-    return json.dumps(
+    payload: dict[str, Any] = {
+        "content": {
+            "text": content.text,
+            "attachments": attachments,
+        }
+    }
+    if normalized.metadata.extras:
+        payload["metadata"] = {"extras": normalized.metadata.extras}
+
+    return json.dumps(payload, default=str)
+
+
+def _enqueue_orchestrator_row(
+    *,
+    normalized: OrchestratorIngressRequest,
+    payload_override: str | None = None,
+) -> None:
+    """
+    Enqueue a normalized ingress message to orchestrator stream.
+
+    Args:
+        normalized: Normalized ingress request.
+        payload_override: Optional payload JSON override.
+    """
+    if _redis is None:
+        raise HTTPException(status_code=500, detail="REDIS_URL is not configured")
+    payload_json = payload_override if payload_override is not None else _payload_content_json(normalized)
+    _redis.xadd(
+        _ORCHESTRATOR_JOB_STREAM,
         {
-            "content": {
-                "text": content.text,
-                "attachments": attachments,
-            }
+            "request_id": normalized.request_id,
+            "case_id": normalized.case_id,
+            "client_id": normalized.client_id,
+            "message_id": normalized.message_id,
+            "channel": normalized.channel,
+            "username": normalized.username or "",
+            "payload": payload_json,
         },
-        default=str,
+        maxlen=_WORKERS_STREAM_MAXLEN,
+        approximate=True,
     )
+
+
+async def _flush_telegram_media_group_after_window(*, channel: str, group_id: str) -> None:
+    """
+    Wait for album quiet window then enqueue grouped Telegram items.
+
+    Args:
+        channel: Channel name.
+        group_id: Telegram media group id.
+    """
+    if _redis is None:
+        return
+    became_quiet = await wait_for_media_batch_quiet(
+        _redis,
+        channel=channel,
+        group_key=group_id,
+        quiet_window_s=_TELEGRAM_MEDIA_GROUP_WINDOW_S,
+        max_wait_s=_TELEGRAM_MEDIA_GROUP_MAX_WAIT_S,
+    )
+    if not became_quiet:
+        return
+
+    slots = claim_media_batch(_redis, channel=channel, group_key=group_id)
+    if not slots:
+        return
+    expected_count = len(slots)
+
+    for slot in slots:
+        payload_json = str(slot.get("payload_json") or "")
+        if not payload_json:
+            continue
+        enriched_payload = enrich_payload_with_group_metadata(
+            payload_json=payload_json,
+            group_id=group_id,
+            group_expected_count=expected_count,
+        )
+        row = slot.get("row") if isinstance(slot.get("row"), dict) else {}
+        if not row:
+            continue
+        try:
+            _redis.xadd(
+                _ORCHESTRATOR_JOB_STREAM,
+                {
+                    "request_id": str(row.get("request_id") or ""),
+                    "case_id": str(row.get("case_id") or ""),
+                    "client_id": str(row.get("client_id") or ""),
+                    "message_id": str(row.get("message_id") or ""),
+                    "channel": str(row.get("channel") or "telegram"),
+                    "username": str(row.get("username") or ""),
+                    "payload": enriched_payload,
+                },
+                maxlen=_WORKERS_STREAM_MAXLEN,
+                approximate=True,
+            )
+        except redis.RedisError:
+            logger.exception("failed enqueue for telegram media group member: group_id=%s", group_id)
 
 
 @router.post("/orchestrator/requests")
@@ -532,6 +713,7 @@ async def upload_test_media(image: UploadFile = File(...)) -> dict[str, Any]:
 
 @router.post("/webhooks/whatsapp")
 async def whatsapp_webhook(
+    x_internal_secret: str | None = Header(default=None, alias="X-Internal-Secret"),
     payload: dict[str, Any] = Body(
         ...,
         example={
@@ -563,37 +745,46 @@ async def whatsapp_webhook(
         },
     )
 ) -> dict[str, Any]:
+    _verify_whatsapp_ingress_secret(x_internal_secret)
+
     if _redis is None:
         raise HTTPException(status_code=500, detail="REDIS_URL is not configured")
 
-    message = _extract_whatsapp_message(payload)
-    if not message:
+    messages = _extract_whatsapp_messages(payload)
+    if not messages:
         return {"status": "ignored", "queued_count": 0, "request_ids": []}
 
-    try:
-        normalized = _normalize_message(message)
-    except HTTPException as exc:
-        logger.warning("Skipping invalid whatsapp message: detail=%s", exc.detail)
+    normalized_messages: list[OrchestratorIngressRequest] = []
+    for message in messages:
+        try:
+            normalized_messages.append(_normalize_message(message))
+        except HTTPException as exc:
+            logger.warning("Skipping invalid whatsapp message: detail=%s", exc.detail)
+
+    if not normalized_messages:
         return {"status": "ignored", "queued_count": 0, "request_ids": []}
 
+    request_ids: list[str] = []
     try:
-        _redis.xadd(
-            _ORCHESTRATOR_JOB_STREAM,
-            {
-                "request_id": normalized.request_id,
-                "case_id": normalized.case_id,
-                "client_id": normalized.client_id,
-                "message_id": normalized.message_id,
-                "channel": normalized.channel,
-                "payload": _payload_content_json(normalized),
-            },
-            maxlen=_WORKERS_STREAM_MAXLEN,
-            approximate=True,
-        )
+        for normalized in normalized_messages:
+            _redis.xadd(
+                _ORCHESTRATOR_JOB_STREAM,
+                {
+                    "request_id": normalized.request_id,
+                    "case_id": normalized.case_id,
+                    "client_id": normalized.client_id,
+                    "message_id": normalized.message_id,
+                    "channel": normalized.channel,
+                    "payload": _payload_content_json(normalized),
+                },
+                maxlen=_WORKERS_STREAM_MAXLEN,
+                approximate=True,
+            )
+            request_ids.append(normalized.request_id)
     except redis.RedisError as exc:
         raise HTTPException(status_code=503, detail="Redis unavailable") from exc
 
-    return {"status": "queued", "queued_count": 1, "request_ids": [normalized.request_id]}
+    return {"status": "queued", "queued_count": len(request_ids), "request_ids": request_ids}
 
 
 @router.post("/webhooks/telegram")
@@ -621,28 +812,53 @@ async def telegram_webhook(
         return {"status": "ignored", "queued_count": 0, "request_ids": []}
 
     try:
-        # Normalize telegram messgae - Returns The pydantic model for Orchestrator ingress request
         normalized: OrchestratorIngressRequest = _normalize_telegram_message(message)
     except HTTPException as exc:
+        if exc.status_code >= 500:
+            logger.exception("Telegram message processing failed: detail=%s", exc.detail)
+            raise
         logger.warning("Skipping invalid telegram message: detail=%s", exc.detail)
         return {"status": "ignored", "queued_count": 0, "request_ids": []}
 
-    try:
-        # Add normalized message to REDIS stream
-        _redis.xadd(
-            _ORCHESTRATOR_JOB_STREAM,
-            {
+    media_group_id = str(message.get("media_group_id") or "").strip()
+    if media_group_id:
+        slot = {
+            "row": {
                 "request_id": normalized.request_id,
                 "case_id": normalized.case_id,
                 "client_id": normalized.client_id,
                 "message_id": normalized.message_id,
                 "channel": normalized.channel,
                 "username": normalized.username or "",
-                "payload": _payload_content_json(normalized),
             },
-            maxlen=_WORKERS_STREAM_MAXLEN,
-            approximate=True,
+            "payload_json": _payload_content_json(normalized),
+        }
+        try:
+            append_to_media_batch(
+                _redis,
+                channel="telegram",
+                group_key=media_group_id,
+                slot=slot,
+                quiet_window_s=_TELEGRAM_MEDIA_GROUP_WINDOW_S,
+            )
+        except redis.RedisError as exc:
+            raise HTTPException(status_code=503, detail="Redis unavailable") from exc
+
+        asyncio.create_task(
+            _flush_telegram_media_group_after_window(
+                channel="telegram",
+                group_id=media_group_id,
+            )
         )
+        return {
+            "status": "buffered",
+            "queued_count": 0,
+            "request_ids": [normalized.request_id],
+            "group_id": media_group_id,
+        }
+
+    try:
+        _enqueue_orchestrator_row(normalized=normalized)
     except redis.RedisError as exc:
         raise HTTPException(status_code=503, detail="Redis unavailable") from exc
 

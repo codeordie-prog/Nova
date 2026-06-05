@@ -1,73 +1,107 @@
 # Dermascan Agents
 
-AI agents network for medical diagnosis.
+AI agent network for dermatology: conversational orchestration, image diagnosis, product safety review, and multi-channel delivery (Telegram / WhatsApp).
 
-## MedGemma Async Quickstart
+## Architecture at a Glance
 
-The MedGemma service now runs as a separated async system:
+```
+user (Telegram / WhatsApp)
+         │
+         ▼
+  Backend API (FastAPI, :8088)
+         │ XADD orchestrator:jobs
+         ▼
+  Orchestrator worker ──► Qwen (primary LLM, Modal vLLM)
+         │                  └── fallbacks: OpenAI, Gemini
+         ├──► diagnose:jobs ──► MedGemma gateway (vision)
+         ├──► rules engine (PostgreSQL) via signal enrichment
+         └──► outbound:messages ──► Telegram / WhatsApp
+```
 
-- **FastAPI API (`uvicorn`)**: validates requests and enqueues jobs to Redis.
-- **Worker process**: consumes Redis Stream jobs and calls Modal GPU inference.
-- **Modal service (`app.py`)**: hosts `MedGemmaService` GPU methods used by workers.
+Workers are started together via `dermascan/scripts/do_work.py`. MedGemma runs as a separate AI-service stack (not included in that script).
 
-### Prerequisites
+## Prerequisites
 
 - Python 3.12+
-- Poetry
-- Modal CLI (required for worker inference calls)
-- Redis instance (for queue + job status storage)
+- [Poetry](https://python-poetry.org/)
+- Redis (queues, job status, LangGraph checkpoints)
+- PostgreSQL (rules engine ingredient safety data — required for product-review flows)
+- Modal CLI (Qwen + MedGemma GPU inference)
 
-### Setup
+## Setup
 
 ```bash
 poetry install
-poetry shell
+cp .env_example .env   # fill in values — see sections below
+```
 
+## 1. Deploy Qwen (primary orchestrator LLM)
+
+The orchestrator's primary model is **self-hosted Qwen** served on Modal via vLLM as an OpenAI-compatible HTTP endpoint. When `QWEN_BASE_URL` is set, the orchestrator worker uses Qwen first and falls back to OpenAI, then Gemini.
+
+**What it does**
+
+- Hosts `Qwen/Qwen3-8B` on an NVIDIA L40S GPU.
+- Exposes `/v1/chat/completions` and `/v1/models` (standard OpenAI client).
+- Supports tool calling (orchestrator tools: diagnose enqueue, search, case status, etc.).
+
+**Deploy**
+
+```bash
+# One-time Modal auth + Hugging Face secret
 modal token new
-modal secret create huggingface HF_TOKEN=YOUR_TOKEN
-modal secret create redis REDIS_HOST=YOUR_HOST REDIS_PORT=YOUR_PORT REDIS_USERNAME=YOUR_USERNAME REDIS_PASSWORD=YOUR_PASSWORD REDIS_DB=YOUR_DB
+modal secret create huggingface HF_TOKEN=
+
+# Deploy (wrapper script)
+poetry run python dermascan/scripts/deploy_qwen_app.py
+
+# Or directly
+modal deploy dermascan/ai_service/modal/qwen_service/app.py
 ```
 
-### Run the API locally (uvicorn)
+After deploy, Modal prints a public HTTPS URL. Set in `.env`:
 
 ```bash
-poetry run python -m uvicorn dermascan.ai_service.modal.medgemma_service.gateways.endpoints:web_app --host 0.0.0.0 --port 8080 --reload
+QWEN_BASE_URL=https://<your-modal-app>--dermascan-qwen-qwenservice-serve.modal.run/v1
+QWEN_SERVED_MODEL_NAME=qwen-3-8b
+QWEN_API_KEY=EMPTY
 ```
 
-### Run the worker
+**Smoke-test the endpoint** (optional):
 
 ```bash
-python dermascan/ai_service/modal/medgemma_service/worker.py
+poetry run python dermascan/scripts/qwen_langchain_agent.py
 ```
 
-### Configuration
+Config lives in `dermascan/ai_service/modal/qwen_service/config/config.json`.
 
-Gateway/API and worker limits are configured via env vars and gateway config:
+## 2. PostgreSQL & rules engine
 
-`dermascan/ai_service/modal/medgemma_service/gateways/config.json`
+Product safety and skin-review signal enrichment call `RulesEngine` (`dermascan/rules_engine/engine/rules_engine.py`), which **queries PostgreSQL** for per-ingredient CIR safety data. Without a reachable Postgres instance and the variables below, product-review flows will fail at signal enrichment time.
 
-See:
-- `dermascan/ai_service/modal/medgemma_service/README.md`
-- `dermascan/ai_service/modal/medgemma_service/gateways/README.md`
+Required variables (see `.env_example`):
 
-## Backend Quickstart
+| Variable | Purpose |
+|---|---|
+| `POSTGRES_HOST` | Database host |
+| `POSTGRES_PORT` | Port (default `5432`) |
+| `POSTGRES_DATABASE` | Database name |
+| `POSTGRES_USER` | Username |
+| `POSTGRESS_PASSWORD` | Password (note: double-S spelling matches code) |
+| `POSTGRES_TABLE` | Ingredient table (default `cir_pdfs`) |
 
-This section documents the backend API entrypoint and the currently active API endpoints.
+`REDIS_URL` is also required by the rules engine for ingredient-index caching.
 
-### Main entry point
+## 3. Run the backend API
 
-- FastAPI app module: `dermascan/backend/app/main.py`
-- App object: `app`
-
-Run on port `8087`:
+- Module: `dermascan/backend/app/main.py`
+- Port: **8088**
 
 ```bash
-poetry run uvicorn dermascan.backend.app.main:app --host 0.0.0.0 --port 8087 --reload
+poetry run uvicorn dermascan.backend.app.main:app --host 0.0.0.0 --port 8088 --reload
 ```
 
-### API endpoints
-
-Router prefix is `/v1` (from `dermascan/backend/api/endpoints.py`).
+Active routes (prefix `/v1`):
 
 - `GET /health`
 - `POST /v1/orchestrator/requests`
@@ -77,18 +111,76 @@ Router prefix is `/v1` (from `dermascan/backend/api/endpoints.py`).
 - `POST /v1/webhooks/whatsapp`
 - `POST /v1/webhooks/telegram`
 
-For worker startup and backend operational details, see:
-- `dermascan/backend/README.md`
+See `dermascan/backend/README.md` for webhook payload contracts and operational detail.
 
-## Project Structure
+## 4. Run agent workers
 
-- **frontend**: Web UI and client-side application.
-- **backend**: API server, business logic, and persistence.
-- **ai-service**: Model serving, inference pipelines, and evaluation.
-- **data**: Sample data, datasets, and evaluation sets.
-- **infra**: Infrastructure-as-code, deployment, and monitoring.
-- **scripts**: Setup, migrations, and maintenance utilities.
-- **docs**: Architecture, API docs, and research notes.
-- **tests**: Integration and end-to-end tests.
+Start orchestrator, diagnose, and outbound-sender workers in one process:
 
-See each subdirectory `README.md` for more details.
+```bash
+poetry run python dermascan/scripts/do_work.py
+```
+
+This script runs:
+
+| Worker | Role |
+|---|---|
+| `orchestrator_worker` | Consumes jobs + signals; drives Qwen (primary) conversation |
+| `diagnose_worker` | Dispatches images to MedGemma gateway |
+| `outbound_sender_worker` | Compacts and delivers replies to Telegram / WhatsApp |
+
+**Not included:** `knowledge_worker` (optional, start manually) and **MedGemma** (separate AI-service stack below).
+
+### Suggested local run order
+
+1. Redis
+2. PostgreSQL (if using product / rules flows)
+3. Deploy Qwen on Modal; set `QWEN_BASE_URL` in `.env`
+4. MedGemma gateway + worker (if diagnose flow is needed)
+5. Backend API (`8088`)
+6. `poetry run python dermascan/scripts/do_work.py`
+7. (Optional) `telegram_polling_bridge.py` for local Telegram testing
+
+## 5. MedGemma (vision diagnosis — separate)
+
+MedGemma is **not** started by `do_work.py`. It runs as its own async stack:
+
+- **Gateway (FastAPI / uvicorn):** validates requests, enqueues to Redis
+- **Worker:** consumes `medgemma:jobs`, calls Modal GPU inference
+- **Modal app:** hosts `MedGemmaService` GPU methods
+
+```bash
+# Gateway
+poetry run python -m uvicorn dermascan.ai_service.modal.medgemma_service.gateways.endpoints:web_app --host 0.0.0.0 --port 8080 --reload
+
+# Worker
+poetry run python dermascan/ai_service/modal/medgemma_service/worker.py
+```
+
+Set `MEDGEMMA_GATEWAY_URL=http://127.0.0.1:8080` in `.env` for the diagnose worker.
+
+Modal setup:
+
+```bash
+modal secret create huggingface HF_TOKEN=
+modal secret create redis REDIS_HOST= REDIS_PORT= REDIS_USERNAME= REDIS_PASSWORD= REDIS_DB=
+```
+
+See `dermascan/ai_service/modal/medgemma_service/README.md` for gateway config.
+
+## Project structure
+
+| Directory | Purpose |
+|---|---|
+| `dermascan/backend` | API server, agent workers, orchestrator tools |
+| `dermascan/ai_service` | MedGemma + Qwen Modal apps, inference postprocessing |
+| `dermascan/rules_engine` | PostgreSQL-backed ingredient safety engine |
+| `dermascan/scripts` | Worker supervisor (`do_work.py`), Qwen deploy/test scripts |
+| `dermascan/shared` | Firebase storage, logging utilities |
+| `dermascan/frontend` | Web UI and client-side application |
+
+## Further reading
+
+- `dermascan/Agents.md` — full agent map, signal flows, safety pipeline
+- `dermascan/backend/README.md` — API, webhooks, worker details
+- `dermascan/ai_service/docs/inference.md` — inference pipeline overview

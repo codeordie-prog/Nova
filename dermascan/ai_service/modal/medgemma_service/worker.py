@@ -17,6 +17,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import os
 import socket
+import threading
 import time
 from typing import Any
 
@@ -26,8 +27,12 @@ from dermascan.ai_service.modal.medgemma_service.app import MedGemmaService, app
 from dermascan.ai_service.modal.medgemma_service.redis_client import redis_client_from_env
 from dermascan.ai_service.postprocessing.escalation import route_case_after_inference
 from dermascan.shared.logger import get_logger
+from dermascan.backend.services.agents import reclaim_logic
 
 _redis = redis_client_from_env().get_redis()
+
+# Initialize reclaim_logic with the Redis client
+reclaim_logic.set_redis_client(_redis)
 
 logger = get_logger(__name__)
 
@@ -41,6 +46,65 @@ _MAX_INFLIGHT: int = max(1, int(os.environ.get("MEDGEMMA_MAX_INFLIGHT", "12")))
 _CONSUMER_GROUP: str = os.environ.get("MEDGEMMA_CONSUMER_GROUP", "medgemma-workers")
 _CONSUMER_NAME_BASE: str = os.environ.get("MEDGEMMA_CONSUMER_NAME", "medgemma-worker")
 _CONSUMER_NAME: str = f"{_CONSUMER_NAME_BASE}-{socket.gethostname()}-{os.getpid()}"
+_MEDGEMMA_DLQ_STREAM: str = os.environ.get("MEDGEMMA_DLQ_STREAM", "medgemma:dlq")
+
+# RPC retry configuration
+MEDGEMMA_RPC_MAX_RETRIES: int = 3
+MEDGEMMA_RPC_RETRY_DELAY_MS: int = 200
+MEDGEMMA_RPC_RETRY_BACKOFF_MULTIPLIER: float = 2.0
+
+
+def _dispatch_with_retry(dispatch_func, *args, **kwargs) -> Any:
+    """
+    Dispatch RPC call with retry logic for transient errors.
+
+    Args:
+        dispatch_func: The RPC function to call
+        *args: Positional arguments for the RPC function
+        **kwargs: Keyword arguments for the RPC function
+
+    Returns:
+        The result of the RPC call
+
+    Raises:
+        Exception: If all retries are exhausted
+    """
+    last_exception: Exception | None = None
+
+    for attempt in range(MEDGEMMA_RPC_MAX_RETRIES + 1):
+        try:
+            return dispatch_func(*args, **kwargs)
+        except Exception as exc:
+            last_exception = exc
+
+            # Check if error is retryable (network, timeout, transient)
+            error_str = str(exc).lower()
+            is_retryable = any(
+                keyword in error_str
+                for keyword in ["timeout", "connection", "network", "transient", "unavailable"]
+            )
+
+            if not is_retryable or attempt >= MEDGEMMA_RPC_MAX_RETRIES:
+                raise
+
+            # Calculate delay with exponential backoff
+            delay_ms = MEDGEMMA_RPC_RETRY_DELAY_MS * (
+                MEDGEMMA_RPC_RETRY_BACKOFF_MULTIPLIER ** attempt
+            )
+
+            logger.warning(
+                "rpc dispatch failed (retryable): attempt=%s/%s delay_ms=%s error=%s",
+                attempt + 1,
+                MEDGEMMA_RPC_MAX_RETRIES + 1,
+                delay_ms,
+                str(exc),
+            )
+            time.sleep(delay_ms / 1000.0)
+
+    # This should never be reached, but just in case
+    if last_exception:
+        raise last_exception
+    raise RuntimeError("Unexpected error in RPC retry logic")
 
 
 @dataclass
@@ -57,6 +121,8 @@ class _JobEntry:
     client_id: str
     message_id: str
     channel: str
+    group_id: str
+    group_expected_count: int = 0
 
 
 def _to_str(value: Any) -> str:
@@ -247,7 +313,7 @@ def _dispatch_message(msg_id: str, payload: dict[str, Any], service: MedGemmaSer
         logger.info("spawn dispatch starting: job_id=%s bytes=%s", job_id, len(image_bytes))
 
         # TODO : should this call_handle use a batched dispatch logic?
-        call_handle = service.run_one.spawn(image_bytes=image_bytes, prompt=prompt)
+        call_handle = _dispatch_with_retry(service.run_one.spawn, image_bytes=image_bytes, prompt=prompt)
         logger.info("spawn dispatch done: job_id=%s", job_id)
         return job_id, msg_id, call_handle
     except Exception as e:
@@ -355,6 +421,11 @@ def _collect_batch() -> list[_JobEntry]:
                         client_id=_to_str(payload.get("client_id") or payload.get(b"client_id")),
                         message_id=_to_str(payload.get("message_id") or payload.get(b"message_id")),
                         channel=_to_str(payload.get("channel") or payload.get(b"channel")),
+                        group_id=_to_str(payload.get("group_id") or payload.get(b"group_id")),
+                        group_expected_count=int(
+                            _to_str(payload.get("group_expected_count") or payload.get(b"group_expected_count") or "0")
+                            or "0"
+                        ),
                         prompt=(
                             payload.get("prompt")
                             or payload.get(b"prompt")
@@ -392,7 +463,8 @@ def _collect_batch_result(batch: list[_JobEntry], call_handle: Any) -> None:
                 confidence_val = text.get("confidence")
                 confidence_num = _to_float(confidence_val)
                 confidence_str = str(confidence_val) if confidence_val is not None else None
-                text_str = json.dumps(text)
+                raw_text = text.get("text")
+                text_str = str(raw_text) if raw_text is not None else json.dumps(text)
             else:
                 text_str = str(text)
 
@@ -407,6 +479,9 @@ def _collect_batch_result(batch: list[_JobEntry], call_handle: Any) -> None:
             )
             _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, entry.msg_id)
             _redis.xdel(_JOB_STREAM, entry.msg_id)
+
+            # Mark as processed for idempotency
+            reclaim_logic.mark_processed(_JOB_STREAM, entry.msg_id)
 
         logger.info("batch inference done: size=%s boot_id=%s", len(batch), boot_id)
 
@@ -452,6 +527,10 @@ def _collect_result(job_id: str, msg_id: str, call_handle: Any) -> None:
         )
         _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id)
         _redis.xdel(_JOB_STREAM, msg_id)
+
+        # Mark as processed for idempotency
+        reclaim_logic.mark_processed(_JOB_STREAM, msg_id)
+
         logger.info("message acked: msg_id=%s", msg_id)
     except Exception as e:
         logger.exception("inference failed: job_id=%s", job_id)
@@ -459,6 +538,66 @@ def _collect_result(job_id: str, msg_id: str, call_handle: Any) -> None:
         _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id)
         _redis.xdel(_JOB_STREAM, msg_id)
         logger.info("message acked after failure: msg_id=%s", msg_id)
+
+
+def _start_reclaim_thread(
+    stop_event: threading.Event,
+) -> threading.Thread:
+    """
+    Start a background thread that periodically reclaims stale pending messages.
+
+    Args:
+        stop_event: Cooperative shutdown flag.
+
+    Returns:
+        The started reclaim thread.
+    """
+    def _reclaim_loop() -> None:
+        while not stop_event.is_set():
+            try:
+                def _reclaim_handler(msg_id: str, fields: dict[str, Any]) -> None:
+                    # Mark as processed before handling to ensure idempotency
+                    if reclaim_logic.mark_processed(_JOB_STREAM, msg_id):
+                        try:
+                            # Re-process the message by adding it back to the stream
+                            # The message will be re-collected by the normal batch collection logic
+                            _redis.xadd(_JOB_STREAM, fields)
+                            # Ack and delete the reclaimed message
+                            _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id)
+                            _redis.xdel(_JOB_STREAM, msg_id)
+                        except Exception:
+                            logger.exception(
+                                "reclaim handler failed: stream=%s msg_id=%s",
+                                _JOB_STREAM, msg_id,
+                            )
+                            # Mark as not processed so it can be retried
+                            _redis.delete(reclaim_logic.processed_key(_JOB_STREAM, msg_id))
+
+                reclaimed = reclaim_logic.reclaim_stale_pending(
+                    stream=_JOB_STREAM,
+                    group=_CONSUMER_GROUP,
+                    consumer=_CONSUMER_NAME,
+                    handler=_reclaim_handler,
+                    dlq_stream=_MEDGEMMA_DLQ_STREAM,
+                )
+                if reclaimed > 0:
+                    logger.info(
+                        "reclaim pass completed: stream=%s reclaimed=%d",
+                        _JOB_STREAM, reclaimed,
+                    )
+            except Exception:
+                logger.exception("reclaim loop error: stream=%s", _JOB_STREAM)
+
+            # Wait for the interval or stop event
+            stop_event.wait(timeout=reclaim_logic.RECLAIM_INTERVAL_SEC)
+
+    thread = threading.Thread(
+        target=_reclaim_loop,
+        name=f"medgemma-reclaim-{_JOB_STREAM}",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def _drain_completed(inflight: set[Future[None]], *, timeout: float) -> None:
@@ -487,13 +626,13 @@ def run_worker_forever() -> None:
 
     A future in this context is a placeholder for a result that will be available later.
     It represents an asynchronous operation that is currently in progress.
-    
+
     This function:
     - Connects to Redis
     - Ensures the consumer group exists
     - Starts the Modal app context
     - Processes jobs from the Redis stream in a loop
-    
+
     """
     logger.info("redis ping...")
 
@@ -516,7 +655,7 @@ def run_worker_forever() -> None:
     # Start Modal app context
     with modal_app.run():
 
-        # Initialize MedGemma service 
+        # Initialize MedGemma service
         service = MedGemmaService()
         logger.info(
             "worker started: stream=%s group=%s consumer=%s batch=%s block_ms=%s max_inflight=%s",
@@ -527,48 +666,60 @@ def run_worker_forever() -> None:
             _BLOCK_MS,
             _MAX_INFLIGHT,
         )
-        
+
+        stop_event = threading.Event()
+
+        # Start reclaim thread
+        reclaim_thread = _start_reclaim_thread(stop_event)
+
         # Create thread pool (a pool of threads that can execute tasks concurrently) for processing jobs
         with ThreadPoolExecutor(max_workers=_MAX_INFLIGHT) as pool:
 
             # Set to track inflight collector tasks - Helps us track the available workers with respect to the maximum inflight limit
             inflight: set[Future[None]] = set()
-            while True:
-                # Drain completed futures - This means, check if any futures have completed and remove them from the set
-                _drain_completed(inflight, timeout=0.0)
+            try:
+                while not stop_event.is_set():
+                    # Drain completed futures - This means, check if any futures have completed and remove them from the set
+                    _drain_completed(inflight, timeout=0.0)
 
-                available_capacity: int = _MAX_INFLIGHT - len(inflight)
-                if available_capacity <= 0:
+                    available_capacity: int = _MAX_INFLIGHT - len(inflight)
+                    if available_capacity <= 0:
 
-                    # If no capacity, wait for some futures to complete
-                    _drain_completed(inflight, timeout=1.0)
-                    continue
+                        # If no capacity, wait for some futures to complete
+                        _drain_completed(inflight, timeout=1.0)
+                        continue
 
-                # Collect one micro-batch and dispatch as a single remote call.
-                batch: list[_JobEntry] = _collect_batch()
-                if not batch:
-                    logger.debug("no messages available")
-                    continue
+                    # Collect one micro-batch and dispatch as a single remote call.
+                    batch: list[_JobEntry] = _collect_batch()
+                    if not batch:
+                        logger.debug("no messages available")
+                        continue
 
-                requests_batch: list[tuple[bytes, str]] = [
-                    (entry.image_bytes, entry.prompt) for entry in batch
-                ]
+                    requests_batch: list[tuple[bytes, str]] = [
+                        (entry.image_bytes, entry.prompt) for entry in batch
+                    ]
 
-                try:
-                    call_handle = service.run_batch.spawn(requests=requests_batch)
-                    inflight.add(pool.submit(_collect_batch_result, batch, call_handle))
-                    logger.info("batch dispatched: size=%s", len(batch))
-                except Exception as e:
-                    logger.exception("batch dispatch failed: size=%s", len(batch))
-                    for entry in batch:
-                        _mark_status(
-                            entry.job_id,
-                            status="failed",
-                            error=str(e),
-                            finished_at=str(int(time.time())),
-                        )
-                        _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, entry.msg_id)
-                        _redis.xdel(_JOB_STREAM, entry.msg_id)
+                    try:
+                        call_handle = _dispatch_with_retry(service.run_batch.spawn, requests=requests_batch)
+                        inflight.add(pool.submit(_collect_batch_result, batch, call_handle))
+                        logger.info("batch dispatched: size=%s", len(batch))
+                    except Exception as e:
+                        logger.exception("batch dispatch failed: size=%s", len(batch))
+                        for entry in batch:
+                            _mark_status(
+                                entry.job_id,
+                                status="failed",
+                                error=str(e),
+                                finished_at=str(int(time.time())),
+                            )
+                            _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, entry.msg_id)
+                            _redis.xdel(_JOB_STREAM, entry.msg_id)
+            except KeyboardInterrupt:
+                logger.info("medgemma worker received KeyboardInterrupt; shutting down")
+            finally:
+                stop_event.set()
+                reclaim_thread.join(timeout=5.0)
+                logger.info("medgemma worker stopped")
 
 
 if __name__ == "__main__":
