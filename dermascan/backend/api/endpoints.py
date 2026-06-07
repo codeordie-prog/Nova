@@ -12,7 +12,10 @@ import json
 import os
 import uuid
 from typing import Any, Dict
+
 from dotenv import load_dotenv
+
+load_dotenv()
 
 from fastapi import APIRouter, Body, File, Header, HTTPException, Request, UploadFile
 import redis
@@ -33,9 +36,9 @@ from dermascan.backend.api.group_media_helper import (
     wait_for_media_batch_quiet,
 )
 from dermascan.shared.firebase_storage import upload_client_image
+from dermascan.shared.global_rate_limiter import _enforce_global_rate_limit
 from dermascan.shared.logger import get_logger
-
-load_dotenv()
+from dermascan.shared.queue_depth_manager import _wait_for_queue_capacity
 
 router = APIRouter(prefix="/v1", tags=["orchestrator"])
 
@@ -57,6 +60,7 @@ _WHATSAPP_INGRESS_SECRET: str = os.getenv(
     "WHATSAPP_INGRESS_SECRET",
     os.getenv("INTERNAL_API_SECRET", ""),
 )
+_INGRESS_RETRY_AFTER_S: str = os.getenv("INGRESS_RETRY_AFTER_SECONDS", "1")
 
 # Initialize redis client
 _redis = redis.Redis.from_url(_REDIS_URL, decode_responses=True) if _REDIS_URL else None
@@ -89,6 +93,26 @@ def _validate_image_bytes(image_bytes: bytes) -> None:
 
     if not (is_jpeg or is_png or is_gif or is_webp):
         raise HTTPException(status_code=400, detail="Unsupported or invalid image format")
+
+
+async def _enforce_ingress_capacity(*, cost: int = 1) -> None:
+    """
+    Apply global RPM and orchestrator queue-depth gates before enqueueing.
+
+    Args:
+        cost: Ingress cost for this webhook (e.g. number of messages).
+
+    Raises:
+        HTTPException: If rate limit or queue pressure blocks intake.
+    """
+    await _enforce_global_rate_limit(cost=cost)
+    state, _ = await _wait_for_queue_capacity()
+    if state == "red":
+        raise HTTPException(
+            status_code=429,
+            detail="Service is overloaded. Please try again later.",
+            headers={"Retry-After": _INGRESS_RETRY_AFTER_S},
+        )
 
 
 def _verify_whatsapp_ingress_secret(header_value: str | None) -> None:
@@ -764,6 +788,8 @@ async def whatsapp_webhook(
     if not normalized_messages:
         return {"status": "ignored", "queued_count": 0, "request_ids": []}
 
+    await _enforce_ingress_capacity(cost=len(normalized_messages))
+
     request_ids: list[str] = []
     try:
         for normalized in normalized_messages:
@@ -819,6 +845,8 @@ async def telegram_webhook(
             raise
         logger.warning("Skipping invalid telegram message: detail=%s", exc.detail)
         return {"status": "ignored", "queued_count": 0, "request_ids": []}
+
+    await _enforce_ingress_capacity(cost=1)
 
     media_group_id = str(message.get("media_group_id") or "").strip()
     if media_group_id:

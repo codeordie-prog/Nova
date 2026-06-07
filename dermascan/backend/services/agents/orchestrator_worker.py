@@ -45,6 +45,11 @@ from dermascan.backend.services.agents.group_report_aggregator import (
     collect_and_compile_if_ready,
 )
 from dermascan.shared.logger import get_logger
+from dermascan.shared.redis_stability import (
+    check_redis_connectivity,
+    get_redis_client,
+    run_with_redis_retries,
+)
 from langchain_core.runnables import RunnableConfig
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware, wrap_model_call, ModelRequest, ModelResponse
@@ -52,6 +57,14 @@ from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dermascan.backend.services.agents.prompts.orchestrator_prompt import system_prompt
 from dermascan.backend.services.agents import reclaim_logic
+from dermascan.backend.services.agents.provider_circuit_breaker import (
+    CircuitBreaker,
+    load_qwen_circuit_breaker,
+)
+from dermascan.backend.services.agents.memory.redis_checkpointer import (
+    delete_thread as delete_checkpoint_thread,
+)
+from dermascan.shared import agent_call_tracer
 
 
 # Load environment variables
@@ -88,6 +101,12 @@ QWEN_API_KEY: str = (
 QWEN_TEMPERATURE: float = float(os.getenv("QWEN_TEMPERATURE", "0.0"))
 QWEN_MAX_TOKENS: int = int(os.getenv("QWEN_MAX_TOKENS", "512"))
 QWEN_REQUEST_TIMEOUT_S: float = float(os.getenv("QWEN_REQUEST_TIMEOUT_S", "45"))
+
+# Hard ceiling on SDK-level retries before the fallback middleware moves to the
+# next provider. Clamped to [0, 3] so a single slow/cold Qwen call can never
+# burn more than 3 retries (4 total attempts) before failing over to OpenAI.
+_PROVIDER_MAX_RETRIES_HARD_CAP: int = 3
+QWEN_MAX_RETRIES: int = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("QWEN_MAX_RETRIES", "2"))))
 # Mirror the serving-side max_model_len so memory middleware can reserve
 # enough budget for system prompt + tools + output tokens before summarizing.
 QWEN_MAX_MODEL_LEN: int = int(os.getenv("QWEN_MAX_MODEL_LEN", "16384"))
@@ -97,6 +116,23 @@ QWEN_ENABLE_THINKING: bool = os.getenv("QWEN_ENABLE_THINKING", "false").strip().
     "1", "true", "yes", "on",
 }
 OPENAI_REQUEST_TIMEOUT_S: float = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"))
+OPENAI_MAX_RETRIES: int = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("OPENAI_MAX_RETRIES", "2"))))
+# Hard ceiling on agent reasoning/tool-call steps per turn. Bounds the number of
+# model calls a single message can issue so a runaway tool loop cannot spin up
+# to the LangChain default of 25 calls.
+AGENT_RECURSION_LIMIT: int = max(1, int(os.getenv("ORCHESTRATOR_AGENT_RECURSION_LIMIT", "12")))
+# User-facing reply sent when a turn fails (e.g. recursion limit / provider
+# error) so the client is never left without a response.
+ORCHESTRATOR_FAILURE_REPLY: str = os.getenv(
+    "ORCHESTRATOR_FAILURE_REPLY",
+    "Sorry, I ran into a problem handling that. Please try again, and if you want a "
+    "skin review, share a clear photo of the affected area.",
+)
+# When a turn fails with a recursion/loop error, reset the client's checkpoint so
+# a poisoned conversation state cannot keep failing every subsequent message.
+ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION: bool = os.getenv(
+    "ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 # Define default configurations
 DEFAULT_CONFIG: List[Dict[str, Any]] = [{
@@ -177,10 +213,43 @@ INFLIGHT_WAIT_TIMEOUT_MS: int = max(0, int(os.getenv("ORCHESTRATOR_INFLIGHT_WAIT
 INFLIGHT_WAIT_POLL_MS: int = max(50, int(os.getenv("ORCHESTRATOR_INFLIGHT_WAIT_POLL_MS", "200")))
 
 # Initialize REDIS client
-_redis: redis.Redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+_redis: redis.Redis = get_redis_client(decode_responses=True)
 
 # Initialize reclaim_logic with the Redis client
 reclaim_logic.set_redis_client(_redis)
+
+# Process-wide reference to the active checkpointer, set in run_worker_forever.
+# Used to reset a poisoned conversation thread on recursion failures.
+_checkpointer: Any = None
+
+
+def _reset_client_checkpoint(client_id: str) -> None:
+    """
+    Best-effort reset of a client's persisted conversation checkpoint.
+
+    Args:
+        client_id: Conversation thread identifier to clear.
+    """
+    if _checkpointer is None:
+        return
+    try:
+        if delete_checkpoint_thread(_checkpointer, client_id):
+            logger.warning("reset poisoned checkpoint for client_id=%s", client_id)
+    except Exception:
+        logger.exception("failed to reset checkpoint for client_id=%s", client_id)
+
+
+def _is_recursion_error(exc: Exception) -> bool:
+    """
+    Detect LangGraph recursion-limit/loop failures.
+
+    Args:
+        exc: Raised exception from an agent invocation.
+
+    Returns:
+        bool: True when the failure is a recursion-limit error.
+    """
+    return "recursion limit" in str(exc).lower() or exc.__class__.__name__ == "GraphRecursionError"
 
 
 def _strip_markdown_formatting(text: str) -> str:
@@ -345,6 +414,29 @@ def _should_fallback(exc: Exception) -> bool:
         "504",
     )
     return any(marker in text for marker in transient_markers)
+
+
+def _is_qwen_unavailable_error(exc: Exception) -> bool:
+    """
+    Detect provider-unavailable patterns specific to the self-hosted Qwen endpoint.
+
+    Args:
+        exc: Raised exception from provider invocation.
+
+    Returns:
+        bool: True when Qwen should be skipped and the next provider tried.
+    """
+    for current in _iter_exception_chain(exc):
+        class_name: str = current.__class__.__name__.lower()
+        text: str = str(current).lower()
+        if "notfounderror" in class_name and (
+            "invalid function call" in text
+            or "modal-http" in text
+            or "404" in text
+            or "not found" in text
+        ):
+            return True
+    return False
 
 
 def _proactive_log_key(client_id: str) -> str:
@@ -802,11 +894,12 @@ def _build_qwen_model() -> Optional[ChatOpenAI]:
         base_url = f"{base_url}/v1"
 
     logger.info(
-        "Qwen primary ENABLED: base_url=%s, model=%s, max_tokens=%s, timeout=%ss, enable_thinking=%s",
+        "Qwen primary ENABLED: base_url=%s, model=%s, max_tokens=%s, timeout=%ss, max_retries=%s, enable_thinking=%s",
         base_url,
         QWEN_SERVED_MODEL_NAME,
         QWEN_MAX_TOKENS,
         QWEN_REQUEST_TIMEOUT_S,
+        QWEN_MAX_RETRIES,
         QWEN_ENABLE_THINKING,
     )
     return ChatOpenAI(
@@ -814,6 +907,7 @@ def _build_qwen_model() -> Optional[ChatOpenAI]:
         base_url=base_url,
         api_key=QWEN_API_KEY,
         timeout=QWEN_REQUEST_TIMEOUT_S,
+        max_retries=QWEN_MAX_RETRIES,
         temperature=QWEN_TEMPERATURE,
         max_tokens=QWEN_MAX_TOKENS,
         extra_body={"chat_template_kwargs": {"enable_thinking": QWEN_ENABLE_THINKING}}
@@ -866,6 +960,7 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
             max_tokens=openai_cfg["max_tokens"],
             api_key=OPENAI_API_KEY,
             timeout=OPENAI_REQUEST_TIMEOUT_S,
+            max_retries=OPENAI_MAX_RETRIES,
         )
         if OPENAI_API_KEY
         else None
@@ -899,6 +994,12 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         " -> ".join(name for name, _ in model_chain),
     )
 
+    # Circuit breaker guarding the self-hosted Qwen provider. When Qwen is
+    # repeatedly failing (cold start / down), the breaker opens and the
+    # middleware skips Qwen entirely for a cooldown window, failing over to
+    # OpenAI immediately instead of retrying an unhealthy endpoint.
+    qwen_breaker: CircuitBreaker = load_qwen_circuit_breaker()
+
     # Define dynamic model selection MIDDLEWARE
     @wrap_model_call
     def dynamic_model_selection(request: ModelRequest, handler) -> ModelResponse:
@@ -908,6 +1009,7 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         Iterates ``model_chain`` in priority order. On a rate-limit/availability
         failure it falls through to the next provider; on a non-transient error
         (or after the last provider) it re-raises so real bugs are not masked.
+        A circuit breaker short-circuits the Qwen provider while it is unhealthy.
 
         Args:
             request: The model request.
@@ -919,16 +1021,45 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         last_exc: Optional[Exception] = None
         for index, (name, model) in enumerate(model_chain):
             role: str = "primary" if index == 0 else f"fallback#{index}"
+            is_qwen: bool = name.startswith("qwen:")
+            is_last: bool = index == len(model_chain) - 1
+
+            # Skip Qwen while its circuit is open (unless it is the only option).
+            if is_qwen and not is_last and not qwen_breaker.allow():
+                logger.warning(
+                    "qwen circuit OPEN (state=%s); skipping to next provider",
+                    qwen_breaker.state,
+                )
+                agent_call_tracer.record_model_attempt(provider=name, success=False)
+                continue
+
             try:
                 logger.info("invoking model: %s (%s)", name, role)
                 response: ModelResponse = handler(request.override(model=model))
                 logger.info("model replied: %s (%s)", name, role)
+                if is_qwen:
+                    # Reset the circuit breaker on success
+                    qwen_breaker.record_success()
+
+                agent_call_tracer.record_model_attempt(provider=name, success=True)
                 return response
+
             except Exception as exc:
                 last_exc = exc
-                is_last: bool = index == len(model_chain) - 1
-                if is_last or not _should_fallback(exc):
+                if is_qwen:
+                    # Record failure and open the circuit breaker
+                    qwen_breaker.record_failure()
+
+                agent_call_tracer.record_model_attempt(provider=name, success=False)
+
+                should_fallback: bool = _should_fallback(exc) or (
+                    is_qwen and _is_qwen_unavailable_error(exc)
+                )
+                
+                if is_last or not should_fallback:
                     raise
+
+                # Log the failure Warning and fall back to the next provider
                 logger.warning(
                     "model %s failed (%s); falling back to next provider",
                     name,
@@ -1030,12 +1161,15 @@ def _reader_loop(
             slots_held += 1
 
         try:
-            resp = _redis.xreadgroup(
-                groupname=group,
-                consumername=consumer,
-                streams={stream: ">"},
-                count=slots_held,
-                block=block_ms,
+            resp = run_with_redis_retries(
+                lambda: _redis.xreadgroup(
+                    groupname=group,
+                    consumername=consumer,
+                    streams={stream: ">"},
+                    count=slots_held,
+                    block=block_ms,
+                ),
+                operation_name=f"orchestrator_xreadgroup_{stream}",
             )
         except Exception:
             # Transient Redis errors must not kill the reader. Release reserved
@@ -1200,7 +1334,8 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             "configurable": {
                 "thread_id": client_id,
                 "checkpoint_ns": "orchestrator",
-            }
+            },
+            "recursion_limit": AGENT_RECURSION_LIMIT,
         }
         cache_ingress_payload(
             request_id=request_id,
@@ -1211,10 +1346,19 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             payload=payload_json,
         )
 
+        agent_call_tracer.start_turn(
+            request_id=request_id,
+            case_id=case_id,
+            client_id=client_id,
+            channel=channel,
+            flow="job",
+        )
         res = agent.invoke(
             {"messages": [{"role": "user", "content": user_prompt}]},
             config=config,
         )
+        agent_call_tracer.set_tool_names(agent_call_tracer.extract_tool_names(res))
+        agent_call_tracer.end_turn(status="ok")
         reply = (
             res.get("structured_response").response
             if isinstance(res, dict) and res.get("structured_response") is not None
@@ -1267,6 +1411,29 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         reclaim_logic.mark_processed(ORCHESTRATOR_JOB_STREAM, msg_id)
 
     except Exception as exc:
+
+        # Finalize the trace for this turn (no-op if already ended on success).
+        agent_call_tracer.end_turn(status="failed", error=str(exc))
+
+        # If the turn failed due to a recursion/loop, the persisted thread state
+        # is likely poisoned. Reset it so subsequent messages start clean.
+        if ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION and _is_recursion_error(exc):
+            _reset_client_checkpoint(client_id)
+
+        # Always send the client a graceful reply so a failure is never silent.
+        try:
+            _enqueue_outbound(
+                client_id=client_id,
+                case_id=case_id,
+                channel=channel,
+                request_id=request_id,
+                text=ORCHESTRATOR_FAILURE_REPLY,
+                kind="job_reply",
+                must_deliver=True,
+                reply_to_message_id=message_id,
+            )
+        except Exception:
+            logger.exception("failed to enqueue fallback reply: request_id=%s", request_id)
 
         # Add the failed job to the dead letter queue
         _redis.xadd(
@@ -1540,12 +1707,22 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                     # Separate namespace prevents races with concurrent job-flow
                     # invokes on the same client_id (jobs use ns="orchestrator").
                     "checkpoint_ns": "orchestrator:signal",
-                }
+                },
+                "recursion_limit": AGENT_RECURSION_LIMIT,
             }
+            agent_call_tracer.start_turn(
+                request_id=request_id,
+                case_id=case_id,
+                client_id=client_id,
+                channel=channel,
+                flow="signal",
+            )
             res = agent.invoke(
                 {"messages": [{"role": "user", "content": signal_prompt}]},
                 config=config,
             )
+            agent_call_tracer.set_tool_names(agent_call_tracer.extract_tool_names(res))
+            agent_call_tracer.end_turn(status="ok")
             reply = (
                 res.get("structured_response").response
                 if isinstance(res, dict) and res.get("structured_response") is not None
@@ -1613,6 +1790,8 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         # Mark as processed for idempotency
         reclaim_logic.mark_processed(ORCHESTRATOR_SIGNAL_STREAM, msg_id)
     except Exception as exc:
+        # Finalize the trace for this turn (no-op if already ended on success).
+        agent_call_tracer.end_turn(status="failed", error=str(exc))
         _redis.xadd(
             ORCHESTRATOR_SIGNAL_DLQ_STREAM,
             {
@@ -1649,13 +1828,17 @@ def run_worker_forever() -> None:
           thread death) to both readers cooperatively.
     """
     # Check REDIS connection, ensure consumer groups exist for both streams.
-    _redis.ping()
+    check_redis_connectivity(decode_responses=True)
     _ensure_consumer_group("orchestrator_job")
     _ensure_consumer_group("signal_job")
 
     # Open Redis checkpointer once for worker lifetime, create required
     # checkpoint indices, then close cleanly on shutdown.
     checkpointer, checkpointer_ctx = open_checkpointer_url(REDIS_URL)
+
+    # Expose the checkpointer for poisoned-thread resets on recursion failures.
+    global _checkpointer
+    _checkpointer = checkpointer
 
     # Initialize the dynamic agent (shared by both readers; safe because the
     # agent is invoked via thread-safe checkpointer state per thread_id).
@@ -1767,11 +1950,3 @@ def run_worker_forever() -> None:
 if __name__ == "__main__":
     run_worker_forever()
 
-
-# TODO
-# 1. Thread locking to preserve causal flow of events
-# 2. System prompt + context engineering
-# 3. Dynamic tooling
-# 4. Dynamic System prompting
-# 5. Direct Soul.md ownership - Qutis should update its own soul NOT US. 
-# 5. Direct Soul.md ownership - Qutis should update its own soul NOT US. 

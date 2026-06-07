@@ -374,10 +374,29 @@ def enque_to_diagnose_stream(request_id: str, collected_context: str = "") -> di
         request_id=envelope["request_id"],
         payload=envelope["payload"],
     )
+
+    # Hard invariant: diagnosis requires an image. Block (terminally) when none
+    # is present so the agent cannot loop on this tool for text-only turns.
+    try:
+        canonical_obj: dict[str, Any] = json.loads(canonical_payload)
+    except Exception:
+        canonical_obj = {}
+    if not payload_has_image_attachment(canonical_obj):
+        logger.info("diagnose tool blocked (no image): request_id=%s", envelope["request_id"])
+        return {
+            "status": "blocked_missing_image",
+            "request_id": envelope["request_id"],
+            "instruction": (
+                "No image is attached to this request. Do NOT call this tool again. "
+                "Ask the user to upload a clear photo of the affected skin area, then "
+                "reply to the user directly."
+            ),
+        }
+
     merged_payload = _merge_collected_context_into_payload(canonical_payload, collected_context)
     logger.info(f"TOOL CALL: merged_payload={merged_payload}")
 
-    return enqueue_diagnose_job(
+    result = enqueue_diagnose_job(
         request_id=envelope["request_id"],
         case_id=envelope["case_id"],
         client_id=envelope["client_id"],
@@ -386,6 +405,16 @@ def enque_to_diagnose_stream(request_id: str, collected_context: str = "") -> di
         payload=merged_payload,
         source="orchestrator_tool",
     )
+
+    # Make every terminal outcome explicit so the model stops calling the tool
+    # and proceeds to compose the final user-facing reply.
+    if result.get("status") in {"queued", "already_queued"}:
+        result["instruction"] = (
+            "The diagnosis request is now in the queue. Do NOT call this tool again. "
+            "Tell the user their photo was received and is being reviewed by the "
+            "specialist team, and that results will follow shortly."
+        )
+    return result
 
 
 def _event_ts_ms(event_id: str) -> int:

@@ -14,6 +14,11 @@ import requests
 from dotenv import load_dotenv
 
 from dermascan.shared.logger import get_logger
+from dermascan.shared.redis_stability import (
+    check_redis_connectivity,
+    get_redis_client,
+    run_with_redis_retries,
+)
 from dermascan.backend.services.agents import reclaim_logic
 
 load_dotenv()
@@ -47,7 +52,7 @@ OUTBOUND_CHAOS_TTL_SEC: int = max(1, int(os.getenv("OUTBOUND_CHAOS_TTL_SEC", "20
 WORKERS_STREAM_MAXLEN: int = int(os.getenv("WORKERS_STREAM_MAXLEN", "5000"))
 
 logger: logging.Logger = get_logger("agents")
-_redis: redis.Redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+_redis: redis.Redis = get_redis_client(decode_responses=True)
 
 # Initialize reclaim_logic with the Redis client
 reclaim_logic.set_redis_client(_redis)
@@ -699,7 +704,7 @@ def _compact_client_items(items: list[tuple[str, dict[str, Any]]]) -> list[tuple
 
 
 def run_worker_forever() -> None:
-    _redis.ping()
+    check_redis_connectivity(decode_responses=True)
     _ensure_consumer_group()
     logger.info("outbound sender started: stream=%s group=%s consumer=%s", OUTBOUND_STREAM, OUTBOUND_CONSUMER_GROUP, OUTBOUND_CONSUMER_NAME)
 
@@ -710,12 +715,15 @@ def run_worker_forever() -> None:
 
     try:
         while not stop_event.is_set():
-            resp = _redis.xreadgroup(
-                groupname=OUTBOUND_CONSUMER_GROUP,
-                consumername=OUTBOUND_CONSUMER_NAME,
-                streams={OUTBOUND_STREAM: ">"},
-                count=OUTBOUND_BATCH_MAX,
-                block=OUTBOUND_BLOCK_MS,
+            resp = run_with_redis_retries(
+                lambda: _redis.xreadgroup(
+                    groupname=OUTBOUND_CONSUMER_GROUP,
+                    consumername=OUTBOUND_CONSUMER_NAME,
+                    streams={OUTBOUND_STREAM: ">"},
+                    count=OUTBOUND_BATCH_MAX,
+                    block=OUTBOUND_BLOCK_MS,
+                ),
+                operation_name="outbound_xreadgroup",
             )
             messages = [(str(mid), fields) for _, batch in (resp or []) for mid, fields in batch]
             if not messages:

@@ -100,6 +100,18 @@ def redis_client_from_env() -> Client:
         )
     )
 
+def redis_client_from_url() -> Redis:
+    """
+    Create a Redis client from a URL.
+    """
+    try:
+        url: str = os.environ.get("REDIS_URL", "")
+        client = Redis.from_url(url, decode_responses=True)
+
+        return client
+    except Exception as e:
+        raise RuntimeError(f"Failed to create Redis client from URL: {e}")
+
 
 def check_redis_connection() -> None:
     """
@@ -110,6 +122,7 @@ def check_redis_connection() -> None:
 
 if __name__ == "__main__":
     client = redis_client_from_env().get_redis()
+   #client = redis_client_from_url()
     print(client.ping())
     print("Redis connection successful!")
     key = "medgemma:job:952817780a5946438ab91baab0f21e34"

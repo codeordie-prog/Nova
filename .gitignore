@@ -29,6 +29,7 @@ node_modules/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+dermascan/frontend/whatsapp/
 
 # OS
 .DS_Store

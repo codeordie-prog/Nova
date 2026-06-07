@@ -22,6 +22,11 @@ from dotenv import load_dotenv
 
 from dermascan.shared.firebase_storage import download_client_image_bytes
 from dermascan.shared.logger import get_logger
+from dermascan.shared.redis_stability import (
+    check_redis_connectivity,
+    get_redis_client,
+    run_with_redis_retries,
+)
 from dermascan.backend.services.agents import reclaim_logic
 
 load_dotenv()
@@ -72,8 +77,8 @@ logger: logging.Logger = get_logger("agents")
 if not REDIS_URL:
     raise RuntimeError("REDIS_URL is required for the diagnose worker")
 
-_redis_text: redis.Redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-_redis_binary: redis.Redis = redis.Redis.from_url(REDIS_URL, decode_responses=False)
+_redis_text: redis.Redis = get_redis_client(decode_responses=True)
+_redis_binary: redis.Redis = get_redis_client(decode_responses=False)
 
 # Initialize reclaim_logic with the Redis client
 reclaim_logic.set_redis_client(_redis_text)
@@ -761,7 +766,7 @@ def run_worker_forever() -> None:
     """
     Run the diagnose worker forever.
     """
-    _redis_text.ping()
+    check_redis_connectivity(decode_responses=True)
     _ensure_consumer_group()
 
     logger.info(
@@ -790,12 +795,15 @@ def run_worker_forever() -> None:
                     continue
 
                 read_count = min(WORKERS_STREAM_BATCH_SIZE, available_capacity)
-                resp = _redis_text.xreadgroup(
-                    groupname=DIAGNOSE_CONSUMER_GROUP,
-                    consumername=DIAGNOSE_CONSUMER_NAME,
-                    streams={DIAGNOSE_JOB_STREAM: ">"},
-                    count=read_count,
-                    block=WORKERS_STREAM_BLOCK_MS,
+                resp = run_with_redis_retries(
+                    lambda: _redis_text.xreadgroup(
+                        groupname=DIAGNOSE_CONSUMER_GROUP,
+                        consumername=DIAGNOSE_CONSUMER_NAME,
+                        streams={DIAGNOSE_JOB_STREAM: ">"},
+                        count=read_count,
+                        block=WORKERS_STREAM_BLOCK_MS,
+                    ),
+                    operation_name="diagnose_xreadgroup",
                 )
                 if not resp:
                     continue

@@ -1,1 +1,0 @@
-status, started_at, created_at, finished_at, boot_id, text, attempts
