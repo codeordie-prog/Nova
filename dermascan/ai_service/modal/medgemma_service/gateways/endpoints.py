@@ -30,6 +30,7 @@ from dermascan.shared.logger import get_logger
 from dermascan.ai_service.modal.medgemma_service.schemas import (
     BatchEnqueueResponse,
     DiagnoseBase64Request,
+    AuditImageRefRequest,
     EnqueueResponse,
     JobStatusResponse,
 )
@@ -204,6 +205,96 @@ def _enqueue_job(
             continue
 
     raise QueueCapacityExceededError("queue capacity contention: enqueue retries exhausted")
+
+
+def _enqueue_ref_job(
+    image_source_kind: str,
+    image_source_value: str,
+    prompt: str,
+    mime_type: str = "",
+    request_id: str = "",
+    case_id: str = "",
+    client_id: str = "",
+    message_id: str = "",
+    channel: str = "",
+    group_id: str = "",
+    group_expected_count: int = 0,
+) -> str:
+    """
+    Enqueue an image-reference audit job to the Redis stream.
+
+    Args:
+        image_source_kind: Image reference type, for example "url" or "blob_ref".
+        image_source_value: URL or blob reference to resolve before inference.
+        prompt: The prompt to use for auditing.
+        mime_type: Optional image MIME type.
+        request_id: Request identifier for tracing.
+        case_id: Case identifier for downstream routing.
+        client_id: Client identifier for downstream routing.
+        message_id: Source message identifier.
+        channel: Source channel.
+        group_id: Optional grouped-media identifier.
+        group_expected_count: Expected grouped-media count.
+
+    Returns:
+        The enqueued MedGemma job ID.
+
+    Raises:
+        QueueCapacityExceededError: If queue capacity is saturated.
+    """
+    job_id: str = uuid.uuid4().hex
+    job_key: str = f"medgemma:job:{job_id}"
+    now_s: int = int(time.time())
+
+    for _ in range(_ENQUEUE_CAPACITY_RETRIES):
+        try:
+            with _redis.pipeline(transaction=True) as pipe:
+                pipe.watch(_JOB_STREAM)
+                queue_len: int = _get_pending_count()
+
+                if queue_len >= _MAX_QUEUE_LEN_HARD:
+                    pipe.unwatch()
+                    raise QueueCapacityExceededError("queue is at hard capacity")
+
+                pipe.multi()
+                pipe.hset(
+                    job_key,
+                    mapping={
+                        "job_id": job_id,
+                        "status": "queued",
+                        "created_at": str(now_s),
+                        "image_source_kind": image_source_kind,
+                        "image_source_value": image_source_value,
+                        "mime_type": mime_type,
+                    },
+                )
+                pipe.expire(job_key, _JOB_TTL_S)
+                pipe.xadd(
+                    _JOB_STREAM,
+                    {
+                        "job_id": job_id,
+                        "prompt": prompt,
+                        "image_source_kind": image_source_kind,
+                        "image_source_value": image_source_value,
+                        "mime_type": mime_type,
+                        "created_at": str(now_s),
+                        "request_id": request_id,
+                        "case_id": case_id,
+                        "client_id": client_id,
+                        "message_id": message_id,
+                        "channel": channel,
+                        "group_id": group_id,
+                        "group_expected_count": str(group_expected_count),
+                    },
+                    maxlen=_STREAM_MAXLEN,
+                    approximate=True,
+                )
+                pipe.execute()
+                return job_id
+        except redis.WatchError:
+            continue
+
+    raise QueueCapacityExceededError("queue capacity contention: ref enqueue retries exhausted")
 
 
 def _enqueue_jobs_batch(jobs: list[tuple[bytes, str]]) -> list[str]:
@@ -531,6 +622,85 @@ async def diagnose_base64(
 
     except Exception:
         logger.exception("Unhandled error in /diagnose_base64")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@web_app.post("/audit_image_ref", response_model=EnqueueResponse)
+@web_app.post("/audit_ref", response_model=EnqueueResponse)
+async def audit_image_ref(
+    request: Request,
+    payload: AuditImageRefRequest = Body(...),
+) -> EnqueueResponse:
+    """
+    Enqueue a image audit job using an image URL and lightweight context.
+
+    Args:
+        request: The FastAPI request.
+        payload: Ref-based diagnosis payload.
+
+    Returns:
+        The MedGemma enqueue response.
+
+    Raises:
+        HTTPException: If validation, queue pressure, or Redis access fails.
+    """
+    logger.info("audit_image_ref endpoint called")
+
+    try:
+        await _enforce_global_rate_limit(cost=1)
+
+        context: str = payload.context.strip()
+        image_url: str = payload.image_url.strip()
+        mime_type: str = str(payload.mime_type or "image/jpeg").strip()
+
+        if not context:
+            raise HTTPException(status_code=400, detail="Audit context cannot be empty")
+
+        if not image_url:
+            raise HTTPException(status_code=400, detail="Image URL cannot be empty")
+
+        if not image_url.lower().startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="Image URL must use http or https")
+
+        state, _ = await _wait_for_capacity_with_retry()
+        if state == "red":
+            raise HTTPException(
+                status_code=429,
+                detail="Service is overloaded. Please try again later.",
+                headers={"Retry-After": _RETRY_AFTER_SECONDS},
+            )
+
+        job_id: str = await _enqueue_with_retry(
+            _enqueue_ref_job,
+            "url",
+            image_url,
+            context,
+            mime_type,
+            payload.request_id,
+            str(payload.case_id or payload.request_id),
+            str(payload.client_id or ""),
+            str(payload.message_id or payload.request_id),
+            str(payload.channel or ""),
+            str(payload.group_id or ""),
+            int(payload.group_expected_count or 0),
+        )
+        return EnqueueResponse(job_id=job_id, status="queued")
+
+    except HTTPException:
+        raise
+
+    except QueueCapacityExceededError:
+        raise HTTPException(
+            status_code=429,
+            detail="Service is overloaded. Please try again later.",
+            headers={"Retry-After": _RETRY_AFTER_SECONDS},
+        )
+
+    except redis.RedisError:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+
+    except Exception:
+        logger.exception("Unhandled error in /audit_image_ref")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 

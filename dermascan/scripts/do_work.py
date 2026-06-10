@@ -8,7 +8,6 @@ import threading
 import time
 from typing import Callable
 
-from dermascan.backend.services.agents.diagnose_worker import run_worker_forever as run_diagnose_worker
 from dermascan.backend.services.agents.orchestrator_worker import run_worker_forever as run_orchestrator_worker
 from dermascan.backend.services.agents.outbound_sender_worker import run_worker_forever as run_outbound_sender_worker
 
@@ -34,7 +33,6 @@ def main() -> None:
     stop_event = threading.Event()
     workers: list[tuple[str, Callable[[], None]]] = [
         ("orchestrator", run_orchestrator_worker),
-        ("diagnose", run_diagnose_worker),
         ("outbound_sender", run_outbound_sender_worker),
     ]
 

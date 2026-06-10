@@ -26,9 +26,9 @@ logger = get_logger(__name__)
 
 TAVILY_API_KEY = str(os.getenv("TAVILY_API_KEY_QUTIS", ""))
 OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY_QUTIS", ""))
-PRODUCT_INGREDIENT_MODEL = str(os.getenv("PRODUCT_INGREDIENT_MODEL", "gpt-4o"))
-PRODUCT_REPORT_MODEL = str(os.getenv("PRODUCT_REPORT_MODEL", "gpt-4o"))
-SKIN_REVIEW_MODEL = str(os.getenv("SKIN_REVIEW_MODEL", "gpt-4o"))
+PRODUCT_INGREDIENT_MODEL = str(os.getenv("PRODUCT_INGREDIENT_MODEL", "gpt-4o-mini"))
+PRODUCT_REPORT_MODEL = str(os.getenv("PRODUCT_REPORT_MODEL", "gpt-4o-mini"))
+SKIN_REVIEW_MODEL = str(os.getenv("SKIN_REVIEW_MODEL", "gpt-4o-mini"))
 
 
 class IngredientExtractionResponse(BaseModel):

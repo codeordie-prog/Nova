@@ -21,11 +21,14 @@ import threading
 import time
 from typing import Any
 
+import httpx
 from redis import Redis
 
 from dermascan.ai_service.modal.medgemma_service.app import MedGemmaService, app as modal_app
+from dermascan.ai_service.modal.medgemma_service.gateways.validation import _validate_image_bytes
 from dermascan.ai_service.modal.medgemma_service.redis_client import redis_client_from_env
 from dermascan.ai_service.postprocessing.escalation import route_case_after_inference
+from dermascan.shared.firebase_storage import download_client_image_bytes
 from dermascan.shared.logger import get_logger
 from dermascan.backend.services.agents import reclaim_logic
 
@@ -47,11 +50,112 @@ _CONSUMER_GROUP: str = os.environ.get("MEDGEMMA_CONSUMER_GROUP", "medgemma-worke
 _CONSUMER_NAME_BASE: str = os.environ.get("MEDGEMMA_CONSUMER_NAME", "medgemma-worker")
 _CONSUMER_NAME: str = f"{_CONSUMER_NAME_BASE}-{socket.gethostname()}-{os.getpid()}"
 _MEDGEMMA_DLQ_STREAM: str = os.environ.get("MEDGEMMA_DLQ_STREAM", "medgemma:dlq")
+_IMAGE_FETCH_TIMEOUT_S: float = float(os.environ.get("IMAGE_FETCH_TIMEOUT_S", "30"))
 
 # RPC retry configuration
 MEDGEMMA_RPC_MAX_RETRIES: int = 3
 MEDGEMMA_RPC_RETRY_DELAY_MS: int = 200
 MEDGEMMA_RPC_RETRY_BACKOFF_MULTIPLIER: float = 2.0
+
+
+def _is_http_url(value: str) -> bool:
+    """
+    Determine whether the value is an HTTP(S) URL.
+
+    Args:
+        value: Value to inspect.
+
+    Returns:
+        True when the value starts with http:// or https://.
+    """
+    lowered = value.strip().lower()
+    return lowered.startswith("http://") or lowered.startswith("https://")
+
+
+def _is_firebase_storage_url(url: str) -> bool:
+    """
+    Determine whether a URL points to Firebase/GCS storage.
+
+    Args:
+        url: URL to inspect.
+
+    Returns:
+        True when the URL belongs to Firebase/GCS storage domains.
+    """
+    lowered = url.strip().lower()
+    return (
+        "storage.googleapis.com" in lowered
+        or "firebasestorage.googleapis.com" in lowered
+        or lowered.startswith("gs://")
+    )
+
+
+def _fetch_image_bytes_from_url(url: str) -> bytes:
+    """
+    Fetch image bytes from a URL and validate payload format/size.
+
+    Args:
+        url: URL to download.
+
+    Returns:
+        Validated image bytes.
+
+    Raises:
+        ValueError: If the URL is unsupported or bytes fail validation.
+        httpx.HTTPError: If HTTP download fails.
+    """
+    if _is_firebase_storage_url(url):
+        image_bytes = download_client_image_bytes(url=url)
+        _validate_image_bytes(image_bytes)
+        return image_bytes
+
+    if not _is_http_url(url):
+        raise ValueError(f"Unsupported image URL: {url}")
+
+    response = httpx.get(
+        url,
+        timeout=_IMAGE_FETCH_TIMEOUT_S,
+        follow_redirects=True,
+    )
+    response.raise_for_status()
+    image_bytes = response.content
+    _validate_image_bytes(image_bytes)
+    return image_bytes
+
+
+def _resolve_image_bytes(payload: dict[str, Any]) -> bytes:
+    """
+    Resolve image bytes from a MedGemma stream payload.
+
+    The worker prefers the ref/url transport (`image_source_kind=image_url`) and
+    falls back to legacy `image_base64` during migration.
+
+    Args:
+        payload: Redis stream field mapping.
+
+    Returns:
+        Validated image bytes.
+
+    Raises:
+        ValueError: If no supported image source is provided.
+    """
+    source_kind = _to_str(payload.get("image_source_kind") or payload.get(b"image_source_kind")).strip().lower()
+    source_value = _to_str(payload.get("image_source_value") or payload.get(b"image_source_value")).strip()
+
+    if source_kind == "url" and source_value:
+        return _fetch_image_bytes_from_url(source_value)
+
+    image_b64_raw: Any = payload.get("image_base64")
+    if image_b64_raw is None:
+        image_b64_raw = payload.get(b"image_base64")
+
+    image_base64 = _to_str(image_b64_raw).strip()
+    if not image_base64:
+        raise ValueError("missing image source: expected image_source_kind/url or image_base64")
+
+    image_bytes = base64.b64decode(image_base64.encode("ascii"), validate=True)
+    _validate_image_bytes(image_bytes)
+    return image_bytes
 
 
 def _dispatch_with_retry(dispatch_func, *args, **kwargs) -> Any:
@@ -292,24 +396,11 @@ def _dispatch_message(msg_id: str, payload: dict[str, Any], service: MedGemmaSer
         _redis.xdel(_JOB_STREAM, msg_id)
         return None
 
-    # Extract prompt and image from payload
+    # Extract context and image from payload
     prompt: str = payload.get("prompt") or ""
-    image_b64: str = payload.get("image_base64") or ""
-
-    # Validate image
-    if not image_b64:
-        logger.warning("missing image_base64: job_id=%s", job_id)
-
-        # Update job status to failed
-        _mark_status(job_id, status="failed", error="missing image_base64", finished_at=str(int(time.time())))
-        
-        # Acknowledge the message to remove it from the stream
-        _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id)
-        _redis.xdel(_JOB_STREAM, msg_id)
-        return None
 
     try:
-        image_bytes: bytes = base64.b64decode(image_b64.encode("ascii"), validate=True)
+        image_bytes = _resolve_image_bytes(payload)
         logger.info("spawn dispatch starting: job_id=%s bytes=%s", job_id, len(image_bytes))
 
         # TODO : should this call_handle use a batched dispatch logic?
@@ -375,31 +466,11 @@ def _collect_batch() -> list[_JobEntry]:
                     _redis.xdel(_JOB_STREAM, msg_id_str)
                     continue
 
-                image_b64_raw: Any = payload.get("image_base64")
-                if image_b64_raw is None:
-                    image_b64_raw = payload.get(b"image_base64")
-
-                image_base64: str
-                if isinstance(image_b64_raw, (bytes, bytearray)):
-                    image_base64 = image_b64_raw.decode("utf-8", errors="ignore")
-                elif image_b64_raw is None:
-                    image_base64 = ""
-                else:
-                    image_base64 = str(image_b64_raw)
-
-                if not image_base64:
-                    # Malformed message
-                    _mark_status(job_id, status="failed", error="missing image_base64", finished_at=str(int(time.time())))
-                    _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id_str)
-                    _redis.xdel(_JOB_STREAM, msg_id_str)
-                    continue
-                
                 try:
-                    image_bytes = base64.b64decode(image_base64.encode("ascii"), validate=True)
-                    
+                    image_bytes = _resolve_image_bytes(payload)
                 except Exception as e:
-                    _mark_status(job_id, status = "failed", error = f"Failed to decode image_base64: {e}")
-                    logger.error("Failed to decode image_base64: %s", e)
+                    _mark_status(job_id, status="failed", error=f"Failed to resolve image bytes: {e}")
+                    logger.error("Failed to resolve image bytes: %s", e)
                     _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id_str)
                     _redis.xdel(_JOB_STREAM, msg_id_str)
                     continue

@@ -13,6 +13,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from typing import Any
 
+import httpx
 from langchain.tools import tool
 from redis import Redis
 from tavily import TavilyClient
@@ -27,9 +28,10 @@ TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY_QUTIS", "")
 logger: Logger = get_logger(__name__)
 
 REDIS_URL: str = os.getenv("REDIS_URL", "")
-DIAGNOSE_JOB_STREAM: str = os.getenv("DIAGNOSE_JOB_STREAM", "diagnose:jobs")
 EVENTS_STREAM: str = os.getenv("EVENTS_STREAM", "events:stream")
 WORKERS_STREAM_MAXLEN: int = int(os.getenv("WORKERS_STREAM_MAXLEN", "5000"))
+MEDGEMMA_GATEWAY_URL: str = os.getenv("MEDGEMMA_GATEWAY_URL", "http://127.0.0.1:8080")
+MEDGEMMA_ENDPOINT_TIMEOUT_S: float = float(os.getenv("MEDGEMMA_ENDPOINT_TIMEOUT_S", "30"))
 
 CASE_STATUS_SCAN_PAGE: int = max(1, int(os.getenv("CASE_STATUS_SCAN_PAGE", "500")))
 CASE_STATUS_SCAN_MAX: int = max(CASE_STATUS_SCAN_PAGE, int(os.getenv("CASE_STATUS_SCAN_MAX", "5000")))
@@ -39,8 +41,8 @@ SEARCH_RESULT_TOTAL_CHARS: int = max(1000, int(os.getenv("SEARCH_RESULT_TOTAL_CH
 
 
 _redis: Redis | None = Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
-_DIAGNOSE_ENQUEUED_KEY_PREFIX: str = "diagnose:enqueued"
-_DIAGNOSE_ENQUEUED_TTL_SEC: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"))
+_AUDIT_ENQUEUED_KEY_PREFIX: str = "diagnose:enqueued"
+_AUDIT_ENQUEUED_TTL_SEC: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"))
 _INGRESS_PAYLOAD_CACHE_PREFIX: str = "orchestrator:ingress_payload"
 _INGRESS_PAYLOAD_CACHE_TTL_SEC: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"))
 
@@ -60,77 +62,6 @@ def payload_has_image_attachment(payload: dict) -> bool:
         if str(source.get("value") or "").strip():
             return True
     return False
-
-
-def enqueue_diagnose_job(
-    *,
-    request_id: str,
-    case_id: str,
-    client_id: str,
-    message_id: str,
-    channel: str,
-    payload: str,
-    source: str = "orchestrator_tool",
-) -> dict[str, str]:
-    """
-    Enqueue a diagnose job with the canonical ingress payload (idempotent per request_id).
-    """
-    if _redis is None:
-        return {"status": "error", "detail": "REDIS_URL is not configured"}
-
-    rid = request_id or str(uuid4())
-    mid = message_id or rid
-    cid = client_id or "anonymous"
-    csid = case_id or rid
-
-    dedupe_key = f"{_DIAGNOSE_ENQUEUED_KEY_PREFIX}:{rid}"
-    if not _redis.set(dedupe_key, "1", nx=True, ex=_DIAGNOSE_ENQUEUED_TTL_SEC):
-        logger.info("diagnose job already enqueued: request_id=%s", rid)
-        return {
-            "status": "already_queued",
-            "stream": DIAGNOSE_JOB_STREAM,
-            "request_id": rid,
-        }
-
-    stream_id = _redis.xadd(
-        DIAGNOSE_JOB_STREAM,
-        {
-            "request_id": rid,
-            "case_id": csid,
-            "client_id": cid,
-            "message_id": mid,
-            "channel": channel,
-            "payload": payload,
-            "source": source,
-        },
-        maxlen=WORKERS_STREAM_MAXLEN,
-        approximate=True,
-    )
-
-    _redis.xadd(
-        EVENTS_STREAM,
-        {
-            "request_id": rid,
-            "case_id": csid,
-            "client_id": cid,
-            "message_id": mid,
-            "channel": channel,
-            "agent": "orchestrator",
-            "status": "routed_to_diagnose",
-            "target_stream": DIAGNOSE_JOB_STREAM,
-            "target_stream_id": str(stream_id),
-            "enqueue_source": source,
-        },
-        maxlen=WORKERS_STREAM_MAXLEN,
-        approximate=True,
-    )
-
-    return {
-        "status": "queued",
-        "stream": DIAGNOSE_JOB_STREAM,
-        "stream_id": str(stream_id),
-        "request_id": rid,
-    }
 
 
 def _payload_cache_key(request_id: str) -> str:
@@ -219,7 +150,7 @@ def _stringify_cached_payload(payload: Any) -> str:
 
 def _get_cached_ingress_envelope(request_id: str) -> dict[str, str]:
     """
-    Read cached ingress envelope fields needed for diagnose dispatch.
+    Read cached ingress envelope fields needed for audit dispatch.
 
     Args:
         request_id: Request id from the current orchestrator prompt.
@@ -294,7 +225,7 @@ def _resolve_canonical_payload(*, request_id: str, payload: str) -> str:
 
 def _merge_collected_context_into_payload(payload: str, collected_context: str) -> str:
     """
-    Merge orchestrator-collected context into payload.content.text for diagnose.
+    Merge orchestrator-collected context into payload.content.text for audit.
 
     Args:
         payload: Canonical payload JSON string.
@@ -332,9 +263,188 @@ def _merge_collected_context_into_payload(payload: str, collected_context: str) 
     if not isinstance(extras_obj, dict):
         extras_obj = {}
         metadata_obj["extras"] = extras_obj
+    extras_obj["audit_context_enriched"] = "true"
+    # Backward compatibility for any downstream readers that still inspect this marker.
     extras_obj["diagnose_prompt_enriched"] = "true"
 
     return json.dumps(payload_obj, default=str)
+
+
+def _resolve_image_url_from_payload(payload_obj: dict[str, Any]) -> str:
+    """
+    Resolve a downloadable image URL from canonical payload attachments.
+
+    Args:
+        payload_obj: Canonical payload object.
+
+    Returns:
+        Image URL string, or empty string when not resolvable.
+    """
+    attachments = (payload_obj.get("content") or {}).get("attachments") or []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        attachment_type = str(attachment.get("type") or "")
+        mime_type = str(attachment.get("mime_type") or "")
+        if attachment_type != "image" and not mime_type.startswith("image/"):
+            continue
+
+        source = attachment.get("source") or {}
+        source_kind = str(source.get("kind") or "").strip().lower()
+        source_value = str(source.get("value") or "").strip()
+        if not source_value:
+            continue
+
+        if source_kind == "url" and source_value.lower().startswith(("http://", "https://")):
+            return source_value
+
+        # Blob refs are expected to map to signed/object URLs in Redis.
+        if source_kind == "blob_ref" and _redis is not None:
+            try:
+                cached = str(_redis.get(source_value) or "").strip()
+                if cached.lower().startswith(("http://", "https://")):
+                    return cached
+            except Exception:
+                logger.exception("failed to resolve blob_ref to image url: ref=%s", source_value)
+
+    # Fallback for Telegram-style metadata extras.
+    extras_obj = ((payload_obj.get("metadata") or {}).get("extras") or {})
+    if isinstance(extras_obj, dict):
+        telegram_media_ref = str(extras_obj.get("telegram_media_ref") or "").strip()
+        if telegram_media_ref and _redis is not None:
+            try:
+                cached = str(_redis.get(telegram_media_ref) or "").strip()
+                if cached.lower().startswith(("http://", "https://")):
+                    return cached
+            except Exception:
+                logger.exception(
+                    "failed to resolve telegram_media_ref to image url: ref=%s",
+                    telegram_media_ref,
+                )
+
+    return ""
+
+
+def _extract_prompt_context(payload_obj: dict[str, Any]) -> str:
+    """
+    Build the context string sent to MedGemma from canonical payload content.
+
+    Args:
+        payload_obj: Canonical payload object.
+
+    Returns:
+        Context text (possibly empty).
+    """
+    content_obj = payload_obj.get("content") or {}
+    if not isinstance(content_obj, dict):
+        return ""
+    return str(content_obj.get("text") or "").strip()
+
+
+def _emit_orchestrator_event(fields: dict[str, str]) -> None:
+    """
+    Best-effort append to orchestrator events stream.
+
+    Args:
+        fields: Event fields to append.
+    """
+    if _redis is None:
+        return
+    try:
+        _redis.xadd(
+            EVENTS_STREAM,
+            {k: ("" if v is None else str(v)) for k, v in fields.items()},
+            maxlen=WORKERS_STREAM_MAXLEN,
+            approximate=True,
+        )
+    except Exception:
+        logger.exception("failed to append orchestrator event: status=%s", fields.get("status"))
+
+
+def _parse_retry_after_seconds(value: str) -> str:
+    """
+    Parse Retry-After header into a user-friendly numeric-seconds string.
+
+    Args:
+        value: Raw Retry-After header value.
+
+    Returns:
+        Parsed integer seconds as string, or empty string when parsing fails.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        seconds = max(1, int(float(raw)))
+        return str(seconds)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _dispatch_audit_image_ref(
+    *,
+    request_id: str,
+    case_id: str,
+    client_id: str,
+    message_id: str,
+    channel: str,
+    image_url: str,
+    context: str,
+) -> dict[str, str]:
+    """
+    Dispatch directly to MedGemma ref endpoint.
+
+    Args:
+        request_id: Request identifier.
+        case_id: Case identifier.
+        client_id: Client identifier.
+        message_id: Message identifier.
+        channel: Source channel.
+        image_url: Signed/downloadable image URL.
+        context: Model context text.
+
+    Returns:
+        Status dictionary for tool caller.
+    """
+    endpoint = f"{MEDGEMMA_GATEWAY_URL.rstrip('/')}/audit_image_ref"
+    payload = {
+        "request_id": request_id,
+        "case_id": case_id,
+        "client_id": client_id,
+        "message_id": message_id,
+        "channel": channel,
+        "image_url": image_url,
+        "context": context,
+    }
+
+    response = httpx.post(
+        endpoint,
+        json=payload,
+        timeout=MEDGEMMA_ENDPOINT_TIMEOUT_S,
+    )
+
+    if response.status_code == 429:
+        retry_after = _parse_retry_after_seconds(response.headers.get("Retry-After", ""))
+        return {
+            "status": "under_pressure",
+            "request_id": request_id,
+            "endpoint": endpoint,
+            "retry_after_seconds": retry_after or "1",
+            "detail": "MedGemma queue is saturated; retry later.",
+            "instruction": (
+                "MedGemma is currently under pressure. Do NOT call this tool again right now. "
+                "Tell the user their request was received but processing is delayed."
+            ),
+        }
+
+    response.raise_for_status()
+    data: dict[str, Any] = response.json() if response.content else {}
+    return {
+        "status": str(data.get("status") or "queued"),
+        "request_id": request_id,
+        "endpoint": endpoint,
+        "medgemma_job_id": str(data.get("job_id") or ""),
+    }
 
 
 @tool
@@ -347,20 +457,24 @@ def get_time() -> str:
 
 
 @tool
-def enque_to_diagnose_stream(request_id: str, collected_context: str = "") -> dict[str, str]:
+def enque_request_for_auditing_stream(request_id: str, collected_context: str = "") -> dict[str, str]:
     """
-    Route the current request to the diagnose worker.
+    Route the current request to the specialist team for image audit.
 
     Args:
         request_id: The exact request_id shown in the current orchestrator input.
-        collected_context: A concise structured summary for diagnosis. Include
+        collected_context: A concise structured summary for the image audit. Include
             only facts gathered from the user, not raw chat or internal details.
 
     Returns:
-        Queue result with status, stream, stream_id, and request_id.
+        Dispatch result with status and job metadata from the image audit worker.
     """
 
-    logger.info(f"TOOL CALL: enque_to_diagnose_stream: request_id={request_id}, collected_context={collected_context}")
+    logger.info(
+        "TOOL CALL: enque_request_for_auditing_stream: request_id=%s, collected_context=%s",
+        request_id,
+        collected_context,
+    )
 
     envelope = _get_cached_ingress_envelope(request_id)
     if not envelope:
@@ -375,14 +489,14 @@ def enque_to_diagnose_stream(request_id: str, collected_context: str = "") -> di
         payload=envelope["payload"],
     )
 
-    # Hard invariant: diagnosis requires an image. Block (terminally) when none
+    # Hard invariant: image audit requires an image. Block (terminally) when none
     # is present so the agent cannot loop on this tool for text-only turns.
     try:
         canonical_obj: dict[str, Any] = json.loads(canonical_payload)
     except Exception:
         canonical_obj = {}
     if not payload_has_image_attachment(canonical_obj):
-        logger.info("diagnose tool blocked (no image): request_id=%s", envelope["request_id"])
+        logger.info("audit tool blocked (no image): request_id=%s", envelope["request_id"])
         return {
             "status": "blocked_missing_image",
             "request_id": envelope["request_id"],
@@ -396,23 +510,92 @@ def enque_to_diagnose_stream(request_id: str, collected_context: str = "") -> di
     merged_payload = _merge_collected_context_into_payload(canonical_payload, collected_context)
     logger.info(f"TOOL CALL: merged_payload={merged_payload}")
 
-    result = enqueue_diagnose_job(
-        request_id=envelope["request_id"],
-        case_id=envelope["case_id"],
-        client_id=envelope["client_id"],
-        message_id=envelope["message_id"],
-        channel=envelope["channel"],
-        payload=merged_payload,
-        source="orchestrator_tool",
+    try:
+        merged_obj: dict[str, Any] = json.loads(merged_payload)
+    except Exception:
+        merged_obj = canonical_obj
+
+    image_url = _resolve_image_url_from_payload(merged_obj)
+    if not image_url:
+        logger.info(
+            "audit tool blocked (image url unresolved): request_id=%s",
+            envelope["request_id"],
+        )
+        return {
+            "status": "blocked_missing_image",
+            "request_id": envelope["request_id"],
+            "instruction": (
+                "An image exists but no downloadable image URL could be resolved for this request. "
+                "Do NOT call this tool again. Ask the user to upload the image again, then reply directly."
+            ),
+        }
+
+    context_text = _extract_prompt_context(merged_obj)
+    if not context_text:
+        context_text = "Provide a structured dermatological or Product review assessment of the provided image."
+
+    dedupe_key = f"{_AUDIT_ENQUEUED_KEY_PREFIX}:{envelope['request_id']}"
+    if _redis is not None and not _redis.set(dedupe_key, "1", nx=True, ex=_AUDIT_ENQUEUED_TTL_SEC):
+        logger.info("audit request already dispatched: request_id=%s", envelope["request_id"])
+        return {
+            "status": "already_queued",
+            "request_id": envelope["request_id"],
+            "instruction": (
+                "This image audit request was already dispatched. Do NOT call this tool again. "
+                "Tell the user their photo is already being reviewed."
+            ),
+        }
+
+    try:
+        result = _dispatch_audit_image_ref(
+            request_id=envelope["request_id"],
+            case_id=envelope["case_id"],
+            client_id=envelope["client_id"],
+            message_id=envelope["message_id"],
+            channel=envelope["channel"],
+            image_url=image_url,
+            context=context_text,
+        )
+    except httpx.HTTPStatusError as exc:
+        if _redis is not None:
+            _redis.delete(dedupe_key)
+        status_code = exc.response.status_code if exc.response is not None else 0
+        return {
+            "status": "error",
+            "request_id": envelope["request_id"],
+            "detail": f"audit dispatch failed with HTTP {status_code}",
+        }
+    except httpx.HTTPError as exc:
+        if _redis is not None:
+            _redis.delete(dedupe_key)
+        return {
+            "status": "error",
+            "request_id": envelope["request_id"],
+            "detail": f"audit dispatch failed: {exc}",
+        }
+
+    _emit_orchestrator_event(
+        {
+            "request_id": envelope["request_id"],
+            "case_id": envelope["case_id"],
+            "client_id": envelope["client_id"],
+            "message_id": envelope["message_id"],
+            "channel": envelope["channel"],
+            "agent": "orchestrator",
+            "status": "routed_for_image_auditing",
+            "target_endpoint": "/audit_image_ref",
+            "medgemma_job_id": result.get("medgemma_job_id", ""),
+            "enqueue_source": "orchestrator_tool",
+        }
     )
 
     # Make every terminal outcome explicit so the model stops calling the tool
     # and proceeds to compose the final user-facing reply.
     if result.get("status") in {"queued", "already_queued"}:
         result["instruction"] = (
-            "The diagnosis request is now in the queue. Do NOT call this tool again. "
-            "Tell the user their photo was received and is being reviewed by the "
-            "specialist team, and that results will follow shortly."
+            "The image audit request is now in the queue. Do NOT call this tool again. "
+            "Tell the user their photo was received and is being reviewed by the specialist team, "
+            "and that results will follow shortly."
         )
     return result
 
@@ -493,6 +676,9 @@ def read_status_of_a_case(case_id: str, request_id: str = "") -> dict:
                         "request_id": event_data.get("request_id", ""),
                         "message_id": event_data.get("message_id", ""),
                         "channel": event_data.get("channel", ""),
+                        "audit_status": event_data.get("medgemma_status", ""),
+                        "audit_job_id": event_data.get("medgemma_job_id", ""),
+                        # Backward compatibility keys
                         "diagnose_status": event_data.get("medgemma_status", ""),
                         "diagnose_job_id": event_data.get("medgemma_job_id", ""),
                         "error": event_data.get("error", ""),
@@ -679,7 +865,7 @@ def internet_search(query: str, max_results: int = 3) -> str:
 
 orchestrator_tools: list = [
     get_time,
-    enque_to_diagnose_stream,
+    enque_request_for_auditing_stream,
     read_status_of_a_case,
     read_soul_md,
     wikipedia_search,

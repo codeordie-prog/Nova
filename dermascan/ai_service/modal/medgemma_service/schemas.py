@@ -25,6 +25,21 @@ class DiagnoseBase64Request(BaseModel):
     group_id: Optional[str] = None
     group_expected_count: Optional[int] = None
 
+
+class AuditImageRefRequest(BaseModel):
+    """JSON request schema for URL-based image auditing."""
+
+    request_id: str = Field(min_length=1)
+    image_url: str = Field(min_length=1)
+    context: str = Field(min_length=1)
+    case_id: Optional[str] = None
+    client_id: Optional[str] = None
+    message_id: Optional[str] = None
+    channel: Optional[str] = None
+    mime_type: Optional[str] = None
+    group_id: Optional[str] = None
+    group_expected_count: Optional[int] = None
+
 # Pydantic model for response.
 class DiagnoseResponse(BaseModel):
     """

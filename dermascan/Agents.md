@@ -37,14 +37,8 @@
         │   writes: outbound:messages            │
         └───────────┬────────────────┬───────────┘
                     │                │
-        XADD diagnose:jobs           │ rules flows + signals
+        direct MedGemma dispatch     │ rules flows + signals
                     ▼                │
-        ┌──────────────────┐         │
-        │ Diagnose Agent   │         │
-        │ diagnose_worker  │         │
-        └────────┬─────────┘         │
-                 │ HTTP              │
-                 ▼                   │
         ┌──────────────────┐         │
         │ MedGemma Service │         │
         │ ai_service/modal │         │
@@ -79,7 +73,7 @@ Backend agent workers are started together via:
 poetry run python dermascan/scripts/do_work.py
 ```
 
-This runs orchestrator, diagnose, and outbound-sender in one supervisor process. **MedGemma** (gateway + worker) and the **knowledge worker** are started separately — see root `README.md`.
+This runs orchestrator and outbound-sender in one supervisor process. **MedGemma** (gateway + worker) and the **knowledge worker** are started separately — see root `README.md`.
 
 ---
 
@@ -109,21 +103,7 @@ This dual-loop design is what `awareness.md` describes as its **internal forever
 
 ---
 
-### 2.2 Diagnose Agent
-- **File:** `dermascan/backend/services/agents/diagnose_worker.py`
-
-**Role**
-- Reads `diagnose:jobs`.
-- Resolves the user’s image (from `blob_ref` in Redis or base64).
-- Calls the MedGemma gateway (`/diagnose_base64`) with image + prompt.
-- Acks the diagnose job once MedGemma has accepted it.
-- The result later flows back to the orchestrator via the **signal stream**.
-
-It is a **deterministic dispatcher**, not an LLM. It acts as a thin bridge between backend streams and the AI service.
-
----
-
-### 2.3 Qwen Service (Primary Orchestrator LLM)
+### 2.2 Qwen Service (Primary Orchestrator LLM)
 - **Folder:** `dermascan/ai_service/modal/qwen_service/`
 - **Modal app:** `app.py` (`QwenService` class, GPU L40S)
 - **Config:** `config/config.json`
@@ -146,7 +126,7 @@ Set `QWEN_BASE_URL` to the Modal HTTPS URL with `/v1` suffix. This is the **prim
 
 ---
 
-### 2.4 MedGemma Service (Vision Diagnosis)
+### 2.3 MedGemma Service (Vision Diagnosis)
 - **Folder:** `dermascan/ai_service/modal/medgemma_service/`
 - **Gateway (FastAPI):** `gateways/endpoints.py`
 - **Worker (Redis stream consumer):** `worker.py`
@@ -163,7 +143,7 @@ This is the system's **eye and clinical-judgment substrate**.
 
 ---
 
-### 2.5 Outbound Sender Agent
+### 2.4 Outbound Sender Agent
 - **File:** `dermascan/backend/services/agents/outbound_sender_worker.py`
 
 **Role**
@@ -176,7 +156,7 @@ This agent is the **mouth-control layer** — it ensures the user sees a coheren
 
 ---
 
-### 2.6 Knowledge Agent
+### 2.5 Knowledge Agent
 - **File:** `dermascan/backend/services/agents/knowledge_worker.py`
 - **Status:** present in the repo, intentionally **not started by `dermascan/scripts/do_work.py`**.
 
@@ -187,7 +167,7 @@ This agent is the **mouth-control layer** — it ensures the user sees a coheren
 
 ---
 
-### 2.7 Subagents in `product_rules_signal_helper.py`
+### 2.6 Subagents in `product_rules_signal_helper.py`
 - **File:** `dermascan/backend/services/agents/product_rules_signal_helper.py`
 
 This module hosts **three small specialized agents** plus two flow functions used during signal enrichment.
@@ -231,7 +211,6 @@ These flows are invoked by the orchestrator’s **signal loop** when the corresp
 |---|---|
 | Worker supervisor | `dermascan/scripts/do_work.py` |
 | Orchestrator | `dermascan/backend/services/agents/orchestrator_worker.py` |
-| Diagnose | `dermascan/backend/services/agents/diagnose_worker.py` |
 | Outbound Sender | `dermascan/backend/services/agents/outbound_sender_worker.py` |
 | Knowledge | `dermascan/backend/services/agents/knowledge_worker.py` |
 | Qwen Modal app | `dermascan/ai_service/modal/qwen_service/app.py` |

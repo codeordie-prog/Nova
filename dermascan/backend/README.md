@@ -76,12 +76,11 @@ Use the supervisor script (recommended):
 poetry run python dermascan/scripts/do_work.py
 ```
 
-This starts three workers in one process:
+This starts two workers in one process:
 
 | Worker | File | Stream(s) |
 |---|---|---|
 | Orchestrator | `orchestrator_worker.py` | `orchestrator:jobs`, `orchestrator:signals` |
-| Diagnose | `diagnose_worker.py` | `diagnose:jobs` |
 | Outbound sender | `outbound_sender_worker.py` | `outbound:messages` |
 
 The **knowledge worker** (`knowledge_worker.py`) is present but intentionally excluded from `do_work.py`. Start it manually if needed:
@@ -95,8 +94,6 @@ poetry run python dermascan/backend/services/agents/knowledge_worker.py
 ### What each worker does
 
 **Orchestrator** — mouth and ears of the system. Consumes user jobs and internal signals, invokes Qwen (primary) with tool calling, enqueues outbound messages.
-
-**Diagnose** — deterministic dispatcher. Resolves image attachments, calls `MEDGEMMA_GATEWAY_URL`, emits diagnosis signals.
 
 **Outbound sender** — compacts and delivers messages to Telegram or WhatsApp with ordered, deduplicated delivery.
 
@@ -161,12 +158,6 @@ Supported: `text`, `caption`, `photo[]` (largest image downloaded and stored).
 
 Protect WhatsApp ingress with `WHATSAPP_INGRESS_SECRET` or `INTERNAL_API_SECRET`. The qutis sidecar should set `QUTIS_AI_INGRESS_SECRET` to the same value.
 
-## Diagnose worker WhatsApp media fallback
+## MedGemma image source handling
 
-When an attachment has `source.kind="whatsapp_media_id"`, the diagnose worker fetches bytes via:
-
-`GET {WHATSAPP_API_BASE_URL}{WHATSAPP_MEDIA_PATH}/{media_id}`
-
-with header `X-Internal-Secret: WHATSAPP_INTERNAL_API_SECRET`.
-
-Related variables: `WHATSAPP_MEDIA_PATH`, `WHATSAPP_MEDIA_HTTP_TIMEOUT_S`, `WHATSAPP_TLS_VERIFY`, `WHATSAPP_CA_BUNDLE`.
+Image analysis is dispatched directly to the MedGemma gateway from orchestrator tools using URL-based image references (`/audit_image_ref` or `/audit_ref`). The MedGemma worker resolves image bytes at inference time.
