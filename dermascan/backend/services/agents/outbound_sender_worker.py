@@ -10,7 +10,6 @@ from collections import defaultdict
 from typing import Any
 
 import redis
-import requests
 from dotenv import load_dotenv
 
 from dermascan.shared.logger import get_logger
@@ -20,6 +19,7 @@ from dermascan.shared.redis_stability import (
     run_with_redis_retries,
 )
 from dermascan.backend.services.agents import reclaim_logic
+from dermascan.backend.utils.backoff import post_with_outbound_retry
 
 load_dotenv()
 
@@ -30,6 +30,7 @@ TELEGRAM_TLS_VERIFY: str = os.getenv("TELEGRAM_TLS_VERIFY", "false")
 TELEGRAM_CA_BUNDLE: str = os.getenv("TELEGRAM_CA_BUNDLE", "")
 WHATSAPP_API_BASE_URL: str = os.getenv("WHATSAPP_API_BASE_URL", "http://127.0.0.1:8000")
 WHATSAPP_API_SEND_PATH: str = os.getenv("WHATSAPP_API_SEND_PATH", "/send")
+WHATSAPP_API_TYPING_PATH: str = os.getenv("WHATSAPP_API_TYPING_PATH", "/typing")
 WHATSAPP_HTTP_TIMEOUT_S: float = float(os.getenv("WHATSAPP_HTTP_TIMEOUT_S", "20"))
 WHATSAPP_TLS_VERIFY: str = os.getenv("WHATSAPP_TLS_VERIFY", "true")
 WHATSAPP_CA_BUNDLE: str = os.getenv("WHATSAPP_CA_BUNDLE", "")
@@ -49,6 +50,17 @@ OUTBOUND_DEDUPE_TTL_SEC: int = max(30, int(os.getenv("OUTBOUND_DEDUPE_TTL_SEC", 
 OUTBOUND_CONVO_FIRST_WINDOW_MS: int = max(0, int(os.getenv("OUTBOUND_CONVO_FIRST_WINDOW_MS", "1500")))
 OUTBOUND_CHAOS_WINDOW_MS: int = max(0, int(os.getenv("OUTBOUND_CHAOS_WINDOW_MS", "2000")))
 OUTBOUND_CHAOS_TTL_SEC: int = max(1, int(os.getenv("OUTBOUND_CHAOS_TTL_SEC", "20")))
+OUTBOUND_SEND_MAX_RETRIES: int = max(0, int(os.getenv("OUTBOUND_SEND_MAX_RETRIES", "3")))
+OUTBOUND_SEND_RETRY_BASE_DELAY_S: float = max(
+    0.05,
+    float(os.getenv("OUTBOUND_SEND_RETRY_BASE_DELAY_S", "0.5")),
+)
+OUTBOUND_TYPING_ENABLED: bool = os.getenv("OUTBOUND_TYPING_ENABLED", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 WORKERS_STREAM_MAXLEN: int = int(os.getenv("WORKERS_STREAM_MAXLEN", "5000"))
 
 logger: logging.Logger = get_logger("agents")
@@ -89,6 +101,92 @@ def _split_telegram_text(text: str, max_len: int = 4096) -> list[str]:
     return [s[i:i + max_len] for i in range(0, len(s), max_len)]
 
 
+def _telegram_tls_verify() -> bool | str:
+    """Return TLS verify setting for Telegram HTTP calls."""
+    if TELEGRAM_CA_BUNDLE.strip():
+        return TELEGRAM_CA_BUNDLE.strip()
+    if TELEGRAM_TLS_VERIFY.strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _whatsapp_tls_verify() -> bool | str:
+    """Return TLS verify setting for WhatsApp sidecar HTTP calls."""
+    if WHATSAPP_CA_BUNDLE.strip():
+        return WHATSAPP_CA_BUNDLE.strip()
+    if WHATSAPP_TLS_VERIFY.strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _whatsapp_internal_headers() -> dict[str, str]:
+    """Build auth headers for qutis sidecar internal endpoints."""
+    return {
+        "Content-Type": "application/json",
+        "X-Internal-Secret": WHATSAPP_INTERNAL_API_SECRET,
+    }
+
+
+def _send_typing_best_effort(fields: dict[str, Any]) -> None:
+    """
+    Best-effort typing indicator before outbound delivery.
+
+    Typing failures are logged and ignored so they never block delivery.
+
+    Args:
+        fields: Outbound stream fields.
+    """
+    if not OUTBOUND_TYPING_ENABLED:
+        return
+
+    channel = str(fields.get("channel") or "")
+    case_id = str(fields.get("case_id") or "").strip()
+    reply_ref = str(fields.get("reply_to_message_id") or "").strip()
+
+    try:
+        if channel == "telegram":
+            if not case_id or not TELEGRAM_BOT_TOKEN:
+                return
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendChatAction"
+            post_with_outbound_retry(
+                url=url,
+                max_retries=0,
+                base_delay_s=OUTBOUND_SEND_RETRY_BASE_DELAY_S,
+                json={"chat_id": case_id, "action": "typing"},
+                timeout=min(TELEGRAM_HTTP_TIMEOUT_S, 5.0),
+                verify=_telegram_tls_verify(),
+            )
+            return
+
+        if channel == "whatsapp":
+            if not reply_ref or not WHATSAPP_INTERNAL_API_SECRET:
+                return
+            base_url = WHATSAPP_API_BASE_URL.rstrip("/")
+            typing_path = (
+                WHATSAPP_API_TYPING_PATH
+                if WHATSAPP_API_TYPING_PATH.startswith("/")
+                else f"/{WHATSAPP_API_TYPING_PATH}"
+            )
+            url = f"{base_url}{typing_path}"
+            post_with_outbound_retry(
+                url=url,
+                max_retries=0,
+                base_delay_s=OUTBOUND_SEND_RETRY_BASE_DELAY_S,
+                json={"message_id": reply_ref},
+                headers=_whatsapp_internal_headers(),
+                timeout=min(WHATSAPP_HTTP_TIMEOUT_S, 5.0),
+                verify=_whatsapp_tls_verify(),
+            )
+    except Exception:
+        logger.debug(
+            "typing indicator failed: channel=%s case_id=%s reply_ref=%s",
+            channel,
+            case_id,
+            reply_ref,
+            exc_info=True,
+        )
+
+
 def _send_telegram(chat_id: str, text: str, reply_to_message_id: int | None = None) -> None:
     """
     Send a message to a Telegram chat.
@@ -103,11 +201,7 @@ def _send_telegram(chat_id: str, text: str, reply_to_message_id: int | None = No
     """
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
-    verify: bool | str = True
-    if TELEGRAM_CA_BUNDLE.strip():
-        verify = TELEGRAM_CA_BUNDLE.strip()
-    elif TELEGRAM_TLS_VERIFY.strip().lower() in {"0", "false", "no", "off"}:
-        verify = False
+    verify = _telegram_tls_verify()
 
     # Send message URL
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -118,9 +212,15 @@ def _send_telegram(chat_id: str, text: str, reply_to_message_id: int | None = No
         if reply_to_message_id is not None:
             payload["reply_to_message_id"] = reply_to_message_id
             payload["allow_sending_without_reply"] = True
-        
-        resp = requests.post(url, json=payload, timeout=TELEGRAM_HTTP_TIMEOUT_S, verify=verify)
-        resp.raise_for_status()
+
+        resp = post_with_outbound_retry(
+            url=url,
+            max_retries=OUTBOUND_SEND_MAX_RETRIES,
+            base_delay_s=OUTBOUND_SEND_RETRY_BASE_DELAY_S,
+            json=payload,
+            timeout=TELEGRAM_HTTP_TIMEOUT_S,
+            verify=verify,
+        )
         payload = resp.json() if resp.content else {}
         if not payload.get("ok"):
             raise RuntimeError(f"telegram send non-ok: {payload}")
@@ -158,11 +258,7 @@ def _send_whatsapp(case_id: str, text: str, reply_to_wamid: str | None = None) -
     if not to:
         raise ValueError("missing case_id for whatsapp outbound")
 
-    verify: bool | str = True
-    if WHATSAPP_CA_BUNDLE.strip():
-        verify = WHATSAPP_CA_BUNDLE.strip()
-    elif WHATSAPP_TLS_VERIFY.strip().lower() in {"0", "false", "no", "off"}:
-        verify = False
+    verify = _whatsapp_tls_verify()
 
     base_url = WHATSAPP_API_BASE_URL.rstrip("/")
     send_path = WHATSAPP_API_SEND_PATH if WHATSAPP_API_SEND_PATH.startswith("/") else f"/{WHATSAPP_API_SEND_PATH}"
@@ -172,14 +268,12 @@ def _send_whatsapp(case_id: str, text: str, reply_to_wamid: str | None = None) -
     if reply_target:
         payload["reply_to_wamid"] = reply_target
 
-    headers = {
-        "Content-Type": "application/json",
-        "X-Internal-Secret": WHATSAPP_INTERNAL_API_SECRET,
-    }
-    response = requests.post(
-        url,
+    response = post_with_outbound_retry(
+        url=url,
+        max_retries=OUTBOUND_SEND_MAX_RETRIES,
+        base_delay_s=OUTBOUND_SEND_RETRY_BASE_DELAY_S,
         json=payload,
-        headers=headers,
+        headers=_whatsapp_internal_headers(),
         timeout=WHATSAPP_HTTP_TIMEOUT_S,
         verify=verify,
     )
@@ -209,15 +303,32 @@ def _to_int(value: Any) -> int | None:
         return None
 
 
+def _whatsapp_reply_wamid(fields: dict[str, Any]) -> str | None:
+    """
+    Resolve WhatsApp threading target.
+
+    WhatsApp threads only signal updates. Job replies are sent without
+    ``reply_to_wamid``, even when chaos mode would thread on Telegram.
+
+    Args:
+        fields: Outbound stream fields.
+
+    Returns:
+        Inbound wamid when this outbound item is a signal update, else None.
+    """
+    if not _is_signal_kind(fields):
+        return None
+    wamid = str(fields.get("reply_to_message_id") or "").strip()
+    return wamid or None
+
+
 def _deliver(fields: dict[str, Any], reply_to_message_id: int | None = None) -> None:
     """
     Deliver a message to a channel.
 
-    NB Only Telegram channel has been implemented : should be mutated later to include other channels.
-
-    
     Args:
         fields: The fields to deliver.
+        reply_to_message_id: Telegram reply target when threading is enabled.
     """
     channel = str(fields.get("channel") or "")
     case_id = str(fields.get("case_id") or "")
@@ -225,7 +336,8 @@ def _deliver(fields: dict[str, Any], reply_to_message_id: int | None = None) -> 
     if not text:
         return
 
-    # Send to Telegram
+    _send_typing_best_effort(fields)
+
     if channel == "telegram":
         if not case_id:
             raise ValueError("missing case_id for telegram outbound")
@@ -233,8 +345,7 @@ def _deliver(fields: dict[str, Any], reply_to_message_id: int | None = None) -> 
         return
 
     if channel == "whatsapp":
-        reply_to_wamid = str(fields.get("reply_to_message_id") or "").strip()
-        _send_whatsapp(case_id, text, reply_to_wamid=reply_to_wamid or None)
+        _send_whatsapp(case_id, text, reply_to_wamid=_whatsapp_reply_wamid(fields))
         return
     raise ValueError(f"unsupported channel: {channel}")
 
