@@ -7,6 +7,7 @@ Description: Orchestrator tools for the orchestrator Agent
 
 import os
 import json
+import time
 from logging import Logger
 from uuid import uuid4
 from datetime import datetime
@@ -31,7 +32,10 @@ REDIS_URL: str = os.getenv("REDIS_URL", "")
 EVENTS_STREAM: str = os.getenv("EVENTS_STREAM", "events:stream")
 WORKERS_STREAM_MAXLEN: int = int(os.getenv("WORKERS_STREAM_MAXLEN", "5000"))
 MEDGEMMA_GATEWAY_URL: str = os.getenv("MEDGEMMA_GATEWAY_URL", "http://127.0.0.1:8080")
-MEDGEMMA_ENDPOINT_TIMEOUT_S: float = float(os.getenv("MEDGEMMA_ENDPOINT_TIMEOUT_S", "30"))
+MEDGEMMA_ENDPOINT_TIMEOUT_S: float = float(os.getenv("MEDGEMMA_ENDPOINT_TIMEOUT_S", "5"))
+MEDGEMMA_ENDPOINT_CONNECT_TIMEOUT_S: float = float(os.getenv("MEDGEMMA_ENDPOINT_CONNECT_TIMEOUT_S", "2"))
+MEDGEMMA_ENDPOINT_RETRY_ATTEMPTS: int = max(0, int(os.getenv("MEDGEMMA_ENDPOINT_RETRY_ATTEMPTS", "1")))
+MEDGEMMA_ENDPOINT_RETRY_DELAY_S: float = max(0.0, float(os.getenv("MEDGEMMA_ENDPOINT_RETRY_DELAY_S", "0.2")))
 
 CASE_STATUS_SCAN_PAGE: int = max(1, int(os.getenv("CASE_STATUS_SCAN_PAGE", "500")))
 CASE_STATUS_SCAN_MAX: int = max(CASE_STATUS_SCAN_PAGE, int(os.getenv("CASE_STATUS_SCAN_MAX", "5000")))
@@ -417,11 +421,27 @@ def _dispatch_audit_image_ref(
         "context": context,
     }
 
-    response = httpx.post(
-        endpoint,
-        json=payload,
+    timeout = httpx.Timeout(
         timeout=MEDGEMMA_ENDPOINT_TIMEOUT_S,
+        connect=MEDGEMMA_ENDPOINT_CONNECT_TIMEOUT_S,
     )
+    response: httpx.Response | None = None
+
+    for attempt in range(MEDGEMMA_ENDPOINT_RETRY_ATTEMPTS + 1):
+        try:
+            response = httpx.post(
+                endpoint,
+                json=payload,
+                timeout=timeout,
+            )
+            break
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError):
+            if attempt >= MEDGEMMA_ENDPOINT_RETRY_ATTEMPTS:
+                raise
+            time.sleep(MEDGEMMA_ENDPOINT_RETRY_DELAY_S * (attempt + 1))
+
+    if response is None:
+        raise RuntimeError("audit dispatch produced no HTTP response")
 
     if response.status_code == 429:
         retry_after = _parse_retry_after_seconds(response.headers.get("Retry-After", ""))

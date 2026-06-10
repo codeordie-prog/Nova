@@ -13,7 +13,7 @@ This is implemented inorder to achieve a near one forward pass behavior.
 
 import base64
 import json
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 import os
 import socket
@@ -50,7 +50,8 @@ _CONSUMER_GROUP: str = os.environ.get("MEDGEMMA_CONSUMER_GROUP", "medgemma-worke
 _CONSUMER_NAME_BASE: str = os.environ.get("MEDGEMMA_CONSUMER_NAME", "medgemma-worker")
 _CONSUMER_NAME: str = f"{_CONSUMER_NAME_BASE}-{socket.gethostname()}-{os.getpid()}"
 _MEDGEMMA_DLQ_STREAM: str = os.environ.get("MEDGEMMA_DLQ_STREAM", "medgemma:dlq")
-_IMAGE_FETCH_TIMEOUT_S: float = float(os.environ.get("IMAGE_FETCH_TIMEOUT_S", "30"))
+_IMAGE_FETCH_TIMEOUT_S: float = float(os.environ.get("IMAGE_FETCH_TIMEOUT_S", "10"))
+_IMAGE_FETCH_MAX_WORKERS: int = max(1, int(os.environ.get("MEDGEMMA_IMAGE_FETCH_MAX_WORKERS", "8")))
 
 # RPC retry configuration
 MEDGEMMA_RPC_MAX_RETRIES: int = 3
@@ -227,6 +228,16 @@ class _JobEntry:
     channel: str
     group_id: str
     group_expected_count: int = 0
+
+
+@dataclass
+class _PendingJob:
+    """
+    Stream message waiting for image-byte resolution.
+    """
+    job_id: str
+    msg_id: str
+    payload: dict[str, Any]
 
 
 def _to_str(value: Any) -> str:
@@ -417,6 +428,75 @@ def _dispatch_message(msg_id: str, payload: dict[str, Any], service: MedGemmaSer
         logger.info("message acked after dispatch failure: msg_id=%s", msg_id)
         return None
 
+def _build_job_entry(pending: _PendingJob, image_bytes: bytes) -> _JobEntry:
+    """
+    Build a model-dispatch job entry from a pending stream message.
+
+    Args:
+        pending: Pending stream job metadata.
+        image_bytes: Resolved and validated image bytes.
+
+    Returns:
+        Dispatch-ready job entry.
+    """
+    payload = pending.payload
+    return _JobEntry(
+        job_id=pending.job_id,
+        msg_id=pending.msg_id,
+        image_bytes=image_bytes,
+        request_id=_to_str(payload.get("request_id") or payload.get(b"request_id")),
+        case_id=_to_str(payload.get("case_id") or payload.get(b"case_id")),
+        client_id=_to_str(payload.get("client_id") or payload.get(b"client_id")),
+        message_id=_to_str(payload.get("message_id") or payload.get(b"message_id")),
+        channel=_to_str(payload.get("channel") or payload.get(b"channel")),
+        group_id=_to_str(payload.get("group_id") or payload.get(b"group_id")),
+        group_expected_count=int(
+            _to_str(payload.get("group_expected_count") or payload.get(b"group_expected_count") or "0")
+            or "0"
+        ),
+        prompt=_to_str(payload.get("prompt") or payload.get(b"prompt")),
+    )
+
+
+def _resolve_pending_images(pending_jobs: list[_PendingJob]) -> dict[str, bytes]:
+    """
+    Resolve image bytes for pending jobs concurrently.
+
+    Args:
+        pending_jobs: Pending stream jobs.
+
+    Returns:
+        Mapping of message id to resolved image bytes. Failed jobs are marked
+        failed and acked/deleted before returning.
+    """
+    if not pending_jobs:
+        return {}
+
+    max_workers = min(_IMAGE_FETCH_MAX_WORKERS, len(pending_jobs))
+    resolved: dict[str, bytes] = {}
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="medgemma-image-fetch") as pool:
+        future_to_job: dict[Future[bytes], _PendingJob] = {
+            pool.submit(_resolve_image_bytes, pending.payload): pending
+            for pending in pending_jobs
+        }
+        for future in as_completed(future_to_job):
+            pending = future_to_job[future]
+            try:
+                resolved[pending.msg_id] = future.result()
+            except Exception as exc:
+                _mark_status(
+                    pending.job_id,
+                    status="failed",
+                    error=f"Failed to resolve image bytes: {exc}",
+                    finished_at=str(int(time.time())),
+                )
+                logger.error("Failed to resolve image bytes: job_id=%s error=%s", pending.job_id, exc)
+                _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, pending.msg_id)
+                _redis.xdel(_JOB_STREAM, pending.msg_id)
+
+    return resolved
+
+
 def _collect_batch() -> list[_JobEntry]:
     """
     Collect results untill batch is full OR time window expires
@@ -424,10 +504,10 @@ def _collect_batch() -> list[_JobEntry]:
     Returns:
         List of job entries with results
     """
-    batch: list[_JobEntry] = []
+    pending_jobs: list[_PendingJob] = []
     deadline: float = time.monotonic() + _BATCH_WINDOW_S
 
-    while len(batch) < _BATCH_SIZE:
+    while len(pending_jobs) < _BATCH_SIZE:
 
         # Get the remaining time in the batch window
         remaining_ms: int = max(0, int((deadline - time.monotonic()) * 1000))
@@ -441,7 +521,7 @@ def _collect_batch() -> list[_JobEntry]:
             groupname=_CONSUMER_GROUP,
             consumername=_CONSUMER_NAME,
             streams={_JOB_STREAM: ">"},
-            count=_BATCH_SIZE - len(batch),
+            count=_BATCH_SIZE - len(pending_jobs),
             block=remaining_ms
         )
 
@@ -466,46 +546,35 @@ def _collect_batch() -> list[_JobEntry]:
                     _redis.xdel(_JOB_STREAM, msg_id_str)
                     continue
 
-                try:
-                    image_bytes = _resolve_image_bytes(payload)
-                except Exception as e:
-                    _mark_status(job_id, status="failed", error=f"Failed to resolve image bytes: {e}")
-                    logger.error("Failed to resolve image bytes: %s", e)
-                    _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id_str)
-                    _redis.xdel(_JOB_STREAM, msg_id_str)
-                    continue
+                pending_jobs.append(_PendingJob(job_id=job_id, msg_id=msg_id_str, payload=payload))
 
-                attempts: int = _start_attempt(job_id)
-                if attempts > _MAX_ATTEMPTS:
-                    _mark_status(job_id, status="failed", error="Max attempts reached")
-                    _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id_str)
-                    _redis.xdel(_JOB_STREAM, msg_id_str)
-                    continue
+    # Resolve the images for the pending jobs - Parallel processing of images
+    resolved_images = _resolve_pending_images(pending_jobs)
+    batch: list[_JobEntry] = []
+    for pending in pending_jobs:
+        image_bytes = resolved_images.get(pending.msg_id)
+        if image_bytes is None:
+            continue
 
-                batch.append(
-                    _JobEntry(
-                        job_id=job_id,
-                        msg_id=msg_id_str,
-                        image_bytes=image_bytes,
-                        request_id=_to_str(payload.get("request_id") or payload.get(b"request_id")),
-                        case_id=_to_str(payload.get("case_id") or payload.get(b"case_id")),
-                        client_id=_to_str(payload.get("client_id") or payload.get(b"client_id")),
-                        message_id=_to_str(payload.get("message_id") or payload.get(b"message_id")),
-                        channel=_to_str(payload.get("channel") or payload.get(b"channel")),
-                        group_id=_to_str(payload.get("group_id") or payload.get(b"group_id")),
-                        group_expected_count=int(
-                            _to_str(payload.get("group_expected_count") or payload.get(b"group_expected_count") or "0")
-                            or "0"
-                        ),
-                        prompt=(
-                            payload.get("prompt")
-                            or payload.get(b"prompt")
-                            or ""
-                        ).decode("utf-8", errors="ignore")
-                        if isinstance(payload.get("prompt") or payload.get(b"prompt") or "", (bytes, bytearray))
-                        else str(payload.get("prompt") or payload.get(b"prompt") or "")
-                    )
-                )
+        try:
+            attempts: int = _start_attempt(pending.job_id)
+            if attempts > _MAX_ATTEMPTS:
+                _mark_status(pending.job_id, status="failed", error="Max attempts reached")
+                _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, pending.msg_id)
+                _redis.xdel(_JOB_STREAM, pending.msg_id)
+                continue
+
+            batch.append(_build_job_entry(pending, image_bytes))
+        except Exception as exc:
+            _mark_status(
+                pending.job_id,
+                status="failed",
+                error=f"Failed to prepare job: {exc}",
+                finished_at=str(int(time.time())),
+            )
+            logger.exception("Failed to prepare job: job_id=%s", pending.job_id)
+            _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, pending.msg_id)
+            _redis.xdel(_JOB_STREAM, pending.msg_id)
                 
     return batch
 
