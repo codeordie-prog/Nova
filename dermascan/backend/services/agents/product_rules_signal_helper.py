@@ -16,6 +16,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 from tavily import TavilyClient
 
+from dermascan.backend.services.agents.provider_circuit_breaker import load_qwen_circuit_breaker
 from dermascan.rules_engine.engine.engine import RulesEngineRequest
 from dermascan.rules_engine.engine.rules_engine import RulesEngine
 from dermascan.shared.logger import get_logger
@@ -25,11 +26,15 @@ load_dotenv()
 logger = get_logger(__name__)
 
 TAVILY_API_KEY = str(os.getenv("TAVILY_API_KEY_QUTIS", ""))
-OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY_QUTIS", ""))
-PRODUCT_INGREDIENT_MODEL = str(os.getenv("PRODUCT_INGREDIENT_MODEL", "gpt-4o-mini"))
-PRODUCT_REPORT_MODEL = str(os.getenv("PRODUCT_REPORT_MODEL", "gpt-4o-mini"))
-SKIN_REVIEW_MODEL = str(os.getenv("SKIN_REVIEW_MODEL", "gpt-4o-mini"))
-
+_PROVIDER_MAX_RETRIES_HARD_CAP = 3
+QWEN_API_KEY = str(os.getenv("QWEN_API_KEY") or os.getenv("QWEN_OPENAI_API_KEY") or "EMPTY")
+QWEN_BASE_URL = str(os.getenv("QWEN_BASE_URL") or os.getenv("QWEN_OPENAI_BASE_URL") or "")
+QWEN_MODEL_NAME = str(os.getenv("QWEN_SERVED_MODEL_NAME") or os.getenv("QWEN_MODEL_NAME") or "qwen-3-8b")
+QWEN_REQUEST_TIMEOUT_S = float(os.getenv("QWEN_REQUEST_TIMEOUT_S", "45"))
+QWEN_MAX_RETRIES = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("QWEN_MAX_RETRIES", "2"))))
+QWEN_ENABLE_THINKING = os.getenv("QWEN_ENABLE_THINKING", "false").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 class IngredientExtractionResponse(BaseModel):
     """Structured output from product ingredient extraction agent."""
@@ -50,8 +55,92 @@ class SkinReviewResponse(BaseModel):
 
     report_text: str = ""
 
-# Global rules engine instance
+# Global rules engine instance + Model circuit breaker
 _rules_engine_singleton: RulesEngine | None = None
+_qwen_breaker = load_qwen_circuit_breaker()
+
+
+def _build_qwen_model() -> ChatOpenAI:
+    """
+    Build a Qwen ChatOpenAI client using the shared OpenAI-compatible endpoint.
+    
+    Returns:
+        ChatOpenAI instance - an openai compatible API for the self-hosted model
+    """
+    base_url = QWEN_BASE_URL.rstrip("/")
+    if not base_url:
+        raise RuntimeError("QWEN_BASE_URL (or QWEN_OPENAI_BASE_URL) is required for subagents")
+    if not base_url.endswith("/v1"):
+        base_url = f"{base_url}/v1"
+
+    return ChatOpenAI(
+        model=QWEN_MODEL_NAME,
+        api_key=QWEN_API_KEY,
+        base_url=base_url,
+        timeout=QWEN_REQUEST_TIMEOUT_S,
+        max_retries=QWEN_MAX_RETRIES,
+        temperature=0,
+        extra_body={"chat_template_kwargs": {"enable_thinking": QWEN_ENABLE_THINKING}},
+    )
+
+
+def _should_retry_provider_error(exc: Exception) -> bool:
+    """
+    Return True for transient provider errors that are safe to retry.
+    
+    Args:
+        exc (Exception): The exception.
+
+
+    Returns:
+        bool - True if should be retried else false.
+    """
+    text = str(exc).lower()
+    markers = (
+        "429",
+        "rate limit",
+        "resource exhausted",
+        "timeout",
+        "timed out",
+        "connection",
+        "connect error",
+        "service unavailable",
+        "temporarily unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "502",
+        "503",
+        "504",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _invoke_with_retry(*, agent: Any, prompt: str, operation: str) -> dict[str, Any]:
+    """Invoke an agent with circuit-breaker guarding and bounded retries."""
+    max_attempts = max(1, QWEN_MAX_RETRIES + 1)
+    last_exc: Exception | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        if not _qwen_breaker.allow():
+            raise RuntimeError(f"qwen circuit open; skipping {operation}")
+        try:
+            response = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
+            _qwen_breaker.record_success()
+            return response if isinstance(response, dict) else {}
+        except Exception as exc:
+            last_exc = exc
+            _qwen_breaker.record_failure()
+            if attempt >= max_attempts or not _should_retry_provider_error(exc):
+                raise
+            logger.warning(
+                "%s attempt %s/%s failed; retrying: %s",
+                operation,
+                attempt,
+                max_attempts,
+                exc,
+            )
+
+    raise last_exc if last_exc is not None else RuntimeError(f"{operation} failed")
 
 
 def _normalize_inci_name(raw_name: str) -> str:
@@ -167,11 +256,7 @@ def _build_ingredient_agent() -> Any:
     These ingredient names are then normalized and used to query our safety database.
 
     """
-    model = ChatOpenAI(
-        model=PRODUCT_INGREDIENT_MODEL, 
-        api_key=OPENAI_API_KEY, 
-        temperature=0
-    )
+    model = _build_qwen_model()
     return create_agent(
         model=model,
         tools=[inci_decoder_search],
@@ -206,16 +291,23 @@ def extract_product_ingredients(*, product_name: str, description: str) -> Ingre
         f"product_name: {product_name}\n"
         f"description: {description}\n"
     )
-    response = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
-    structured = response.get("structured_response") if isinstance(response, dict) else None
-    if isinstance(structured, IngredientExtractionResponse):
-        ingredients = [_normalize_inci_name(item) for item in structured.ingredients]
-        ingredients = [item for item in ingredients if item]
-        return IngredientExtractionResponse(
-            ingredients=list(dict.fromkeys(ingredients)),
-            notes=structured.notes,
-            sources=structured.sources,
+    try:
+        response = _invoke_with_retry(
+            agent=agent,
+            prompt=prompt,
+            operation="ingredient_extraction",
         )
+        structured = response.get("structured_response") if isinstance(response, dict) else None
+        if isinstance(structured, IngredientExtractionResponse):
+            ingredients = [_normalize_inci_name(item) for item in structured.ingredients]
+            ingredients = [item for item in ingredients if item]
+            return IngredientExtractionResponse(
+                ingredients=list(dict.fromkeys(ingredients)),
+                notes=structured.notes,
+                sources=structured.sources,
+            )
+    except Exception:
+        logger.exception("failed to extract product ingredients")
 
     return IngredientExtractionResponse()
 
@@ -262,11 +354,7 @@ def _build_report_agent(context: list[dict[str, Any]]) -> Any:
     Build a report summarization subagent.
     
     """
-    model = ChatOpenAI(
-        model=PRODUCT_REPORT_MODEL, 
-        api_key=OPENAI_API_KEY, 
-        temperature=0
-    )
+    model = _build_qwen_model()
     return create_agent(
         model=model,
         tools=[report_internet_search],
@@ -290,11 +378,7 @@ def _build_skin_review_agent(context: list[dict[str, Any]]) -> Any:
     """
     Build a skin review agent
     """
-    model = ChatOpenAI(
-        model=SKIN_REVIEW_MODEL,
-        api_key=OPENAI_API_KEY,
-        temperature=0
-    )
+    model = _build_qwen_model()
 
     return create_agent(
         model=model,
@@ -339,7 +423,11 @@ def build_skin_review_report(
         f"last_conversation_entries: {json.dumps(context, default=str)}\n"
     )
     try:
-        response = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
+        response = _invoke_with_retry(
+            agent=agent,
+            prompt=prompt,
+            operation="skin_review_report",
+        )
         structured = response.get("structured_response") if isinstance(response, dict) else None
         if isinstance(structured, SkinReviewResponse) and structured.report_text.strip():
             return _strip_markdown_formatting(structured.report_text)
@@ -387,7 +475,11 @@ def build_user_friendly_report(
         f"last_conversation_entries: {json.dumps(context, default=str)}\n"
     )
     try:
-        response = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
+        response = _invoke_with_retry(
+            agent=agent,
+            prompt=prompt,
+            operation="product_user_friendly_report",
+        )
         structured = response.get("structured_response") if isinstance(response, dict) else None
         if isinstance(structured, UserFriendlyReportResponse) and structured.report_text.strip():
             return _strip_markdown_formatting(structured.report_text)
