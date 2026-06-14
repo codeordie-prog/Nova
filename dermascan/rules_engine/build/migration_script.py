@@ -5,6 +5,8 @@ Migration script from local sqlite to postgres
 import os
 import re
 import sqlite3
+import sys
+
 import psycopg2
 
 
@@ -16,6 +18,12 @@ PORT = "5432"
 DATABASE = "postgres"
 USER = "postgres"
 
+CLOUD_SQL_HOST = os.environ.get("CLOUD_POSTGRES_HOST", "34.79.111.107")
+CLOUD_SQL_PORT = os.environ.get("CLOUD_POSTGRES_PORT", "5432")
+CLOUD_SQL_DATABASE = os.environ.get("CLOUD_POSTGRES_DATABASE", "qutis_db")
+CLOUD_SQL_USER = os.environ.get("CLOUD_POSTGRES_USER", "postgres")
+CLOUD_SQL_SSLMODE = os.environ.get("CLOUD_POSTGRES_SSLMODE", "require")
+CLOUD_SQL_PASSWORD = "Dermascan@a1122"
 
 # -----------------------------
 # SQLITE CONNECTION
@@ -393,41 +401,117 @@ def _migrate_data(table_name: str):
 
 
 # -----------------------------
+# CLOUD SQL CONNECTION TEST
+# -----------------------------
+def _cloud_sql_password() -> str:
+    """
+    Resolve the Cloud SQL password from environment variables or module config.
+
+    Returns:
+        str: Postgres password for the Cloud SQL instance.
+
+    Raises:
+        ValueError: If no password is configured.
+    """
+    password = (
+        os.environ.get("CLOUD_POSTGRES_PASSWORD")
+        or os.environ.get("POSTGRESS_PASSWORD")
+        or os.environ.get("postgres_password")
+        or CLOUD_SQL_PASSWORD
+    )
+    if not password:
+        raise ValueError(
+            "Cloud SQL password is required. Set CLOUD_POSTGRES_PASSWORD or CLOUD_SQL_PASSWORD."
+        )
+    return password
+
+
+def _establish_cloud_sql_conn():
+    """
+    Open a psycopg2 connection to the GCP Cloud SQL instance.
+
+    Returns:
+        psycopg2 connection configured with SSL.
+
+    Raises:
+        ValueError: If the password is missing.
+        psycopg2.Error: If the connection fails.
+    """
+    return psycopg2.connect(
+        host=CLOUD_SQL_HOST,
+        port=CLOUD_SQL_PORT,
+        database=CLOUD_SQL_DATABASE,
+        user=CLOUD_SQL_USER,
+        password=_cloud_sql_password(),
+        sslmode=CLOUD_SQL_SSLMODE,
+    )
+
+
+def test_cloud_sql_connection(*, table_name: str = "cir_pdfs") -> bool:
+    """
+    Verify connectivity to the GCP Cloud SQL database.
+
+    Runs a version check and, when present, reports row count for the target table.
+
+    Args:
+        table_name: Table to probe after the connection succeeds.
+
+    Returns:
+        bool: True when the connection and probe queries succeed.
+
+    Raises:
+        ValueError: If the password is missing.
+        psycopg2.Error: If connection or probe queries fail.
+    """
+    conn = _establish_cloud_sql_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT version();")
+        version = cur.fetchone()[0]
+        print(f"Connected to Cloud SQL at {CLOUD_SQL_HOST}:{CLOUD_SQL_PORT}/{CLOUD_SQL_DATABASE}")
+        print(f"  sslmode={CLOUD_SQL_SSLMODE}")
+        print(f"  postgres version: {version}")
+
+        cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = %s
+            );
+            """,
+            (table_name,),
+        )
+        table_exists = cur.fetchone()[0]
+
+        if table_exists:
+            cur.execute(f'SELECT COUNT(*) FROM "{table_name}";')
+            row_count = cur.fetchone()[0]
+            print(f"  table {table_name!r}: {row_count} rows")
+        else:
+            print(f"  table {table_name!r}: not found (connection still OK)")
+
+        print("Cloud SQL connection test passed.")
+        return True
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
 # MAIN PIPELINE
 # -----------------------------
 if __name__ == "__main__":
+
+    if len(sys.argv) > 1 and sys.argv[1] == "test-cloud-sql":
+        test_cloud_sql_connection()
+        sys.exit(0)
 
     sqlite_conn = _establish_sqlite_connection()
     tables = _get_tables(sqlite_conn)
 
     print("Tables to migrate:", tables)
 
-    for table_name in tables:
-
-        print(f"\nProcessing: {table_name}")
-
-        schema = _get_table_schema(sqlite_conn, table_name)
-
-        # create table in postgres
-        sql = generate_postgres_create_table(table_name, schema)
-        _create_table_postgres(sql)
-        print("  Table created")
-
-        # add pdf_name column if missing (for existing tables)
-        _add_pdf_name_column_if_missing(table_name)
-
-        # add normalized_names column if missing (for existing tables)
-        _add_normalized_names_column_if_missing(table_name)
-
-        # update existing rows with pdf_name from pdf_path
-        _update_pdf_name_from_pdf_path(table_name)
-
-        # update existing rows with normalized_names from cir_ingredient_name
-        _update_normalized_names_from_ingredient_name(table_name)
-
-        # migrate data
-        _migrate_data(table_name)
-
-    sqlite_conn.close()
-
-    print("\nMigration completed successfully!")
+    

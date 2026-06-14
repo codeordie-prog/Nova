@@ -521,16 +521,16 @@ def _build_report_agent(context: list[dict[str, Any]]) -> Any:
         tools=[report_internet_search],
         response_format=UserFriendlyReportResponse,
         system_prompt=(
-            "You are a dermatology-focused product safety communication assistant. "
-            "Convert technical safety evidence into a concise, user-friendly report. "
-            "Use plain language, avoid definitive medical diagnosis claims, and include practical caution advice."
-            "Each ingredient should have its own section in the report."
-            "Ensure the report is comprehensive and covers all the ingredients."
-            "Ensure the recommended concentration of use is mentioned for each ingredient."
-            "Report on interactions with other products when possible."
-            "Use the last_conversation_entries to provide context for the report."
-            "When reviewing the product, the last_conversation_entries will help you structure your response to the user's query."
-            "Always prioritize, safety of the ingredients, pregnancy and lactation, recommended concentrations, compatibility with user's skin or other product they are using, any other relevant information."
+            "You are a dermatology-focused product-audit assistant. "
+            "Your task is to convert structured product safety evidence into a concise user-facing product audit. "
+            "Use plain language and practical guidance for a non-technical user. "
+            "Do not claim medical diagnosis and do not prescribe treatment. "
+            "Use report_internet_search only when it meaningfully strengthens unclear or missing safety points. "
+            "Output must be structured in this order: "
+            "Overview; Key ingredient safety points; Contraindications and interaction cautions; Pregnancy and lactation considerations; What to do next; Safety disclaimer. "
+            "When ingredient-level evidence is available, include a short note per ingredient. "
+            "Keep the response concise, actionable, and aligned with conversation context. "
+            "Return plain text only; do not use markdown, bold, or italics. "
             f"last_conversation_entries: {json.dumps(context, default=str)}\n"
         ),
     )
@@ -616,19 +616,13 @@ def build_user_friendly_report(
     """
     agent = _build_report_agent(context)
     prompt = (
-        "Write a user-friendly safety report for this cosmetic product.\n"
-        "Keep it short, clear, and practical for a non-technical user.\n"
-        "Include: overview, key safety points, contraindication highlights, and what to do next.\n"
-        "Avoid formatting your repsonses. No bolds or italics.\n"
-        "Use the last_conversation_entries to provide context for the report.\n"
-        "When reviewing the product, the last_conversation_entries will help you structure your response to the user's query."
-        "Always prioritize, safety of the ingredients, pregnancy and lactation, compatibility with user's skin or other product they are using, any other relevant information."
+        "Generate the final product audit using the inputs below.\n"
+        "If a field is missing, state 'unknown' briefly and continue.\n"
         f"product_name: {product_name}\n"
         f"description: {description}\n"
         f"ingredients: {json.dumps(ingredients, default=str)}\n"
         f"rules_engine_report_json: {json.dumps(report, default=str)}\n"
         f"sources: {json.dumps(sources, default=str)}\n"
-        f"last_conversation_entries: {json.dumps(context, default=str)}\n"
     )
     try:
         response = _invoke_with_retry(

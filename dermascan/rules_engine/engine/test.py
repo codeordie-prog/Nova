@@ -3,11 +3,21 @@ import json
 from dermascan.rules_engine.engine.rules_engine import internet_search
 
 
-res = internet_search.invoke({"query": "What is the safety of the ingredient parafluorobenzoic acid?", "max_results": 8})
+from dotenv import load_dotenv
+import os
 
-dict_res = json.loads(res)
-results = dict_res['results']
+load_dotenv()
 
-for result in results:
-    print(result['url'])
+postgres_host = os.environ.get("POSTGRES_HOST", "localhost")
+postgres_port = os.environ.get("POSTGRES_PORT", "5432")
+postgres_database = os.environ.get("POSTGRES_DATABASE", "qutis_db")
+postgres_user = os.environ.get("POSTGRES_USER", "postgres")
+postgres_password = os.environ.get("POSTGRESS_PASSWORD", "")
+postgres_table = os.environ.get("POSTGRES_TABLE", "cir_pdfs")
+
+
+list_variables = [postgres_host, postgres_port, postgres_database, postgres_user, postgres_password, postgres_table]
+
+for variable in list_variables:
+    print(variable)
     print("-"*100)

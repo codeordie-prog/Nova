@@ -96,7 +96,7 @@ class RulesEngine(Engine):
         # Get postgres variables
         self.postgres_host = os.environ.get("POSTGRES_HOST", "localhost")
         self.postgres_port = os.environ.get("POSTGRES_PORT", "5432")
-        self.postgres_database = os.environ.get("POSTGRES_DATABASE", "postgres")
+        self.postgres_database = os.environ.get("POSTGRES_DATABASE", "qutis_db")
         self.postgres_user = os.environ.get("POSTGRES_USER", "postgres")
         self.postgres_password = os.environ.get("POSTGRESS_PASSWORD", "")
         self.postgres_table = os.environ.get("POSTGRES_TABLE", "cir_pdfs")
