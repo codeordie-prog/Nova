@@ -13,7 +13,7 @@ user (Telegram / WhatsApp)
          ▼
   Orchestrator worker ──► Qwen (primary LLM, Modal vLLM)
          │                  └── fallbacks: OpenAI, Gemini
-         ├──► diagnose:jobs ──► MedGemma gateway (vision)
+         ├──► MedGemma gateway (vision, via orchestrator tools)
          ├──► rules engine (PostgreSQL) via signal enrichment
          └──► outbound:messages ──► Telegram / WhatsApp
 ```
@@ -43,7 +43,7 @@ The orchestrator's primary model is **self-hosted Qwen** served on Modal via vLL
 
 - Hosts `Qwen/Qwen3-8B` on an NVIDIA L40S GPU.
 - Exposes `/v1/chat/completions` and `/v1/models` (standard OpenAI client).
-- Supports tool calling (orchestrator tools: diagnose enqueue, search, case status, etc.).
+- Supports tool calling (orchestrator tools: image audit, search, case status, etc.).
 
 **Deploy**
 
@@ -72,6 +72,18 @@ QWEN_API_KEY=EMPTY
 ```bash
 poetry run python dermascan/scripts/qwen_langchain_agent.py
 ```
+
+**Shut down the deployed app** (stops GPU billing when you are done testing):
+
+```bash
+# List deployed Modal apps and copy the App ID for the Qwen deployment
+modal app list
+
+# Stop the app (replace with the App ID from the list)
+modal app stop <app-id>
+```
+
+Look for an app named like `dermascan-qwen` in the `modal app list` output. Redeploy with the deploy command above when you need it again.
 
 Config lives in `dermascan/ai_service/modal/qwen_service/config/config.json`.
 
@@ -115,7 +127,7 @@ See `dermascan/backend/README.md` for webhook payload contracts and operational 
 
 ## 4. Run agent workers
 
-Start orchestrator, diagnose, and outbound-sender workers in one process:
+Start orchestrator and outbound-sender workers in one process:
 
 ```bash
 poetry run python dermascan/scripts/do_work.py
@@ -126,7 +138,6 @@ This script runs:
 | Worker | Role |
 |---|---|
 | `orchestrator_worker` | Consumes jobs + signals; drives Qwen (primary) conversation |
-| `diagnose_worker` | Dispatches images to MedGemma gateway |
 | `outbound_sender_worker` | Compacts and delivers replies to Telegram / WhatsApp |
 
 **Not included:** `knowledge_worker` (optional, start manually) and **MedGemma** (separate AI-service stack below).
@@ -136,7 +147,7 @@ This script runs:
 1. Redis
 2. PostgreSQL (if using product / rules flows)
 3. Deploy Qwen on Modal; set `QWEN_BASE_URL` in `.env`
-4. MedGemma gateway + worker (if diagnose flow is needed)
+4. MedGemma gateway + worker (if image / skin review flows are needed)
 5. Backend API (`8088`)
 6. `poetry run python dermascan/scripts/do_work.py`
 7. (Optional) `telegram_polling_bridge.py` for local Telegram testing
@@ -157,7 +168,7 @@ poetry run python -m uvicorn dermascan.ai_service.modal.medgemma_service.gateway
 poetry run python dermascan/ai_service/modal/medgemma_service/worker.py
 ```
 
-Set `MEDGEMMA_GATEWAY_URL=http://127.0.0.1:8080` in `.env` for the diagnose worker.
+Set `MEDGEMMA_GATEWAY_URL=http://127.0.0.1:8080` in `.env` so orchestrator tools can reach the gateway.
 
 Modal setup:
 

@@ -102,7 +102,7 @@ poetry run python dermascan/backend/services/agents/knowledge_worker.py
 1. Redis
 2. PostgreSQL (if using rules-engine flows)
 3. Deploy Qwen; set `QWEN_BASE_URL`
-4. MedGemma gateway + worker (if diagnose flow is required)
+4. MedGemma gateway + worker (if image / skin review flows are required)
 5. Backend API (`8088`)
 6. `poetry run python dermascan/scripts/do_work.py`
 7. (Optional) Telegram polling bridge for local testing:
