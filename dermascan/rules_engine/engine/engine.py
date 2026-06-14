@@ -21,6 +21,37 @@ class SkinContext(BaseModel):
     notes: str = ""
 
 
+class SkinCurrentCondition(BaseModel):
+    """Observed current state of skin inferred from review text."""
+
+    severity: str = ""
+    active_inflammation: bool = False
+    barrier_status: str = ""
+    observed_patterns: list[str] = Field(default_factory=list)
+
+
+class SkinNeeds(BaseModel):
+    """Derived skin needs used for downstream alignment checks."""
+
+    barrier_repair: bool = False
+    anti_inflammatory: bool = False
+    comedolytic: bool = False
+    hydration: bool = False
+    sun_protection: bool = False
+
+
+class SkinAudit(BaseModel):
+    """Canonical bridge schema used between skin and product audits."""
+
+    primary_concern: str = ""
+    current_condition: SkinCurrentCondition = Field(default_factory=SkinCurrentCondition)
+    needs: SkinNeeds = Field(default_factory=SkinNeeds)
+    contraindicated_approaches: list[str] = Field(default_factory=list)
+    confidence: float = 0.0
+    completeness_score: float = 0.0
+    missing_fields: list[str] = Field(default_factory=list)
+
+
 class RulesEngineRequest(BaseModel):
     """Canonical payload consumed by the rules engine worker."""
 
@@ -34,6 +65,7 @@ class RulesEngineRequest(BaseModel):
     escalation_notes: str = ""
     ingredients: list[str] = Field(default_factory=list)
     skin_context: SkinContext = Field(default_factory=SkinContext)
+    skin_audit: SkinAudit = Field(default_factory=SkinAudit)
     diagnosis: str = ""
     summary: str = ""
     treatment: str = ""

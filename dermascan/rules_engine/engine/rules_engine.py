@@ -1,4 +1,9 @@
-"""Concrete Rules Engine implementation."""
+"""
+Author: Dermascan Team
+Date: 14-6-2026
+Licence: MIT
+
+Concrete Rules Engine implementation."""
 
 from __future__ import annotations
 
@@ -14,6 +19,9 @@ from dotenv import load_dotenv
 from dermascan.rules_engine.engine.engine import (
     Engine,
     IngredientIndexResult,
+    SkinAudit,
+    SkinCurrentCondition,
+    SkinNeeds,
     RulesEngineRequest,
     RulesEngineResponse,
 )
@@ -35,6 +43,21 @@ logger = get_logger(__name__)
 
 class RulesEngine(Engine):
     """Routes and assesses product, skin, and hybrid reviews."""
+
+    _CONCERN_ALIASES: dict[str, str] = {
+        "pih": "post inflammatory hyperpigmentation",
+        "post-inflammatory hyperpigmentation": "post inflammatory hyperpigmentation",
+        "atopic dermatitis": "eczema",
+        "seb derm": "seborrheic dermatitis",
+    }
+
+    _CONCERN_KEYWORD_PROFILES: tuple[tuple[tuple[str, ...], dict[str, bool]], ...] = (
+        (("acne", "comed", "follicul"), {"comedolytic": True, "sun_protection": True}),
+        (("eczema", "dermatitis", "rosacea", "psoriasis", "inflamm"), {"barrier_repair": True, "anti_inflammatory": True, "hydration": True}),
+        (("hyperpig", "melasma", "post inflammatory hyperpigmentation", "photo"), {"sun_protection": True}),
+        (("dry", "xerosis", "dehydrat"), {"hydration": True, "barrier_repair": True}),
+        (("sensitive", "irrit"), {"barrier_repair": True, "anti_inflammatory": True}),
+    )
 
     def __init__(
         self,
@@ -429,6 +452,283 @@ class RulesEngine(Engine):
         )
         return self._serialize_matches(matches)
 
+    @staticmethod
+    def _extract_primary_concern(diagnosis: str) -> str:
+        """
+        Extract a single primary concern from diagnosis text.
+        Args:
+            diagnosis (str): The diagnosis text
+
+        Returns:
+            str: The primary concern
+        """
+        raw = str(diagnosis or "").strip()
+        if not raw:
+            return ""
+        first = raw.split(";", 1)[0]
+        first = first.split(",", 1)[0]
+        first = first.split("(", 1)[0]
+        return first.strip()
+
+    @staticmethod
+    def _extract_current_condition(summary: str) -> SkinCurrentCondition:
+        """
+        Infer current condition signals from summary text.
+        Args:
+            summary (str): The summary text
+
+        Returns:
+            SkinCurrentCondition: The current condition
+        """
+        text = str(summary or "").strip().lower()
+        condition = SkinCurrentCondition()
+        if not text:
+            return condition
+
+        if "severe" in text:
+            condition.severity = "severe"
+        elif "moderate" in text:
+            condition.severity = "moderate"
+        elif "mild" in text:
+            condition.severity = "mild"
+
+        inflammation_markers = (
+            "inflamm",
+            "erythema",
+            "redness",
+            "swelling",
+            "papule",
+            "pustule",
+        )
+        condition.active_inflammation = any(marker in text for marker in inflammation_markers)
+
+        if "compromised barrier" in text or "barrier damage" in text or "barrier impaired" in text:
+            condition.barrier_status = "compromised"
+        elif "intact barrier" in text or "barrier intact" in text:
+            condition.barrier_status = "intact"
+
+        pattern_markers = (
+            "papule",
+            "pustule",
+            "comedone",
+            "scaling",
+            "patch",
+            "hyperpigment",
+            "erythema",
+        )
+        condition.observed_patterns = [marker for marker in pattern_markers if marker in text]
+        return condition
+
+    @staticmethod
+    def _parse_bool_like(value: str) -> bool | None:
+        """
+        Parse bool-like strings into booleans.
+        Args:
+            value (str): The value to parse
+
+        Returns:
+            bool | None: The parsed value
+        """
+        token = str(value or "").strip().lower()
+        if token in {"true", "yes", "1"}:
+            return True
+        if token in {"false", "no", "0"}:
+            return False
+        return None
+
+    @staticmethod
+    def _parse_structured_needs(treatment: str) -> dict[str, bool | None]:
+        """
+        Parse needs flags from structured treatment text.
+        Args:
+            treatment (str): The treatment text
+
+        Returns:
+            dict[str, bool | None]: The parsed needs
+        """
+        text = str(treatment or "").strip()
+        parsed: dict[str, bool | None] = {
+            "barrier_repair": None,
+            "anti_inflammatory": None,
+            "comedolytic": None,
+            "hydration": None,
+            "sun_protection": None,
+        }
+        if not text:
+            return parsed
+
+        needs_start = text.lower().find("needs=")
+        if needs_start == -1:
+            return parsed
+        needs_payload = text[needs_start + len("needs="):]
+        delimiter = needs_payload.find(";")
+        if delimiter != -1:
+            needs_payload = needs_payload[:delimiter]
+
+        for pair in needs_payload.split(","):
+            key, sep, raw_value = pair.partition(":")
+            if not sep:
+                continue
+            normalized_key = str(key or "").strip().lower()
+            if normalized_key not in parsed:
+                continue
+            parsed[normalized_key] = RulesEngine._parse_bool_like(raw_value)
+        return parsed
+
+    def _normalize_concern(self, concern: str) -> str:
+        """
+        Normalize concern labels into a stable matching form.
+        Args:
+            concern (str): The concern text
+
+        Returns:
+            str: The normalized concern
+        """
+        lowered = str(concern or "").strip().lower()
+        if not lowered:
+            return ""
+        return self._CONCERN_ALIASES.get(lowered, lowered)
+
+    def _derive_skin_needs(self, *, concern: str, treatment: str, condition: SkinCurrentCondition) -> SkinNeeds:
+        """
+        Derive deterministic skin needs from concern/treatment/condition.
+        Args:
+            concern (str): The concern text
+            treatment (str): The treatment text
+            condition (SkinCurrentCondition): The current condition
+
+        Returns:
+            SkinNeeds: The derived skin needs
+        """
+        needs = SkinNeeds()
+        concern_text = self._normalize_concern(concern)
+        treatment_text = str(treatment or "").lower()
+
+        parsed_needs = self._parse_structured_needs(treatment)
+        if parsed_needs["barrier_repair"] is True:
+            needs.barrier_repair = True
+        if parsed_needs["anti_inflammatory"] is True:
+            needs.anti_inflammatory = True
+        if parsed_needs["comedolytic"] is True:
+            needs.comedolytic = True
+        if parsed_needs["hydration"] is True:
+            needs.hydration = True
+        if parsed_needs["sun_protection"] is True:
+            needs.sun_protection = True
+
+        for keywords, profile in self._CONCERN_KEYWORD_PROFILES:
+            if any(keyword in concern_text for keyword in keywords):
+                if profile.get("barrier_repair"):
+                    needs.barrier_repair = True
+                if profile.get("anti_inflammatory"):
+                    needs.anti_inflammatory = True
+                if profile.get("comedolytic"):
+                    needs.comedolytic = True
+                if profile.get("hydration"):
+                    needs.hydration = True
+                if profile.get("sun_protection"):
+                    needs.sun_protection = True
+
+        if parsed_needs["barrier_repair"] is None and ("barrier" in treatment_text or "repair" in treatment_text):
+            needs.barrier_repair = True
+        if parsed_needs["anti_inflammatory"] is None and (
+            "anti-inflammatory" in treatment_text or "soothe" in treatment_text or "calm" in treatment_text
+        ):
+            needs.anti_inflammatory = True
+        if parsed_needs["comedolytic"] is None and (
+            "salicylic" in treatment_text or "retinoid" in treatment_text or "benzoyl" in treatment_text
+        ):
+            needs.comedolytic = True
+        if parsed_needs["hydration"] is None and ("moistur" in treatment_text or "hydrat" in treatment_text):
+            needs.hydration = True
+        if parsed_needs["sun_protection"] is None and (
+            "spf" in treatment_text or "sunscreen" in treatment_text or "sun protection" in treatment_text
+        ):
+            needs.sun_protection = True
+
+        if condition.active_inflammation:
+            needs.anti_inflammatory = True
+        if condition.barrier_status == "compromised":
+            needs.barrier_repair = True
+            needs.hydration = True
+
+        return needs
+
+    @staticmethod
+    def _score_skin_audit_completeness(*, concern: str, condition: SkinCurrentCondition, needs: SkinNeeds) -> tuple[float, list[str]]:
+        """
+        Compute a simple completeness score and missing fields list.
+        Args:
+            concern (str): The concern text
+            condition (SkinCurrentCondition): The current condition
+            needs (SkinNeeds): The derived skin needs
+
+        Returns:
+            tuple[float, list[str]]: The completeness score and missing fields
+        """
+        checks: list[tuple[str, bool]] = [
+            ("primary_concern", bool(concern.strip())),
+            ("condition_severity", bool(condition.severity.strip())),
+            (
+                "condition_signals",
+                bool(condition.active_inflammation or condition.barrier_status.strip() or condition.observed_patterns),
+            ),
+            (
+                "needs",
+                bool(
+                    needs.barrier_repair
+                    or needs.anti_inflammatory
+                    or needs.comedolytic
+                    or needs.hydration
+                    or needs.sun_protection
+                ),
+            ),
+        ]
+        total = len(checks)
+        passed = sum(1 for _, ok in checks if ok)
+        missing = [name for name, ok in checks if not ok]
+        score = passed / total if total else 0.0
+        return score, missing
+
+    def _build_skin_audit_bridge(self, request: RulesEngineRequest) -> SkinAudit:
+        """
+        Build bridge SkinAudit from existing flat fields.
+        Args:
+            request (RulesEngineRequest): The request
+
+        Returns:
+            SkinAudit: The built skin audit
+        """
+        concern = self._extract_primary_concern(request.diagnosis)
+        condition = self._extract_current_condition(request.summary)
+        needs = self._derive_skin_needs(
+            concern=concern,
+            treatment=request.treatment,
+            condition=condition,
+        )
+        completeness_score, missing_fields = self._score_skin_audit_completeness(
+            concern=concern,
+            condition=condition,
+            needs=needs,
+        )
+
+        contraindicated_approaches: list[str] = []
+        if condition.active_inflammation and needs.comedolytic:
+            contraindicated_approaches.append("avoid aggressive actives while inflamed")
+        if condition.barrier_status == "compromised":
+            contraindicated_approaches.append("avoid barrier-stripping routines")
+
+        confidence = max(0.0, min(1.0, float(request.skin_audit.confidence or 0.0)))
+        return SkinAudit(
+            primary_concern=concern,
+            current_condition=condition,
+            needs=needs,
+            contraindicated_approaches=contraindicated_approaches,
+            confidence=confidence,
+            completeness_score=completeness_score,
+            missing_fields=missing_fields,
+        )
+
     def evaluate_contraindications(self, ingredient_ids: list[str]) -> list[dict[str, Any]]:
         """
         Evaluate contraindications of the ingredients by Querying the Cross-Ingredient Interactions.
@@ -533,10 +833,12 @@ class RulesEngine(Engine):
         
         """
         
-        query: str = request.diagnosis if request.diagnosis else ""
+        skin_audit = self._build_skin_audit_bridge(request)
+        query: str = request.diagnosis if request.diagnosis else skin_audit.primary_concern
         if not query:
             report = {
             "skin_context": request.skin_context.model_dump(),
+            "skin_audit": skin_audit.model_dump(),
             "diagnosis": "No skin review report at the moment.",
             "summary": "No summary at the moment",
             "treatment": "No treatment plan at the moment",
@@ -559,7 +861,7 @@ class RulesEngine(Engine):
 
         # Tavily-backed tool returns a *string* (usually JSON), but it can also
         # return plain text error messages when misconfigured / fails.
-        research_raw = internet_search.invoke({"query": query, "max_results": 8})
+        research_raw = internet_search.invoke({"query": query, "max_results": 4})
         research_text = research_raw if isinstance(research_raw, str) else str(research_raw)
 
         def _extract_urls(text: str) -> list[str]:
@@ -597,6 +899,7 @@ class RulesEngine(Engine):
 
         report = {
             "skin_context": request.skin_context.model_dump(),
+            "skin_audit": skin_audit.model_dump(),
             "diagnosis": request.diagnosis,
             "summary": request.summary,
             "treatment": request.treatment,

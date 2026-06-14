@@ -75,7 +75,7 @@ def _to_str(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def _extract_structured_fields(text: str) -> tuple[dict[str, str], bool]:
+def _extract_structured_fields(text: str) -> tuple[dict[str, Any], bool]:
     """
     Parse MedGemma JSON output and extract diagnose/product fields.
 
@@ -85,12 +85,26 @@ def _extract_structured_fields(text: str) -> tuple[dict[str, str], bool]:
     Returns:
         A tuple of (fields dictionary, parse_success)
     """
-    fields = {
+    fields: dict[str, Any] = {
         "review_type": "",
         "diagnosis": "",
         "rationale": "",
-        "summary": "",
-        "treatment": "",
+        "summary": {
+            "severity": "",
+            "active_inflammation": "",
+            "barrier_status": "",
+            "observed_patterns": [],
+        },
+        "treatment": {
+            "needs": {
+                "barrier_repair": "",
+                "anti_inflammatory": "",
+                "comedolytic": "",
+                "hydration": "",
+                "sun_protection": "",
+            },
+            "contraindicated_approaches": [],
+        },
         "product_name": "",
         "description": "",
         "indications": "",
@@ -104,8 +118,63 @@ def _extract_structured_fields(text: str) -> tuple[dict[str, str], bool]:
     except Exception:
         return fields, False
 
-    for key in fields:
+    for key in (
+        "review_type",
+        "diagnosis",
+        "rationale",
+        "product_name",
+        "description",
+        "indications",
+        "safety_in_pregnancy",
+        "contraindications",
+        "how_to_use",
+        "special_instructions",
+    ):
         fields[key] = _to_str(parsed.get(key)).strip()
+
+    parsed_summary = parsed.get("summary")
+    if isinstance(parsed_summary, dict):
+        fields["summary"] = {
+            "severity": _to_str(parsed_summary.get("severity")).strip(),
+            "active_inflammation": _to_str(parsed_summary.get("active_inflammation")).strip(),
+            "barrier_status": _to_str(parsed_summary.get("barrier_status")).strip(),
+            "observed_patterns": [
+                _to_str(item).strip()
+                for item in (parsed_summary.get("observed_patterns") or [])
+                if _to_str(item).strip()
+            ]
+            if isinstance(parsed_summary.get("observed_patterns"), list)
+            else [],
+        }
+
+    parsed_treatment = parsed.get("treatment")
+    if isinstance(parsed_treatment, dict):
+        parsed_needs = parsed_treatment.get("needs")
+        needs_obj = {
+            "barrier_repair": "",
+            "anti_inflammatory": "",
+            "comedolytic": "",
+            "hydration": "",
+            "sun_protection": "",
+        }
+        if isinstance(parsed_needs, dict):
+            needs_obj = {
+                "barrier_repair": _to_str(parsed_needs.get("barrier_repair")).strip(),
+                "anti_inflammatory": _to_str(parsed_needs.get("anti_inflammatory")).strip(),
+                "comedolytic": _to_str(parsed_needs.get("comedolytic")).strip(),
+                "hydration": _to_str(parsed_needs.get("hydration")).strip(),
+                "sun_protection": _to_str(parsed_needs.get("sun_protection")).strip(),
+            }
+        fields["treatment"] = {
+            "needs": needs_obj,
+            "contraindicated_approaches": [
+                _to_str(item).strip()
+                for item in (parsed_treatment.get("contraindicated_approaches") or [])
+                if _to_str(item).strip()
+            ]
+            if isinstance(parsed_treatment.get("contraindicated_approaches"), list)
+            else [],
+        }
     return fields, True
 
 
@@ -178,8 +247,8 @@ def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | 
         "how_to_use": structured["how_to_use"],
         "special_instructions": structured["special_instructions"],
         "diagnosis": structured["diagnosis"],
-        "summary": structured["summary"],
-        "treatment": structured["treatment"],
+        "summary": structured["summary"] if isinstance(structured["summary"], dict) else _to_str(structured["summary"]).strip(),
+        "treatment": structured["treatment"] if isinstance(structured["treatment"], dict) else _to_str(structured["treatment"]).strip(),
     }
 
     # push case to EVENT stream - regardless of confidence threshold
@@ -326,8 +395,8 @@ def _push_signal(
                     "diagnosis": base_fields.get("diagnosis") or "",
                     "diagnosis_text": base_fields.get("diagnosis") or text,
                     "rationale": base_fields.get("rationale", ""),
-                    "summary": base_fields.get("summary", ""),
-                    "treatment": base_fields.get("treatment", ""),
+                    "summary": base_fields.get("summary", {}),
+                    "treatment": base_fields.get("treatment", {}),
                     "confidence": confidence,
                     "threshold": threshold_used,
                     "escalation": escalated,

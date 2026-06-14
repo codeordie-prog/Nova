@@ -1,4 +1,7 @@
 """
+Author: Dermascan Team
+Date: 6-14-2026
+Licence: MIT
 
 Helpers for product-review signal enrichment via ingredient extraction + rules engine."""
 
@@ -7,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Any
 
 from dotenv import load_dotenv
@@ -20,6 +24,7 @@ from dermascan.backend.services.agents.provider_circuit_breaker import load_qwen
 from dermascan.rules_engine.engine.engine import RulesEngineRequest
 from dermascan.rules_engine.engine.rules_engine import RulesEngine
 from dermascan.shared.logger import get_logger
+from dermascan.shared.redis_stability import get_redis_client, run_with_redis_retries
 
 load_dotenv()
 
@@ -35,6 +40,8 @@ QWEN_MAX_RETRIES = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("QWE
 QWEN_ENABLE_THINKING = os.getenv("QWEN_ENABLE_THINKING", "false").strip().lower() in {
     "1", "true", "yes", "on"
 }
+_SKIN_AUDIT_KEY_TEMPLATE = "client:{client_id}:skin_profile"
+_SKIN_AUDIT_TTL_S = max(60, int(os.getenv("SKIN_AUDIT_TTL_S", str(60 * 60 * 24 * 30))))
 
 class IngredientExtractionResponse(BaseModel):
     """Structured output from product ingredient extraction agent."""
@@ -116,7 +123,17 @@ def _should_retry_provider_error(exc: Exception) -> bool:
 
 
 def _invoke_with_retry(*, agent: Any, prompt: str, operation: str) -> dict[str, Any]:
-    """Invoke an agent with circuit-breaker guarding and bounded retries."""
+    """
+    Invoke an agent with circuit-breaker guarding and bounded retries.
+    
+    Args:
+        Agent (Any): Agent instance.
+        prompt (str): The prompt for the agent.
+        operation (str): The operation carried out [skin or product review research]
+    
+    Returns:
+        dict (str, Any)
+    """
     max_attempts = max(1, QWEN_MAX_RETRIES + 1)
     last_exc: Exception | None = None
 
@@ -178,6 +195,149 @@ def _safe_json_loads(raw: str) -> dict[str, Any]:
         return {}
 
 
+def _skin_audit_key(client_id: str) -> str:
+    """
+    Build Redis key for latest client skin audit.
+    Args:
+        client_id (str): The client ID
+
+    Returns:
+        str: The Redis key
+    """
+    normalized_client_id = str(client_id or "anonymous").strip() or "anonymous"
+    return _SKIN_AUDIT_KEY_TEMPLATE.format(client_id=normalized_client_id)
+
+
+def _load_latest_skin_audit(client_id: str) -> tuple[dict[str, Any], int | None]:
+    """
+    Load latest persisted skin audit (+timestamp) from Redis for a client.
+    Args:
+        client_id (str): The client ID
+
+    Returns:
+        tuple[dict[str, Any], int | None]: The latest skin audit and timestamp
+    """
+    key = _skin_audit_key(client_id)
+    try:
+        redis_client = get_redis_client(decode_responses=True)
+        raw_payload = run_with_redis_retries(
+            lambda: redis_client.get(key),
+            operation_name="skin_audit_get",
+        )
+    except Exception as exc:
+        logger.warning("failed to load skin audit from redis: client_id=%s err=%s", client_id, exc)
+        return {}, None
+
+    if not raw_payload:
+        return {}, None
+    parsed = _safe_json_loads(str(raw_payload))
+    if not isinstance(parsed, dict):
+        return {}, None
+
+    if isinstance(parsed.get("skin_audit"), dict):
+        updated_at_ts_raw = parsed.get("updated_at_ts")
+        try:
+            updated_at_ts = int(updated_at_ts_raw) if updated_at_ts_raw is not None else None
+        except Exception:
+            updated_at_ts = None
+        return parsed["skin_audit"], updated_at_ts
+
+    return parsed, None
+
+
+def _persist_latest_skin_audit(client_id: str, skin_audit: Any) -> None:
+    """
+    Persist latest skin audit in Redis with TTL.
+    Args:
+        client_id (str): The client ID
+        skin_audit (Any): The skin audit
+
+    Returns:
+        None
+    """
+    if isinstance(skin_audit, BaseModel):
+        payload = skin_audit.model_dump()
+    elif isinstance(skin_audit, dict):
+        payload = skin_audit
+    else:
+        payload = {}
+
+    if not payload:
+        return
+
+    key = _skin_audit_key(client_id)
+    serialized = json.dumps(
+        {
+            "skin_audit": payload,
+            "updated_at_ts": int(time.time()),
+        },
+        default=str,
+    )
+    try:
+        redis_client = get_redis_client(decode_responses=True)
+        run_with_redis_retries(
+            lambda: redis_client.set(key, serialized, ex=_SKIN_AUDIT_TTL_S),
+            operation_name="skin_audit_set",
+        )
+    except Exception as exc:
+        logger.warning("failed to persist skin audit to redis: client_id=%s err=%s", client_id, exc)
+
+
+def _coerce_summary_payload(value: Any) -> str:
+    """
+    Normalize summary payload into a deterministic string representation.
+    Args:
+        value (Any): The summary payload
+
+    Returns:
+        str: The normalized summary payload
+    """
+    if isinstance(value, dict):
+        severity = str(value.get("severity") or "").strip()
+        active_inflammation = str(value.get("active_inflammation") or "").strip()
+        barrier_status = str(value.get("barrier_status") or "").strip()
+        observed_raw = value.get("observed_patterns")
+        observed: list[str] = []
+        if isinstance(observed_raw, list):
+            observed = [str(item).strip() for item in observed_raw if str(item).strip()]
+        observed_patterns = "|".join(observed) if observed else "none"
+        return (
+            f"severity={severity};"
+            f"active_inflammation={active_inflammation};"
+            f"barrier_status={barrier_status};"
+            f"observed_patterns={observed_patterns}"
+        )
+    return str(value or "").strip()
+
+
+def _coerce_treatment_payload(value: Any) -> str:
+    """
+    Normalize treatment payload into a deterministic string representation.
+    Args:
+        value (Any): The treatment payload
+
+    Returns:
+        str: The normalized treatment payload
+    """
+    if isinstance(value, dict):
+        needs_raw = value.get("needs") if isinstance(value.get("needs"), dict) else {}
+        needs = {
+            "barrier_repair": str(needs_raw.get("barrier_repair") or "").strip(),
+            "anti_inflammatory": str(needs_raw.get("anti_inflammatory") or "").strip(),
+            "comedolytic": str(needs_raw.get("comedolytic") or "").strip(),
+            "hydration": str(needs_raw.get("hydration") or "").strip(),
+            "sun_protection": str(needs_raw.get("sun_protection") or "").strip(),
+        }
+        needs_text = ",".join(f"{k}:{v}" for k, v in needs.items())
+        contraindicated_raw = value.get("contraindicated_approaches")
+        contraindicated: list[str] = []
+        if isinstance(contraindicated_raw, list):
+            contraindicated = [str(item).strip() for item in contraindicated_raw if str(item).strip()]
+        contraindicated_text = "|".join(contraindicated) if contraindicated else "none"
+        return f"needs={needs_text};contraindicated_approaches={contraindicated_text}"
+    return str(value or "").strip()
+
+
 def _strip_markdown_formatting(text: str) -> str:
     """
     Strip down Markdown formating.
@@ -224,9 +384,10 @@ def inci_decoder_search(query: str, max_results: int = 8) -> str:
 
 
 @tool
-def skin_review_search(query: str, max_results: int = 8) -> str:
+def skin_review_search(query: str, max_results: int = 4) -> str:
     """
-    Search for dermatology and skin condition information from reputable medical sources.
+    Internet search for dermatology and skin condition information from reputable medical sources.
+    Use this tool to strengthen the skin audit report.
 
     Args:
         query (str): The search query
@@ -385,17 +546,16 @@ def _build_skin_review_agent(context: list[dict[str, Any]]) -> Any:
         tools=[skin_review_search],
         response_format=SkinReviewResponse,
         system_prompt=(
-            "You are a dermatology research assistant. "
-            "Research the provided skin condition/diagnosis to provide evidence-based information. "
-            "Focus on: common causes, typical symptoms, and general treatment approaches. "
-            "Always avoid definitive treatment plans - provide information only, not prescriptions. "
-            "Use the skin_review_search tool to gather information from reputable medical sources. "
-            "Include disclaimers that this is for informational purposes and not medical advice. "
-            "Do not prescribe medications or claim definitive diagnosis. "
-            "Use the last_conversation_entries to provide context for the report."
-            "When reviewing the skin condition, the last_conversation_entries will help you structure your response to the user's query."
+            "You are a dermatology skin-audit assistant. "
+            "Your task is to produce a concise user-facing skin audit from the provided primary concern, condition summary, and needs/treatment context. "
+            "Use the skin_review_search tool to strengthen evidence when useful. "
+            "Return plain text only; do not use markdown, bold, or italics. "
+            "Do not prescribe medications, dosages, or definitive treatment plans. "
+            "Do not claim definitive diagnosis; use cautious language such as 'consistent with'. "
+            "The output must be structured in this order: "
+            "Primary concern; Condition snapshot; Likely contributors; Care priorities (general, non-prescriptive); Cautions and when to seek in-person care; Safety disclaimer. "
+            "Keep it practical, short, and aligned with conversation context. "
             f"last_conversation_entries: {json.dumps(context, default=str)}\n"
-            "Return plain text only; do not use markdown, bold, or italics."
         )
     )
 
@@ -411,16 +571,12 @@ def build_skin_review_report(
     """Build a concise user-facing skin review report."""
     agent = _build_skin_review_agent(context)
     prompt = (
-        "Create a user-friendly skin research report.\n"
-        "Include: likely/common causes, common treatment approaches, and practical caution notes.\n"
-        "Avoid definitive treatment plans or direct prescriptions.\n"
-        "Use the last_conversation_entries to provide context for the report.\n"
-        "Return plain text only; do not use markdown, bold, or italics.\n"
-        f"diagnosis: {diagnosis}\n"
-        f"summary: {summary}\n"
-        f"treatment: {treatment}\n"
-        f"internet_research: {internet_research}\n"
-        f"last_conversation_entries: {json.dumps(context, default=str)}\n"
+        "Generate the final skin audit using the inputs below.\n"
+        "If a field is missing, state 'unknown' briefly and continue.\n"
+        f"primary_concern: {diagnosis}\n"
+        f"skin_condition_summary: {summary}\n"
+        f"needs_and_treatment: {treatment}\n"
+        f"internet_research_on_primary_concern: {internet_research}\n"
     )
     try:
         response = _invoke_with_retry(
@@ -509,6 +665,8 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
     product_name = str(payload.get("product_name") or "").strip()
     description = str(payload.get("description") or "").strip()
 
+    latest_skin_audit, _ = _load_latest_skin_audit(client_id)
+
     logger.info(
         "product signal rules flow started: request_id=%s case_id=%s client_id=%s product_name=%s",
         request_id,
@@ -534,6 +692,7 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
         channel=channel,
         review_type="product",
         ingredients=extraction.ingredients,
+        skin_audit=latest_skin_audit,
         product_name=product_name,
         description=description,
         indications=str(payload.get("indications") or ""),
@@ -581,8 +740,8 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
     channel = str(fields.get("channel") or "whatsapp")
 
     diagnosis = str(payload.get("diagnosis") or payload.get("diagnosis_text") or "").strip()
-    summary = str(payload.get("summary") or "").strip()
-    treatment = str(payload.get("treatment") or "").strip()
+    summary = _coerce_summary_payload(payload.get("summary"))
+    treatment = _coerce_treatment_payload(payload.get("treatment"))
 
     logger.info(
         "skin signal rules flow started: request_id=%s case_id=%s client_id=%s diagnosis=%s",
@@ -610,6 +769,7 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
     result = rules_engine.process(request)
 
     report = result.report if isinstance(result.report, dict) else {}
+    _persist_latest_skin_audit(client_id, report.get("skin_audit"))
     user_friendly_report = build_skin_review_report(
         diagnosis=str(report.get("diagnosis") or diagnosis),
         summary=str(report.get("summary") or summary),
