@@ -7,6 +7,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 
 from dermascan.backend.services.agents.memory.redis_checkpointer import setup_from_url
+from dermascan.shared.env_paths import resolve_env_path
+
 
 
 def build_checkpointer_url(url: str) -> Any:
@@ -36,6 +38,8 @@ def open_checkpointer_url(url: str) -> tuple[Any, Any]:
     return setup_from_url(url)
 
 
+
+
 def build_google_credentials(path: str) -> service_account.Credentials:
     """
     Google credentials from the specified path to service account credentials.
@@ -48,8 +52,9 @@ def build_google_credentials(path: str) -> service_account.Credentials:
     """
     if not path:
         raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS_QUTIS is required for Google provider")
+    resolved_path = resolve_env_path(path, required=True)
     return service_account.Credentials.from_service_account_file(
-        path,
+        resolved_path,
         scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
 

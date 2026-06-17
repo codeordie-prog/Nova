@@ -175,6 +175,7 @@ _STRUCTURED_SYSTEM_PROMPT: str = (
     min_containers=2,
     scaledown_window=600,
 )
+@modal.concurrent(max_inputs=16)
 class MedGemmaService:
     """
     MedGemma inference service. Model loads once in @enter.

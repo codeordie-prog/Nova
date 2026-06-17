@@ -16,5 +16,5 @@
     "reasoning_parser": "",
     "enable_auto_tool_choice": true,
     "enable_thinking": false,
-    "max_concurrent_requests": 32
+    "max_concurrent_requests": 16
 }

@@ -17,6 +17,7 @@ from firebase_admin import App, credentials, firestore
 from firebase_admin.firestore import Client
 
 from dermascan.shared.logger import get_logger
+from dermascan.shared.env_paths import resolve_env_path
 
 # Load env variables
 load_dotenv()
@@ -90,7 +91,8 @@ def _initialize_firebase() -> Client:
     if not CREDENTIALS_PATH:
         raise ValueError("CONFIG_FILE_PATH is required and cannot be empty")
 
-    _init_firebase_app(CREDENTIALS_PATH)
+    resolved_credentials_path = resolve_env_path(CREDENTIALS_PATH, required=True)
+    _init_firebase_app(resolved_credentials_path)
     logger.info("Successfully initialized Firebase.")
     return firestore.client()
 

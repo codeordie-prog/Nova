@@ -9,6 +9,7 @@ Description: This module contains the implementation of the logic of adding data
 """
 
 import os
+import shutil
 from dotenv import load_dotenv
 from collections import defaultdict
 from typing import Any
@@ -24,6 +25,7 @@ from dermascan.rules_engine.build.cir_db import (
     _fetch_cir_pdf_rows,
 )
 from dermascan.shared.logger import get_logger
+from dermascan.shared.env_paths import resolve_env_path
 
 # Load environment variables
 load_dotenv()
@@ -72,8 +74,8 @@ def _load_pdf(path: str) -> list[Document]:
     ocr_pages: list[Document] = []
     pdf = fitz.open(path)
     try:
-        tesseract_path = os.getenv("TESSERACT_PATH", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
-        if os.path.exists(tesseract_path):
+        tesseract_path = resolve_env_path(os.getenv("TESSERACT_PATH", "")) or shutil.which("tesseract")
+        if tesseract_path and os.path.exists(tesseract_path):
             pytesseract.pytesseract.tesseract_cmd = tesseract_path
         for page_number, page in enumerate(pdf, start=1):
             pixmap = page.get_pixmap(dpi=200)
@@ -387,3 +389,4 @@ def ingest_cir_documents(
 if __name__ == "__main__":
     report = ingest_cir_documents(row_limit=5, dry_run=True)
     print(report)
+    

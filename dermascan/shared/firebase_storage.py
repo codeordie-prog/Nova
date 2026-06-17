@@ -23,6 +23,7 @@ import firebase_admin
 from firebase_admin import App, credentials, storage
 
 from dermascan.shared.logger import get_logger
+from dermascan.shared.env_paths import resolve_env_path
 
 # Initialize Logger
 logger = get_logger(__name__)
@@ -42,16 +43,18 @@ def _resolve_credentials_path() -> str | None:
     Raises:
         FileNotFoundError: If the credentials file is not found.
     """
-    config_path = os.environ.get("CONFIG_FILE_PATH", "").strip()
+    config_path = resolve_env_path(os.environ.get("CONFIG_FILE_PATH", ""))
     if config_path and os.path.exists(config_path):
         return config_path
 
-    fallback_paths = [
+    repo_relative_candidates = [
+        "dermascan/backend/services/agents/configurations/dawagpn-1c9b72f24ea8.json",
         "configs/dawagpn-1c9b72f24ea8.json",
     ]
-    for path in fallback_paths:
-        if os.path.exists(path):
-            return path
+    for candidate in repo_relative_candidates:
+        resolved = resolve_env_path(candidate)
+        if resolved and os.path.exists(resolved):
+            return resolved
     return None
 
 

@@ -45,6 +45,7 @@ SEARCH_RESULT_TOTAL_CHARS: int = max(1000, int(os.getenv("SEARCH_RESULT_TOTAL_CH
 
 
 _redis: Redis | None = Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+_SOUL_MD_CACHE: str | None = None
 _AUDIT_ENQUEUED_KEY_PREFIX: str = "diagnose:enqueued"
 _AUDIT_ENQUEUED_TTL_SEC: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"))
 _INGRESS_PAYLOAD_CACHE_PREFIX: str = "orchestrator:ingress_payload"
@@ -738,6 +739,10 @@ def read_status_of_a_case(case_id: str, request_id: str = "") -> dict:
             "case_id": case_id,
             "request_id": request_id,
             "scanned": scanned,
+            "instruction": (
+                "No status events exist for this case yet. Do NOT call this tool again in this turn. "
+                "Tell the user their request is still being processed and results will follow shortly."
+            ),
         }
 
     return {
@@ -747,6 +752,10 @@ def read_status_of_a_case(case_id: str, request_id: str = "") -> dict:
         "latest": matches[0],
         "history": matches,
         "scanned": scanned,
+        "instruction": (
+            "This is the current case status. Do NOT call this tool again in this turn. "
+            "Use the latest status to compose your reply to the user."
+        ),
     }
 
 
@@ -767,14 +776,32 @@ def read_soul_md() -> str:
     Returns:
         The content of the soul.md file
     """
+    global _SOUL_MD_CACHE
     logger.info(f"TOOL CALL: read_soul_md")
-    path = os.path.normpath(
-        os.path.join(os.path.dirname(__file__), "..", "..", "agents", "soul.md")
-    )
-    with open(path, "r", encoding="utf-8") as f:
-        contents = f.read()
 
-    return contents
+    if _SOUL_MD_CACHE is None:
+        path = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "agents", "soul.md")
+        )
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                _SOUL_MD_CACHE = f.read()
+        except OSError as exc:
+            logger.exception("failed to read soul.md: path=%s", path)
+            return (
+                f"Soul context is temporarily unavailable ({exc}). "
+                "Do NOT call this tool again in this turn. Proceed to respond to the user "
+                "using your established identity and values."
+            )
+
+    # Append a terminal directive so the agent loads identity context once and
+    # proceeds, rather than re-calling this static tool and exhausting the
+    # recursion budget.
+    return (
+        f"{_SOUL_MD_CACHE}\n\n"
+        "[SYSTEM NOTE: Your soul/identity context is now loaded. Do NOT call read_soul_md "
+        "again in this turn. Proceed to respond to the user.]"
+    )
 
 
 
@@ -876,8 +903,13 @@ def internet_search(query: str, max_results: int = 3) -> str:
             search_depth="advanced",
             include_domains=["mayoclinic.org", "webmd.com", "healthline.com", "cdc.gov", "nih.gov", "mydawa.com"],
         )
-        logger.info(f"TOOL CALL SUCCESS: internet_search: result={result}")
-        return _format_tavily_results(result, max_results=capped_results)
+        formatted = _format_tavily_results(result, max_results=capped_results)
+        logger.info(
+            "TOOL CALL SUCCESS: internet_search: query=%s result_chars=%s",
+            query,
+            len(formatted),
+        )
+        return formatted
     except Exception as exc:
         return f"Internet search failed: {exc}"
 

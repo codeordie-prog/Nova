@@ -8,6 +8,7 @@ from urllib.parse import quote
 import psycopg2
 
 from dermascan.shared.logger import get_logger
+from dermascan.shared.env_paths import resolve_env_path
 
 
 PDFS_PATH = r"C:/Users/LENOVO/Documents/cir/cir-crawler/data/pdfs"
@@ -107,12 +108,17 @@ def _update_postgres_storage_metadata(
 
 
 def _resolve_cred_path() -> str | None:
-    possible_paths = [
+    config_path = resolve_env_path(os.environ.get("CONFIG_FILE_PATH", ""))
+    if config_path and os.path.exists(config_path):
+        return config_path
+
+    for candidate in (
+        "dermascan/backend/services/agents/configurations/dawagpn-1c9b72f24ea8.json",
         "configs/dawagpn-1c9b72f24ea8.json",
-    ]
-    for path in possible_paths:
-        if os.path.exists(path):
-            return path
+    ):
+        resolved = resolve_env_path(candidate)
+        if resolved and os.path.exists(resolved):
+            return resolved
     return None
 
 

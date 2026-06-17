@@ -86,7 +86,7 @@ app: modal.App = modal.App("dermascan-qwen")
     image=image,
     secrets=[hf_secret],
     max_containers=2,
-    min_containers=1,
+    min_containers=2,
     scaledown_window=600,
 )
 @modal.concurrent(max_inputs=_CFG.max_concurrent_requests)
