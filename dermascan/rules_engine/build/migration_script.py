@@ -415,8 +415,8 @@ def _cloud_sql_password() -> str:
     """
     password = (
         os.environ.get("CLOUD_POSTGRES_PASSWORD")
-        or os.environ.get("POSTGRESS_PASSWORD")
-        or os.environ.get("postgres_password")
+        #or os.environ.get("POSTGRESS_PASSWORD")
+        #or os.environ.get("postgres_password")
         or CLOUD_SQL_PASSWORD
     )
     if not password:

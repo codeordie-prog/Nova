@@ -1665,7 +1665,7 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             )
             rules_result = run_product_signal_rules_flow(
                 fields=fields,
-                context=_read_conversation_log(client_id, 10),    
+                context=_read_conversation_log(client_id, 10),
             )
             summary = str(rules_result.get("summary") or "").strip()
             friendly_report = str(rules_result.get("user_friendly_report") or "").strip()
@@ -1673,7 +1673,7 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             sources_text = "\n".join(str(item) for item in sources if str(item).strip())
             primary_text = friendly_report or summary
             reply = primary_text if not sources_text else f"{primary_text}\n\nSources:\n{sources_text}"
-       
+
         elif signal_type.startswith("diagnose_") or signal_type.startswith("skin_"):
             logger.info(
                 "processing skin-review signal through rules flow: request_id=%s case_id=%s client_id=%s signal_type=%s",
@@ -1684,7 +1684,7 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             )
             rules_result = run_skin_signal_rules_flow(
                 fields=fields,
-                context=_read_conversation_log(client_id, 10)
+                context=_read_conversation_log(client_id, 10),
             )
             summary = str(rules_result.get("summary") or "").strip()
             friendly_report = str(rules_result.get("user_friendly_report") or "").strip()
@@ -1789,6 +1789,7 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
 
         # Mark as processed for idempotency
         reclaim_logic.mark_processed(ORCHESTRATOR_SIGNAL_STREAM, msg_id)
+
     except Exception as exc:
         # Finalize the trace for this turn (no-op if already ended on success).
         agent_call_tracer.end_turn(status="failed", error=str(exc))

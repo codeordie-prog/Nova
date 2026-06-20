@@ -851,7 +851,11 @@ def run_worker_forever() -> None:
                 # Detect chaos mode - essential for threading logic
                 chaos_mode = _detect_chaos_mode(client_id, selected_items)
                 if chaos_mode:
-                    logger.debug("outbound chaos mode active: client_id=%s selected=%d", client_id, len(selected_items))
+                    logger.debug(
+                        "outbound chaos mode active: client_id=%s selected=%d",
+                        client_id,
+                        len(selected_items),
+                    )
 
                 ordered_items = sorted(selected_items, key=_delivery_order_key)
 
@@ -868,7 +872,6 @@ def run_worker_forever() -> None:
                             _ack_delete(mid)
                             continue
                     try:
-
                         # How do we reply - if chaos Mode reply to target, otherwise reply to message id
                         should_thread, target = _threading_decision(fields, chaos_mode)
                         _deliver(fields, reply_to_message_id=target if should_thread else None)

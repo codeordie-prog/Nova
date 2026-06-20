@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Generator
 from typing import Any
 
@@ -23,6 +24,7 @@ def real_redis_session() -> Generator[Any, None, None]:
     Yields:
         redis.Redis client connected to the ephemeral container.
     """
+    os.environ.setdefault("TESTCONTAINERS_RYUK_DISABLED", "true")
     from testcontainers.redis import RedisContainer
 
     with RedisContainer("redis:7") as container:

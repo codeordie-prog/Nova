@@ -60,6 +60,9 @@ def _init_firebase_app(credentials_path: str) -> App:
 
         options["storageBucket"] = bucket_name
 
+        if not credentials_path:
+            raise ValueError("Firebase credentials path is empty")
+
         if not os.path.exists(credentials_path):
             raise FileNotFoundError(f"Credentials file not found in the specified path : {credentials_path}")
         cred = credentials.Certificate(credentials_path)

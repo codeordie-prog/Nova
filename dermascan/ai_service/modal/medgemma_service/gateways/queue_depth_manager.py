@@ -42,6 +42,7 @@ def _get_queue_depth() -> int:
         return pending_count
     except redis.RedisError:
         raise
+    
 
 
 def _check_queue_pressure() -> tuple[str, int]:

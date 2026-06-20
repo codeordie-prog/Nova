@@ -14,6 +14,7 @@ from urllib.parse import unquote, urlparse
 from firebase_admin import App, storage
 
 from dermascan.rules_engine.firebase_init.init_firebase import CREDENTIALS_PATH, _init_firebase_app
+from dermascan.shared.env_paths import resolve_env_path
 from dermascan.shared.logger import get_logger
 
 # Load env variables
@@ -24,7 +25,10 @@ logger: Logger = get_logger(__name__)
 
 
 def _get_app() -> App:
-    return _init_firebase_app(CREDENTIALS_PATH)
+    if not CREDENTIALS_PATH:
+        raise ValueError("CONFIG_FILE_PATH is required and cannot be empty")
+    resolved_credentials_path = resolve_env_path(CREDENTIALS_PATH, required=True)
+    return _init_firebase_app(resolved_credentials_path)
 
 
 def _get_storage_bucket(app: App):

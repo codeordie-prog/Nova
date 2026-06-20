@@ -1,8 +1,13 @@
 """
-Resolve filesystem paths from environment variables for local and deployed runs.
+Author: Dermascan Team
+Date: 2026-06-17
+License: MIT
+
+Description: Resolve filesystem paths from environment variables for local and deployed runs.
 
 Paths in ``.env`` may be absolute, relative to the repository root, or relative
 to ``DERMASCAN_ROOT`` when that variable is set explicitly on the host.
+
 """
 
 from __future__ import annotations
