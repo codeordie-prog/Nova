@@ -1,3 +1,4 @@
+import os
 from typing import Any, Optional, Type
 
 from google.oauth2 import service_account
@@ -40,6 +41,21 @@ def open_checkpointer_url(url: str) -> tuple[Any, Any]:
 
 
 
+def _use_vertex_ai() -> bool:
+    """
+    Return True when Gemini should authenticate via Vertex AI (OAuth/service account).
+
+    Returns:
+        bool: True when ``GOOGLE_GENAI_USE_VERTEXAI`` is enabled.
+    """
+    return os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def build_google_credentials(path: str) -> service_account.Credentials:
     """
     Google credentials from the specified path to service account credentials.
@@ -57,6 +73,61 @@ def build_google_credentials(path: str) -> service_account.Credentials:
         resolved_path,
         scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
+
+
+def build_gemini_chat_model(
+    *,
+    model: str,
+    temperature: float,
+    max_tokens: int,
+    google_credentials_path: str,
+    google_project: str,
+    google_location: str,
+    gemini_api_key: str = "",
+    top_p: float | None = None,
+) -> ChatGoogleGenerativeAI:
+    """
+    Build a Gemini chat model with the correct auth mode for the environment.
+
+    Vertex AI (``GOOGLE_GENAI_USE_VERTEXAI=true``) requires service-account
+    credentials and rejects API keys. Google AI Studio uses ``gemini_api_key``.
+
+    Args:
+        model: Gemini model name.
+        temperature: Sampling temperature.
+        max_tokens: Maximum output tokens.
+        google_credentials_path: Service-account JSON path for Vertex mode.
+        google_project: GCP project ID for Vertex mode.
+        google_location: GCP region for Vertex mode.
+        gemini_api_key: Google AI Studio API key for non-Vertex mode.
+        top_p: Optional nucleus sampling parameter.
+
+    Returns:
+        ChatGoogleGenerativeAI: Configured Gemini client.
+
+    Raises:
+        RuntimeError: When required credentials are missing for the active mode.
+    """
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if top_p is not None:
+        kwargs["top_p"] = top_p
+
+    if _use_vertex_ai():
+        kwargs["credentials"] = build_google_credentials(path=google_credentials_path)
+        kwargs["project"] = google_project
+        kwargs["location"] = google_location
+    else:
+        if not gemini_api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY_QUTIS is required when GOOGLE_GENAI_USE_VERTEXAI is disabled"
+            )
+        kwargs["api_key"] = gemini_api_key
+
+    return ChatGoogleGenerativeAI(**kwargs)
 
 
 def build_agent(
@@ -135,17 +206,15 @@ def initialize_google_agent(
     response_format: Optional[Type[Any]] = None,
 ) -> Any:
     """Initialize a Google-backed agent."""
-    creds = build_google_credentials(path=google_credentials_path)
-    model = ChatGoogleGenerativeAI(
+    model = build_gemini_chat_model(
         model=cfg["model"],
-        credentials=creds,
         temperature=cfg["temperature"],
         max_tokens=cfg["max_tokens"],
         top_p=cfg["top_p"],
-        verbose=True,
-        location=google_location,
-        project=google_project,
-        api_key=gemini_api_key,
+        google_credentials_path=google_credentials_path,
+        google_project=google_project,
+        google_location=google_location,
+        gemini_api_key=gemini_api_key,
     )
     return build_agent(
         model=model,

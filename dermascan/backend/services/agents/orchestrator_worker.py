@@ -35,7 +35,7 @@ from dermascan.backend.services.tools.orchestrator.orchestrator_tools import (
 from dermascan.backend.services.agents.loader import load_agent_configurations
 from dermascan.backend.services.agents.build import (
     open_checkpointer_url,
-    build_google_credentials,
+    build_gemini_chat_model,
 )
 from dermascan.backend.services.agents.product_rules_signal_helper import (
     run_product_signal_rules_flow,
@@ -54,12 +54,12 @@ from langchain_core.runnables import RunnableConfig
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware, wrap_model_call, ModelRequest, ModelResponse
 from langchain_openai import ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
 from dermascan.backend.services.agents.prompts.orchestrator_prompt import system_prompt
 from dermascan.backend.services.agents import reclaim_logic
 from dermascan.backend.services.agents.provider_circuit_breaker import (
     CircuitBreaker,
-    load_qwen_circuit_breaker,
+    load_gemini_circuit_breaker,
+    load_openai_circuit_breaker,
 )
 from dermascan.backend.services.agents.memory.redis_checkpointer import (
     delete_thread as delete_checkpoint_thread,
@@ -75,51 +75,22 @@ OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY_QUTIS", "")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY_QUTIS", "")
 CRED_PATH: str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_QUTIS", "")
 PROJECT_ID: str = os.getenv("GOOGLE_CLOUD_PROJECT_QUTIS", "qutisai")
-LOCATION: str = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+# Gemini 3.x models require the global Vertex endpoint on this project.
+LOCATION: str = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
+ORCHESTRATOR_GEMINI_MODEL: str = os.getenv(
+    "ORCHESTRATOR_GEMINI_MODEL", "gemini-3.1-flash-lite"
+)
 REDIS_URL: str = os.getenv("REDIS_URL", "")
 BASE_DIR: str = os.path.dirname(__file__)
 CONFIG_PATH: str = os.path.join(BASE_DIR, "configurations", "agents_config.json")
 
-# Self-hosted Qwen primary model (Modal vLLM OpenAI-compatible endpoint).
-# Supports both the newer concise names and the existing .env names used by
-# earlier Qwen experiments.
-QWEN_BASE_URL: str = (
-    os.getenv("QWEN_BASE_URL")
-    or os.getenv("QWEN_OPENAI_BASE_URL")
-    or ""
-).strip()
-QWEN_SERVED_MODEL_NAME: str = (
-    os.getenv("QWEN_SERVED_MODEL_NAME")
-    or os.getenv("QWEN_MODEL_NAME")
-    or "qwen-3-8b"
-).strip()
-QWEN_API_KEY: str = (
-    os.getenv("QWEN_API_KEY")
-    or os.getenv("QWEN_OPENAI_API_KEY")
-    or "EMPTY"
-)
-QWEN_TEMPERATURE: float = float(os.getenv("QWEN_TEMPERATURE", "0.0"))
-QWEN_MAX_TOKENS: int = int(os.getenv("QWEN_MAX_TOKENS", "512"))
-QWEN_REQUEST_TIMEOUT_S: float = float(os.getenv("QWEN_REQUEST_TIMEOUT_S", "45"))
-
-# Hard ceiling on SDK-level retries before the fallback middleware moves to the
-# next provider. Clamped to [0, 3] so a single slow/cold Qwen call can never
-# burn more than 3 retries (4 total attempts) before failing over to OpenAI.
+# Orchestrator LLM chain: OpenAI GPT-4o (primary, tool calling) -> Gemini (fallback).
+ORCHESTRATOR_MAX_MODEL_LEN: int = int(os.getenv("ORCHESTRATOR_MAX_MODEL_LEN", "128000"))
+ORCHESTRATOR_MAX_TOKENS: int = int(os.getenv("ORCHESTRATOR_MAX_TOKENS", "1000"))
 _PROVIDER_MAX_RETRIES_HARD_CAP: int = 3
-QWEN_MAX_RETRIES: int = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("QWEN_MAX_RETRIES", "2"))))
-# Mirror the serving-side max_model_len so memory middleware can reserve
-# enough budget for system prompt + tools + output tokens before summarizing.
-QWEN_MAX_MODEL_LEN: int = int(os.getenv("QWEN_MAX_MODEL_LEN", "16384"))
-# Qwen3 emits <think> blocks by default; disable so the orchestrator receives
-# clean, tool-callable completions. vLLM honors this chat-template kwarg.
-QWEN_ENABLE_THINKING: bool = os.getenv("QWEN_ENABLE_THINKING", "false").strip().lower() in {
-    "1", "true", "yes", "on",
-}
 OPENAI_REQUEST_TIMEOUT_S: float = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"))
 OPENAI_MAX_RETRIES: int = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("OPENAI_MAX_RETRIES", "2"))))
-# Hard ceiling on agent reasoning/tool-call steps per turn. Bounds the number of
-# model calls a single message can issue so a runaway tool loop cannot spin up
-# to the LangChain default of 25 calls.
+# Hard ceiling on agent reasoning/tool-call steps per turn.
 AGENT_RECURSION_LIMIT: int = max(1, int(os.getenv("ORCHESTRATOR_AGENT_RECURSION_LIMIT", "12")))
 # User-facing reply sent when a turn fails (e.g. recursion limit / provider
 # error) so the client is never left without a response.
@@ -138,7 +109,7 @@ ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION: bool = os.getenv(
 DEFAULT_CONFIG: List[Dict[str, Any]] = [{
         "name": "orchestrator-google",
         "description": "Conversational Agent for orchestrating the diagnosis process",
-        "model":"gemini-2.5-flash",
+        "model":"gemini-3.1-flash-lite",
         "temperature": 0.0,
         "max_tokens": 1000,
         "top_p": 0.95,
@@ -414,29 +385,6 @@ def _should_fallback(exc: Exception) -> bool:
         "504",
     )
     return any(marker in text for marker in transient_markers)
-
-
-def _is_qwen_unavailable_error(exc: Exception) -> bool:
-    """
-    Detect provider-unavailable patterns specific to the self-hosted Qwen endpoint.
-
-    Args:
-        exc: Raised exception from provider invocation.
-
-    Returns:
-        bool: True when Qwen should be skipped and the next provider tried.
-    """
-    for current in _iter_exception_chain(exc):
-        class_name: str = current.__class__.__name__.lower()
-        text: str = str(current).lower()
-        if "notfounderror" in class_name and (
-            "invalid function call" in text
-            or "modal-http" in text
-            or "404" in text
-            or "not found" in text
-        ):
-            return True
-    return False
 
 
 def _proactive_log_key(client_id: str) -> str:
@@ -869,59 +817,13 @@ def _ensure_consumer_group(stream: str = "orchestrator_job") -> None:
         raise
 
 
-def _build_qwen_model() -> Optional[ChatOpenAI]:
-    """
-    Build the self-hosted Qwen primary model client, if configured.
-
-    The Modal vLLM service exposes an OpenAI-compatible API, so a standard
-    ``ChatOpenAI`` client targets it via ``base_url``. Qwen3 "thinking" is
-    disabled through the vLLM chat-template kwarg for clean tool-calling output.
-
-    Returns:
-        Optional[ChatOpenAI]: Configured Qwen client, or None when
-        ``QWEN_BASE_URL`` is not set.
-    """
-    if not QWEN_BASE_URL:
-        logger.warning(
-            "Qwen primary DISABLED: QWEN_BASE_URL is not set; OpenAI Provider will act as "
-            "primary. Set QWEN_BASE_URL to the Modal vLLM endpoint to make Qwen primary."
-        )
-        return None
-
-    # Normalize to the OpenAI v1 base path expected by the client.
-    base_url: str = QWEN_BASE_URL.rstrip("/")
-    if not base_url.endswith("/v1"):
-        base_url = f"{base_url}/v1"
-
-    logger.info(
-        "Qwen primary ENABLED: base_url=%s, model=%s, max_tokens=%s, timeout=%ss, max_retries=%s, enable_thinking=%s",
-        base_url,
-        QWEN_SERVED_MODEL_NAME,
-        QWEN_MAX_TOKENS,
-        QWEN_REQUEST_TIMEOUT_S,
-        QWEN_MAX_RETRIES,
-        QWEN_ENABLE_THINKING,
-    )
-    return ChatOpenAI(
-        model=QWEN_SERVED_MODEL_NAME,
-        base_url=base_url,
-        api_key=QWEN_API_KEY,
-        timeout=QWEN_REQUEST_TIMEOUT_S,
-        max_retries=QWEN_MAX_RETRIES,
-        temperature=QWEN_TEMPERATURE,
-        max_tokens=QWEN_MAX_TOKENS,
-        extra_body={"chat_template_kwargs": {"enable_thinking": QWEN_ENABLE_THINKING}}
-    )
-
-
 def _build_dynamic_agent(*, checkpointer: Any) -> Any:
     """
     Build a dynamic agent with an ordered model fallback chain.
 
-    The chain is, in priority order: self-hosted Qwen (primary, when
-    ``QWEN_BASE_URL`` is set) -> OpenAI -> Google Gemini. A middleware tries each
-    provider in turn, falling through on rate-limit/availability failures so a
-    single overloaded or cold provider never breaks a turn.
+    Priority: OpenAI GPT-4o (primary, including tool calls) -> Google Gemini.
+    Each provider is guarded by a circuit breaker so repeated failures skip
+    straight to the next provider during the cooldown window.
 
     Args:
         checkpointer: The conversation checkpointer to attach to the agent.
@@ -930,86 +832,61 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         Any: A LangChain agent backed by the fallback chain.
 
     Raises:
-        RuntimeError: If neither Qwen nor OpenAI is configured (no usable
-            primary provider).
+        RuntimeError: If OpenAI is not configured.
     """
-    # Get config files
     google_cfg = get_config_file(CONFIG_PATH, "google")
     openai_cfg = get_config_file(CONFIG_PATH, "openai")
 
-    # Get Google service account access credentials
-    creds = build_google_credentials(path=CRED_PATH)
+    if not OPENAI_API_KEY:
+        raise RuntimeError(
+            "OpenAI primary provider required: set OPENAI_API_KEY_QUTIS"
+        )
 
-    # Define Gemini provider (final fallback)
-    gemini_model = ChatGoogleGenerativeAI(
+    gemini_model = build_gemini_chat_model(
         model=google_cfg["model"],
-        credentials=creds,
         temperature=google_cfg["temperature"],
         max_tokens=google_cfg["max_tokens"],
         top_p=google_cfg["top_p"],
-        location=LOCATION,
-        project=PROJECT_ID,
-        api_key=GEMINI_API_KEY,
+        google_credentials_path=CRED_PATH,
+        google_project=PROJECT_ID,
+        google_location=LOCATION,
+        gemini_api_key=GEMINI_API_KEY,
     )
 
-    # Define OpenAI provider (secondary)
-    openai_model: Optional[ChatOpenAI] = (
-        ChatOpenAI(
-            model=openai_cfg["model"],
-            temperature=openai_cfg["temperature"],
-            max_tokens=openai_cfg["max_tokens"],
-            api_key=OPENAI_API_KEY,
-            timeout=OPENAI_REQUEST_TIMEOUT_S,
-            max_retries=OPENAI_MAX_RETRIES,
-        )
-        if OPENAI_API_KEY
-        else None
+    openai_model = ChatOpenAI(
+        model=openai_cfg["model"],
+        temperature=openai_cfg["temperature"],
+        max_tokens=openai_cfg["max_tokens"],
+        api_key=OPENAI_API_KEY,
+        timeout=OPENAI_REQUEST_TIMEOUT_S,
+        # Avoid SDK-level 429 retries; middleware fails over to Gemini immediately.
+        max_retries=0,
     )
 
-    # Define Qwen provider (primary, when configured)
-    qwen_model: Optional[ChatOpenAI] = _build_qwen_model()
+    model_chain: List[tuple[str, Any]] = [
+        (f"openai:{openai_cfg['model']}", openai_model),
+        (f"gemini:{google_cfg['model']}", gemini_model),
+    ]
+    primary_model: Any = openai_model
 
-    # Assemble the ordered fallback chain: Qwen -> OpenAI -> Gemini. Each entry
-    # is paired with a human-readable name for logging. Unconfigured providers
-    # are skipped so the chain only contains usable models.
-    model_chain: List[tuple[str, Any]] = []
-    if qwen_model is not None:
-        model_chain.append((f"qwen:{QWEN_SERVED_MODEL_NAME}", qwen_model))
-    if openai_model is not None:
-        model_chain.append((f"openai:{openai_cfg['model']}", openai_model))
-    model_chain.append((f"gemini:{google_cfg['model']}", gemini_model))
-
-    if model_chain[0][1] is gemini_model:
-        # Only Gemini is available; Qwen/OpenAI both unconfigured. This is almost
-        # certainly a misconfiguration for a "Qwen-primary" deployment.
-        raise RuntimeError(
-            "No primary provider configured: set QWEN_BASE_URL or OPENAI_API_KEY_QUTIS"
-        )
-
-    # The first model in the chain is the default bound to the agent; the
-    # middleware overrides it per call to implement the fallback ordering.
-    primary_model: Any = model_chain[0][1]
     logger.info(
         "orchestrator model chain: %s",
         " -> ".join(name for name, _ in model_chain),
     )
 
-    # Circuit breaker guarding the self-hosted Qwen provider. When Qwen is
-    # repeatedly failing (cold start / down), the breaker opens and the
-    # middleware skips Qwen entirely for a cooldown window, failing over to
-    # OpenAI immediately instead of retrying an unhealthy endpoint.
-    qwen_breaker: CircuitBreaker = load_qwen_circuit_breaker()
+    provider_breakers: dict[str, CircuitBreaker] = {
+        "openai": load_openai_circuit_breaker(),
+        "gemini": load_gemini_circuit_breaker(),
+    }
 
-    # Define dynamic model selection MIDDLEWARE
     @wrap_model_call
     def dynamic_model_selection(request: ModelRequest, handler) -> ModelResponse:
         """
-        Try each provider in the fallback chain until one succeeds.
+        Try OpenAI first, then Gemini on transient failures.
 
-        Iterates ``model_chain`` in priority order. On a rate-limit/availability
-        failure it falls through to the next provider; on a non-transient error
-        (or after the last provider) it re-raises so real bugs are not masked.
-        A circuit breaker short-circuits the Qwen provider while it is unhealthy.
+        Each provider has a circuit breaker. While a circuit is open the
+        middleware skips that provider (when a fallback exists) instead of
+        retrying an unhealthy endpoint.
 
         Args:
             request: The model request.
@@ -1021,14 +898,15 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         last_exc: Optional[Exception] = None
         for index, (name, model) in enumerate(model_chain):
             role: str = "primary" if index == 0 else f"fallback#{index}"
-            is_qwen: bool = name.startswith("qwen:")
             is_last: bool = index == len(model_chain) - 1
+            provider_key: str = name.split(":", 1)[0]
+            breaker: Optional[CircuitBreaker] = provider_breakers.get(provider_key)
 
-            # Skip Qwen while its circuit is open (unless it is the only option).
-            if is_qwen and not is_last and not qwen_breaker.allow():
+            if breaker is not None and not is_last and not breaker.allow():
                 logger.warning(
-                    "qwen circuit OPEN (state=%s); skipping to next provider",
-                    qwen_breaker.state,
+                    "%s circuit OPEN (state=%s); skipping to next provider",
+                    provider_key,
+                    breaker.state,
                 )
                 agent_call_tracer.record_model_attempt(provider=name, success=False)
                 continue
@@ -1037,56 +915,39 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
                 logger.info("invoking model: %s (%s)", name, role)
                 response: ModelResponse = handler(request.override(model=model))
                 logger.info("model replied: %s (%s)", name, role)
-                if is_qwen:
-                    # Reset the circuit breaker on success
-                    qwen_breaker.record_success()
-
+                if breaker is not None:
+                    breaker.record_success()
                 agent_call_tracer.record_model_attempt(provider=name, success=True)
                 return response
 
             except Exception as exc:
                 last_exc = exc
-                if is_qwen:
-                    # Record failure and open the circuit breaker
-                    qwen_breaker.record_failure()
-
+                if breaker is not None:
+                    breaker.record_failure()
                 agent_call_tracer.record_model_attempt(provider=name, success=False)
 
-                should_fallback: bool = _should_fallback(exc) or (
-                    is_qwen and _is_qwen_unavailable_error(exc)
-                )
-                
-                if is_last or not should_fallback:
+                if is_last or not _should_fallback(exc):
                     raise
 
-                # Log the failure Warning and fall back to the next provider
                 logger.warning(
                     "model %s failed (%s); falling back to next provider",
                     name,
                     exc,
                 )
-        # Defensive: the loop always returns or raises, but satisfy type-checkers.
         raise last_exc if last_exc is not None else RuntimeError("model chain empty")
 
-    # Dynamic summarization trigger:
-    # Uses Qwen3's max_model_len to calculate the summarization trigger tokens.
-    # - Reserve explicit output budget.
-    # - Reserve extra context for system prompt, tool schemas/results, and
-    #   serialization overhead.
-    # - Trigger summarization only when conversational history exceeds this
-    #   remaining budget.
-    reserved_output_tokens: int = max(128, QWEN_MAX_TOKENS)
+    reserved_output_tokens: int = max(128, ORCHESTRATOR_MAX_TOKENS)
     reserved_overhead_tokens: int = max(
         2048,
-        int(QWEN_MAX_MODEL_LEN * 0.20),
+        int(ORCHESTRATOR_MAX_MODEL_LEN * 0.20),
     )
     summarization_trigger_tokens: int = max(
         1500,
-        QWEN_MAX_MODEL_LEN - reserved_output_tokens - reserved_overhead_tokens,
+        ORCHESTRATOR_MAX_MODEL_LEN - reserved_output_tokens - reserved_overhead_tokens,
     )
     logger.info(
         "summarization budget: model_len=%s output_reserve=%s overhead_reserve=%s trigger_tokens=%s",
-        QWEN_MAX_MODEL_LEN,
+        ORCHESTRATOR_MAX_MODEL_LEN,
         reserved_output_tokens,
         reserved_overhead_tokens,
         summarization_trigger_tokens,

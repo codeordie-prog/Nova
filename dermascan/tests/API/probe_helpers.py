@@ -25,10 +25,11 @@ CONFIG_PATH = Path(__file__).with_name("stress_config.json")
 IngressEndpoint = Literal["health", "whatsapp", "telegram"]
 
 DEFAULT_CONFIG: dict[str, object] = {
-    "base_url": "http://localhost:8080",
+    "base_url": "http://localhost:8088",
     "ingress_endpoint": "whatsapp",
     "http_timeout": 30,
     "p95_concurrency": 20,
+    "p95_concurrency_levels": [20, 40],
     "p95_rounds": 3,
     "p95_warmup_rounds": 1,
     "ingress_p95_slo_ms": 300,
@@ -83,6 +84,31 @@ def load_probe_config() -> dict[str, object]:
     return cfg
 
 
+def load_p95_concurrency_levels(cfg: dict[str, object]) -> list[int]:
+    """Resolve ingress probe concurrency levels (e.g. 20 and 40).
+
+    Priority: ``DERMASCAN_P95_CONCURRENCY_LEVELS`` env → ``p95_concurrency_levels``
+    in stress_config.json → single ``p95_concurrency`` fallback.
+
+    Args:
+        cfg: Config mapping from :func:`load_probe_config`.
+
+    Returns:
+        Sorted unique concurrency levels to probe.
+    """
+    levels_env = os.getenv("DERMASCAN_P95_CONCURRENCY_LEVELS", "").strip()
+    if levels_env:
+        levels = [int(part.strip()) for part in levels_env.split(",") if part.strip()]
+    else:
+        raw_levels = cfg.get("p95_concurrency_levels")
+        if isinstance(raw_levels, list) and raw_levels:
+            levels = [int(level) for level in raw_levels]
+        else:
+            levels = [int(cfg["p95_concurrency"])]
+
+    return sorted({level for level in levels if level >= 1})
+
+
 def _ingress_secret() -> str:
     """Resolve WhatsApp ingress secret from environment."""
     return os.getenv("WHATSAPP_INGRESS_SECRET", os.getenv("INTERNAL_API_SECRET", "")).strip()
@@ -95,8 +121,13 @@ def ensure_backend_api_up(base_url: str) -> None:
         response = requests.get(health_url, timeout=5)
     except requests.RequestException as exc:  # pragma: no cover - network guard
         pytest.skip(f"Backend API not reachable at {health_url} ({exc})")
-    if response.status_code >= 500:
-        pytest.skip(f"Backend API unhealthy at {health_url}, status {response.status_code}")
+    if response.status_code != 200:
+        pytest.skip(
+            f"Backend health check failed at {health_url}, status {response.status_code}. "
+            "Start the Dermascan backend on port 8088 "
+            "(poetry run uvicorn dermascan.backend.app.main:app --port 8088) "
+            "or set DERMASCAN_API_URL."
+        )
 
 
 def percentile_ms(latencies_s: list[float], percentile: float) -> float:
@@ -270,7 +301,15 @@ def summarize_samples(
 
 
 def write_p95_csv(summary: LatencySummary, output_path: Path) -> None:
-    """Persist ingress p95 summary to CSV."""
+    """Persist one ingress p95 summary row to CSV (overwrites file)."""
+    write_p95_csv_rows([summary], output_path)
+
+
+def write_p95_csv_rows(summaries: list[LatencySummary], output_path: Path) -> None:
+    """Persist one or more ingress p95 summaries to CSV."""
+    if not summaries:
+        raise ValueError("No probe summaries to write")
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -290,29 +329,93 @@ def write_p95_csv(summary: LatencySummary, output_path: Path) -> None:
             "error_rate",
             "status_counts",
         ])
-        writer.writerow([
-            datetime.now(timezone.utc).isoformat(),
-            summary.endpoint,
-            summary.concurrency,
-            summary.rounds,
-            summary.samples,
-            summary.admission_samples,
-            f"{summary.p50_ms:.2f}",
-            f"{summary.p95_ms:.2f}",
-            f"{summary.p99_ms:.2f}",
-            f"{summary.admission_p95_ms:.2f}",
-            f"{summary.success_rate:.4f}",
-            f"{summary.throttle_rate:.4f}",
-            f"{summary.error_rate:.4f}",
-            json.dumps(summary.status_counts),
-        ])
+        timestamp = datetime.now(timezone.utc).isoformat()
+        for summary in summaries:
+            writer.writerow([
+                timestamp,
+                summary.endpoint,
+                summary.concurrency,
+                summary.rounds,
+                summary.samples,
+                summary.admission_samples,
+                f"{summary.p50_ms:.2f}",
+                f"{summary.p95_ms:.2f}",
+                f"{summary.p99_ms:.2f}",
+                f"{summary.admission_p95_ms:.2f}",
+                f"{summary.success_rate:.4f}",
+                f"{summary.throttle_rate:.4f}",
+                f"{summary.error_rate:.4f}",
+                json.dumps(summary.status_counts),
+            ])
+
+
+def assert_probe_summary_ok(summary: LatencySummary, *, slo_ms: float, enforce_slo: bool) -> None:
+    """Assert ingress probe outcomes are acceptable.
+
+    Args:
+        summary: Aggregated probe results.
+        slo_ms: Admission p95 SLO in milliseconds.
+        enforce_slo: Whether to fail when admission p95 exceeds the SLO.
+
+    Raises:
+        AssertionError: On unexpected status codes, server errors, or SLO breach.
+    """
+    unexpected = set(summary.status_counts) - {200, 429}
+    assert not unexpected, f"Unexpected status codes during ingress probe: {unexpected}"
+    assert summary.error_rate == 0.0, f"Server errors observed: {summary.status_counts}"
+
+    if enforce_slo and summary.admission_samples > 0 and summary.throttle_rate < 0.5:
+        assert summary.admission_p95_ms <= slo_ms, (
+            f"Admission p95 {summary.admission_p95_ms:.1f}ms exceeds ingress SLO {slo_ms:.0f}ms "
+            f"at concurrency={summary.concurrency}"
+        )
+
+
+def run_endpoint_probe(
+    endpoint: IngressEndpoint,
+    *,
+    concurrency: int | None = None,
+) -> LatencySummary:
+    """Run ingress probes for one endpoint and return the aggregated summary.
+
+    Args:
+        endpoint: Target ingress surface.
+        concurrency: Optional override; defaults to ``p95_concurrency`` in config.
+
+    Returns:
+        Latency summary for the probe run.
+    """
+    cfg = load_probe_config()
+    base_url = str(cfg["base_url"])
+    level = concurrency if concurrency is not None else int(cfg["p95_concurrency"])
+    rounds = int(cfg["p95_rounds"])
+    warmup_rounds = int(cfg["p95_warmup_rounds"])
+    timeout_s = float(cfg["http_timeout"])
+
+    ensure_backend_api_up(base_url)
+
+    samples = run_ingress_probe(
+        base_url=base_url,
+        endpoint=endpoint,
+        concurrency=level,
+        rounds=rounds,
+        warmup_rounds=warmup_rounds,
+        timeout_s=timeout_s,
+    )
+    return summarize_samples(
+        samples,
+        endpoint=endpoint,
+        concurrency=level,
+        rounds=rounds,
+    )
 
 
 def format_summary_line(summary: LatencySummary, slo_ms: float) -> str:
     """Format a human-readable one-line summary."""
     slo_flag = "PASS" if summary.admission_p95_ms <= slo_ms else "FAIL"
     return (
-        f"[{summary.endpoint}] admission_p95={summary.admission_p95_ms:.1f}ms "
+        f"[{summary.endpoint} concurrency={summary.concurrency}] "
+        f"admission_p95={summary.admission_p95_ms:.1f}ms "
         f"(slo={slo_ms:.0f}ms {slo_flag}) | all_p95={summary.p95_ms:.1f}ms "
         f"p50={summary.p50_ms:.1f}ms p99={summary.p99_ms:.1f}ms | "
         f"samples={summary.samples} admitted={summary.admission_samples} | "

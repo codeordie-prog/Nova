@@ -23,11 +23,12 @@ CONFIG_PATH: Final[Path] = Path(__file__).resolve().with_name("config.json")
 logger_qwen: logging.Logger = get_logger(__name__)
 
 
-class _QwenConfigDict(TypedDict):
+class _QwenConfigDict(TypedDict, total=False):
     """Typed representation of ``config.json``."""
 
     model_id: str
     served_model_name: str
+    gpu: str
     temperature: float
     max_tokens: int
     gpu_memory_utilization: float
@@ -43,6 +44,7 @@ class _QwenConfigDict(TypedDict):
     reasoning_parser: str
     enable_auto_tool_choice: bool
     enable_thinking: bool
+    fast_boot: bool
     max_concurrent_requests: int
 
 
@@ -54,6 +56,7 @@ class QwenConfig:
     Attributes:
         model_id: Hugging Face model identifier.
         served_model_name: Alias exposed by vLLM OpenAI-compatible APIs.
+        gpu: Modal GPU type (e.g. ``A100-80GB``, ``H100``, ``L40S``).
         temperature: Default sampling temperature.
         max_tokens: Default max completion tokens.
         gpu_memory_utilization: GPU memory fraction for vLLM.
@@ -71,12 +74,15 @@ class QwenConfig:
         enable_auto_tool_choice: Whether to pass ``--enable-auto-tool-choice``.
         enable_thinking: Default Qwen3 thinking mode. Applied per request as a
             chat-template kwarg by clients, not as a server CLI flag.
+        fast_boot: When True, pass ``--enforce-eager`` to vLLM for faster cold
+            starts (skips CUDA graph capture).
         max_concurrent_requests: Max simultaneous HTTP requests routed to one
             replica (``@modal.concurrent(max_inputs=...)``).
     """
 
     model_id: str
     served_model_name: str
+    gpu: str
     temperature: float
     max_tokens: int
     gpu_memory_utilization: float
@@ -92,28 +98,31 @@ class QwenConfig:
     reasoning_parser: str
     enable_auto_tool_choice: bool
     enable_thinking: bool
+    fast_boot: bool
     max_concurrent_requests: int
 
 
 DEFAULT_CONFIG: Final[QwenConfig] = QwenConfig(
-    model_id="Qwen/Qwen3-8B",
-    served_model_name="qwen-3-8b",
+    model_id="Qwen/Qwen3-32B",
+    served_model_name="qwen-3-32b",
+    gpu="A100-80GB",
+    fast_boot=True,
     temperature=0.0,
     max_tokens=512,
-    gpu_memory_utilization=0.9,
-    max_model_len=16384,
-    max_num_seqs=32,
-    max_num_batched_tokens=16384,
+    gpu_memory_utilization=0.92,
+    max_model_len=8192,
+    max_num_seqs=8,
+    max_num_batched_tokens=8192,
     vllm_host="0.0.0.0",
     vllm_port=8000,
     vllm_base_url="http://0.0.0.0:8000",
-    vllm_request_timeout_s=120.0,
-    vllm_startup_timeout_s=600.0,
+    vllm_request_timeout_s=180.0,
+    vllm_startup_timeout_s=1200.0,
     tool_call_parser="hermes",
     reasoning_parser="",
     enable_auto_tool_choice=True,
     enable_thinking=False,
-    max_concurrent_requests=32,
+    max_concurrent_requests=8,
 )
 
 
@@ -183,6 +192,7 @@ def load_config(path: Path | None = None) -> QwenConfig:
         cfg = QwenConfig(
             model_id=str(data["model_id"]),
             served_model_name=str(data["served_model_name"]),
+            gpu=str(data.get("gpu", DEFAULT_CONFIG.gpu)),
             temperature=float(data["temperature"]),
             max_tokens=int(data["max_tokens"]),
             gpu_memory_utilization=float(data["gpu_memory_utilization"]),
@@ -198,15 +208,18 @@ def load_config(path: Path | None = None) -> QwenConfig:
             reasoning_parser=str(data.get("reasoning_parser", "")),
             enable_auto_tool_choice=_parse_bool(data["enable_auto_tool_choice"]),
             enable_thinking=_parse_bool(data["enable_thinking"]),
+            fast_boot=_parse_bool(data.get("fast_boot", DEFAULT_CONFIG.fast_boot)),
             max_concurrent_requests=int(
                 data.get("max_concurrent_requests", data["max_num_seqs"])
             ),
         )
 
         logger_qwen.info(
-            "Qwen config loaded: model_id=%s, served_model_name=%s, temperature=%s, max_tokens=%s, gpu_memory_utilization=%s, max_model_len=%s, max_num_seqs=%s, max_num_batched_tokens=%s, vllm_host=%s, vllm_port=%s, vllm_base_url=%s, vllm_request_timeout_s=%s, vllm_startup_timeout_s=%s, tool_call_parser=%s, reasoning_parser=%s, enable_auto_tool_choice=%s, enable_thinking=%s, max_concurrent_requests=%s",
+            "Qwen config loaded: model_id=%s, served_model_name=%s, gpu=%s, fast_boot=%s, temperature=%s, max_tokens=%s, gpu_memory_utilization=%s, max_model_len=%s, max_num_seqs=%s, max_num_batched_tokens=%s, vllm_host=%s, vllm_port=%s, vllm_base_url=%s, vllm_request_timeout_s=%s, vllm_startup_timeout_s=%s, tool_call_parser=%s, reasoning_parser=%s, enable_auto_tool_choice=%s, enable_thinking=%s, max_concurrent_requests=%s",
             cfg.model_id,
             cfg.served_model_name,
+            cfg.gpu,
+            cfg.fast_boot,
             cfg.temperature,
             cfg.max_tokens,
             cfg.gpu_memory_utilization,

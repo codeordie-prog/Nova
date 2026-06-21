@@ -1,11 +1,15 @@
 """
+Author: Dermascan Team
+Date: 6-20-2026
+Licence: MIT
+
 Thread-safe circuit breaker for model providers.
 
-Prevents runaway retries against an unhealthy provider (e.g. a cold or down
-self-hosted Qwen endpoint). After a configurable number of consecutive
-failures the circuit opens for a cooldown window, during which callers are told
-to skip the provider and fail over immediately. After the cooldown a single
-half-open probe is allowed; success closes the circuit, failure re-opens it.
+Prevents runaway retries against an unhealthy provider. After a configurable
+number of consecutive failures the circuit opens for a cooldown window, during
+which callers skip the provider and fail over immediately. After the cooldown a
+single half-open probe is allowed; success closes the circuit, failure re-opens
+it.
 """
 
 from __future__ import annotations
@@ -126,6 +130,69 @@ def get_circuit_breaker(name: str, config: CircuitBreakerConfig) -> CircuitBreak
         return breaker
 
 
+def load_provider_circuit_breaker(
+    provider: str,
+    *,
+    threshold_env: str,
+    cooldown_env: str,
+    default_threshold: int = 3,
+    default_cooldown_s: float = 60.0,
+) -> CircuitBreaker:
+    """
+    Build a provider circuit breaker from environment configuration.
+
+    Args:
+        provider: Provider identifier used as the breaker registry key.
+        threshold_env: Environment variable for consecutive failure threshold.
+        cooldown_env: Environment variable for open-state cooldown seconds.
+        default_threshold: Default threshold when the env var is unset.
+        default_cooldown_s: Default cooldown when the env var is unset.
+
+    Returns:
+        CircuitBreaker: Breaker guarding the named provider.
+    """
+    threshold: int = max(
+        1,
+        int(float(os.getenv(threshold_env, str(default_threshold)))),
+    )
+    cooldown_s: float = max(
+        1.0,
+        float(os.getenv(cooldown_env, str(default_cooldown_s))),
+    )
+    return get_circuit_breaker(
+        provider,
+        CircuitBreakerConfig(failure_threshold=threshold, cooldown_s=cooldown_s),
+    )
+
+
+def load_openai_circuit_breaker() -> CircuitBreaker:
+    """
+    Build the OpenAI circuit breaker from environment configuration.
+
+    Returns:
+        CircuitBreaker: Breaker guarding the OpenAI provider.
+    """
+    return load_provider_circuit_breaker(
+        "openai",
+        threshold_env="OPENAI_CB_FAILURE_THRESHOLD",
+        cooldown_env="OPENAI_CB_COOLDOWN_S",
+    )
+
+
+def load_gemini_circuit_breaker() -> CircuitBreaker:
+    """
+    Build the Gemini circuit breaker from environment configuration.
+
+    Returns:
+        CircuitBreaker: Breaker guarding the Gemini provider.
+    """
+    return load_provider_circuit_breaker(
+        "gemini",
+        threshold_env="GEMINI_CB_FAILURE_THRESHOLD",
+        cooldown_env="GEMINI_CB_COOLDOWN_S",
+    )
+
+
 def load_qwen_circuit_breaker() -> CircuitBreaker:
     """
     Build the Qwen circuit breaker from environment configuration.
@@ -133,11 +200,10 @@ def load_qwen_circuit_breaker() -> CircuitBreaker:
     Returns:
         CircuitBreaker: Breaker guarding the Qwen provider.
     """
-    threshold: int = max(1, int(os.getenv("QWEN_CB_FAILURE_THRESHOLD", "3")))
-    cooldown_s: float = max(1.0, float(os.getenv("QWEN_CB_COOLDOWN_S", "60")))
-    return get_circuit_breaker(
+    return load_provider_circuit_breaker(
         "qwen",
-        CircuitBreakerConfig(failure_threshold=threshold, cooldown_s=cooldown_s),
+        threshold_env="QWEN_CB_FAILURE_THRESHOLD",
+        cooldown_env="QWEN_CB_COOLDOWN_S",
     )
 
 
@@ -145,5 +211,8 @@ __all__ = [
     "CircuitBreaker",
     "CircuitBreakerConfig",
     "get_circuit_breaker",
+    "load_provider_circuit_breaker",
+    "load_openai_circuit_breaker",
+    "load_gemini_circuit_breaker",
     "load_qwen_circuit_breaker",
 ]

@@ -1,0 +1,2 @@
+timestamp,endpoint,concurrency,rounds,samples,admission_samples,p50_ms,p95_ms,p99_ms,admission_p95_ms,success_rate,throttle_rate,error_rate,status_counts
+2026-06-20T19:02:56.833035+00:00,whatsapp,20,3,60,60,10436.07,17489.65,18929.06,17489.65,1,0,0,"{""200"": 60}"

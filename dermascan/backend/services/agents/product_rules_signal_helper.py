@@ -20,7 +20,12 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 from tavily import TavilyClient
 
-from dermascan.backend.services.agents.provider_circuit_breaker import load_qwen_circuit_breaker
+from dermascan.backend.services.agents.build import build_gemini_chat_model
+from dermascan.backend.services.agents.provider_circuit_breaker import (
+    CircuitBreaker,
+    load_gemini_circuit_breaker,
+    load_openai_circuit_breaker,
+)
 from dermascan.rules_engine.engine.engine import RulesEngineRequest
 from dermascan.rules_engine.engine.rules_engine import RulesEngine
 from dermascan.shared.logger import get_logger
@@ -32,14 +37,18 @@ logger = get_logger(__name__)
 
 TAVILY_API_KEY = str(os.getenv("TAVILY_API_KEY_QUTIS", ""))
 _PROVIDER_MAX_RETRIES_HARD_CAP = 3
-QWEN_API_KEY = str(os.getenv("QWEN_API_KEY") or os.getenv("QWEN_OPENAI_API_KEY") or "EMPTY")
-QWEN_BASE_URL = str(os.getenv("QWEN_BASE_URL") or os.getenv("QWEN_OPENAI_BASE_URL") or "")
-QWEN_MODEL_NAME = str(os.getenv("QWEN_SERVED_MODEL_NAME") or os.getenv("QWEN_MODEL_NAME") or "qwen-3-8b")
-QWEN_REQUEST_TIMEOUT_S = float(os.getenv("QWEN_REQUEST_TIMEOUT_S", "45"))
-QWEN_MAX_RETRIES = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("QWEN_MAX_RETRIES", "2"))))
-QWEN_ENABLE_THINKING = os.getenv("QWEN_ENABLE_THINKING", "false").strip().lower() in {
-    "1", "true", "yes", "on"
-}
+OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY_QUTIS", ""))
+OPENAI_MODEL_NAME = str(os.getenv("ORCHESTRATOR_OPENAI_MODEL") or os.getenv("OPENAI_MODEL_NAME") or "gpt-4o")
+OPENAI_REQUEST_TIMEOUT_S = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"))
+OPENAI_MAX_RETRIES = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("OPENAI_MAX_RETRIES", "2"))))
+GEMINI_MODEL_NAME = str(os.getenv("ORCHESTRATOR_GEMINI_MODEL", "gemini-3.1-flash-lite"))
+GEMINI_API_KEY = str(os.getenv("GEMINI_API_KEY_QUTIS", ""))
+GOOGLE_CREDENTIALS_PATH = str(os.getenv("GOOGLE_APPLICATION_CREDENTIALS_QUTIS", ""))
+GOOGLE_PROJECT_ID = str(
+    os.getenv("GOOGLE_CLOUD_PROJECT_QUTIS")
+    or os.getenv("GOOGLE_PROJECT_ID_QUTIS", "qutisai")
+)
+GOOGLE_LOCATION = str(os.getenv("GOOGLE_CLOUD_LOCATION", "global"))
 _SKIN_AUDIT_KEY_TEMPLATE = "client:{client_id}:skin_profile"
 _SKIN_AUDIT_TTL_S = max(60, int(os.getenv("SKIN_AUDIT_TTL_S", str(60 * 60 * 24 * 30))))
 
@@ -62,33 +71,63 @@ class SkinReviewResponse(BaseModel):
 
     report_text: str = ""
 
-# Global rules engine instance + Model circuit breaker
+# Global rules engine instance + provider circuit breakers (shared with orchestrator).
 _rules_engine_singleton: RulesEngine | None = None
-_qwen_breaker = load_qwen_circuit_breaker()
+_openai_breaker: CircuitBreaker = load_openai_circuit_breaker()
+_gemini_breaker: CircuitBreaker = load_gemini_circuit_breaker()
 
 
-def _build_qwen_model() -> ChatOpenAI:
+def _build_openai_model() -> ChatOpenAI:
     """
-    Build a Qwen ChatOpenAI client using the shared OpenAI-compatible endpoint.
-    
+    Build the OpenAI GPT-4o client for rules-flow subagents (tool calling).
+
     Returns:
-        ChatOpenAI instance - an openai compatible API for the self-hosted model
+        ChatOpenAI: Configured OpenAI client.
+
+    Raises:
+        RuntimeError: If ``OPENAI_API_KEY_QUTIS`` is not set.
     """
-    base_url = QWEN_BASE_URL.rstrip("/")
-    if not base_url:
-        raise RuntimeError("QWEN_BASE_URL (or QWEN_OPENAI_BASE_URL) is required for subagents")
-    if not base_url.endswith("/v1"):
-        base_url = f"{base_url}/v1"
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY_QUTIS is required for rules-flow subagents")
 
     return ChatOpenAI(
-        model=QWEN_MODEL_NAME,
-        api_key=QWEN_API_KEY,
-        base_url=base_url,
-        timeout=QWEN_REQUEST_TIMEOUT_S,
-        max_retries=QWEN_MAX_RETRIES,
+        model=OPENAI_MODEL_NAME,
+        api_key=OPENAI_API_KEY,
+        timeout=OPENAI_REQUEST_TIMEOUT_S,
+        max_retries=0,
         temperature=0,
-        extra_body={"chat_template_kwargs": {"enable_thinking": QWEN_ENABLE_THINKING}},
     )
+
+
+def _build_gemini_model() -> Any:
+    """
+    Build the Gemini fallback client for rules-flow subagents.
+
+    Returns:
+        Any: Configured Gemini chat model.
+    """
+    return build_gemini_chat_model(
+        model=GEMINI_MODEL_NAME,
+        temperature=0,
+        max_tokens=1000,
+        google_credentials_path=GOOGLE_CREDENTIALS_PATH,
+        google_project=GOOGLE_PROJECT_ID,
+        google_location=GOOGLE_LOCATION,
+        gemini_api_key=GEMINI_API_KEY,
+    )
+
+
+def _should_failover_to_gemini(exc: Exception) -> bool:
+    """
+    Return True when OpenAI failure should trigger Gemini fallback.
+
+    Args:
+        exc: Raised exception from the primary provider.
+
+    Returns:
+        bool: True when Gemini should be attempted next.
+    """
+    return _should_retry_provider_error(exc)
 
 
 def _should_retry_provider_error(exc: Exception) -> bool:
@@ -122,42 +161,93 @@ def _should_retry_provider_error(exc: Exception) -> bool:
     return any(marker in text for marker in markers)
 
 
-def _invoke_with_retry(*, agent: Any, prompt: str, operation: str) -> dict[str, Any]:
+def _invoke_agent_once(*, agent: Any, prompt: str) -> dict[str, Any]:
     """
-    Invoke an agent with circuit-breaker guarding and bounded retries.
-    
+    Invoke an agent once and normalize the response shape.
+
     Args:
-        Agent (Any): Agent instance.
-        prompt (str): The prompt for the agent.
-        operation (str): The operation carried out [skin or product review research]
-    
+        agent: Agent instance.
+        prompt: User prompt.
+
     Returns:
-        dict (str, Any)
+        dict[str, Any]: Agent invoke response.
     """
-    max_attempts = max(1, QWEN_MAX_RETRIES + 1)
-    last_exc: Exception | None = None
+    response = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
+    return response if isinstance(response, dict) else {}
 
-    for attempt in range(1, max_attempts + 1):
-        if not _qwen_breaker.allow():
-            raise RuntimeError(f"qwen circuit open; skipping {operation}")
-        try:
-            response = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
-            _qwen_breaker.record_success()
-            return response if isinstance(response, dict) else {}
-        except Exception as exc:
-            last_exc = exc
-            _qwen_breaker.record_failure()
-            if attempt >= max_attempts or not _should_retry_provider_error(exc):
-                raise
-            logger.warning(
-                "%s attempt %s/%s failed; retrying: %s",
-                operation,
-                attempt,
-                max_attempts,
-                exc,
-            )
 
-    raise last_exc if last_exc is not None else RuntimeError(f"{operation} failed")
+def _invoke_with_retry(
+    *,
+    primary_agent: Any,
+    fallback_agent: Any,
+    prompt: str,
+    operation: str,
+) -> dict[str, Any]:
+    """
+    Invoke OpenAI first, then Gemini on rate limits or circuit-open state.
+
+    Args:
+        primary_agent: OpenAI-backed agent.
+        fallback_agent: Gemini-backed fallback agent.
+        prompt: The prompt for the agent.
+        operation: The operation carried out (skin or product review research).
+
+    Returns:
+        dict[str, Any]: Agent invoke response.
+
+    Raises:
+        RuntimeError: When both providers fail or circuits are open.
+    """
+    if not _openai_breaker.allow():
+        logger.warning(
+            "openai circuit open (state=%s); using gemini for %s",
+            _openai_breaker.state,
+            operation,
+        )
+        return _invoke_gemini_once(agent=fallback_agent, prompt=prompt, operation=operation)
+
+    try:
+        response = _invoke_agent_once(agent=primary_agent, prompt=prompt)
+        _openai_breaker.record_success()
+        return response
+    except Exception as exc:
+        _openai_breaker.record_failure()
+        if not _should_failover_to_gemini(exc):
+            raise
+        logger.warning(
+            "%s openai failed (%s); failing over to gemini",
+            operation,
+            exc,
+        )
+        return _invoke_gemini_once(agent=fallback_agent, prompt=prompt, operation=operation)
+
+
+def _invoke_gemini_once(*, agent: Any, prompt: str, operation: str) -> dict[str, Any]:
+    """
+    Invoke the Gemini fallback agent with circuit-breaker guarding.
+
+    Args:
+        agent: Gemini-backed agent.
+        prompt: User prompt.
+        operation: Operation name for logging/errors.
+
+    Returns:
+        dict[str, Any]: Agent invoke response.
+
+    Raises:
+        RuntimeError: When the Gemini circuit is open or the call fails.
+    """
+    if not _gemini_breaker.allow():
+        raise RuntimeError(
+            f"gemini circuit open (state={_gemini_breaker.state}); skipping {operation}"
+        )
+    try:
+        response = _invoke_agent_once(agent=agent, prompt=prompt)
+        _gemini_breaker.record_success()
+        return response
+    except Exception as exc:
+        _gemini_breaker.record_failure()
+        raise
 
 
 def _normalize_inci_name(raw_name: str) -> str:
@@ -410,28 +500,35 @@ def skin_review_search(query: str, max_results: int = 4) -> str:
         return f"Skin review search failed: {exc}"
 
 
-def _build_ingredient_agent() -> Any:
+def _build_ingredient_agents() -> tuple[Any, Any]:
     """
-    Build a simple subagent for ingredient search.
-    This agent searches the ingredients of a given product from INCI decoder.
-    These ingredient names are then normalized and used to query our safety database.
+    Build OpenAI-primary and Gemini-fallback ingredient extraction agents.
 
+    Returns:
+        tuple[Any, Any]: Primary and fallback agent instances.
     """
-    model = _build_qwen_model()
-    return create_agent(
-        model=model,
+    system_prompt = (
+        "You extract cosmetic product ingredient names in strict INCI-style naming. "
+        "Always use the inci_decoder_search tool before finalizing when product identity is available. "
+        "Return only ingredient names without concentration or percentages. "
+        "Example: 'Niacinamide 10%' -> 'Niacinamide'. "
+        "Never return explanatory prose in ingredients; keep it clean and deduplicated."
+        "Return at-most the first 10 main ingredients."
+        "Avoid formatting your responses, reply with a clean well structured response, No bold or italics."
+    )
+    primary = create_agent(
+        model=_build_openai_model(),
         tools=[inci_decoder_search],
         response_format=IngredientExtractionResponse,
-        system_prompt=(
-            "You extract cosmetic product ingredient names in strict INCI-style naming. "
-            "Always use the inci_decoder_search tool before finalizing when product identity is available. "
-            "Return only ingredient names without concentration or percentages. "
-            "Example: 'Niacinamide 10%' -> 'Niacinamide'. "
-            "Never return explanatory prose in ingredients; keep it clean and deduplicated."
-            "Return at-most the first 10 main ingredients."
-            "Avoid formatting your responses, reply with a clean well structured response, No bold or italics."
-        ),
+        system_prompt=system_prompt,
     )
+    fallback = create_agent(
+        model=_build_gemini_model(),
+        tools=[inci_decoder_search],
+        response_format=IngredientExtractionResponse,
+        system_prompt=system_prompt,
+    )
+    return primary, fallback
 
 
 def extract_product_ingredients(*, product_name: str, description: str) -> IngredientExtractionResponse:
@@ -444,8 +541,7 @@ def extract_product_ingredients(*, product_name: str, description: str) -> Ingre
     Returns:
         IngredientExtractionResponse: The extracted ingredients
     """
-    # Build agent
-    agent = _build_ingredient_agent()
+    primary_agent, fallback_agent = _build_ingredient_agents()
     prompt = (
         "Extract the ingredient list for this cosmetic product.\n"
         "Use INCI names only and remove concentration values.\n"
@@ -454,7 +550,8 @@ def extract_product_ingredients(*, product_name: str, description: str) -> Ingre
     )
     try:
         response = _invoke_with_retry(
-            agent=agent,
+            primary_agent=primary_agent,
+            fallback_agent=fallback_agent,
             prompt=prompt,
             operation="ingredient_extraction",
         )
@@ -510,54 +607,73 @@ def report_internet_search(query: str, max_results: int = 8) -> str:
     except Exception as exc:
         return f"Report internet search failed: {exc}" 
 
-def _build_report_agent(context: list[dict[str, Any]]) -> Any:
+def _build_report_agents(context: list[dict[str, Any]]) -> tuple[Any, Any]:
     """
-    Build a report summarization subagent.
-    
+    Build OpenAI-primary and Gemini-fallback product report agents.
+
+    Returns:
+        tuple[Any, Any]: Primary and fallback agent instances.
     """
-    model = _build_qwen_model()
-    return create_agent(
-        model=model,
+    system_prompt = (
+        "You are a dermatology-focused product-audit assistant. "
+        "Your task is to convert structured product safety evidence into a concise user-facing product audit. "
+        "Use plain language and practical guidance for a non-technical user. "
+        "Do not claim medical diagnosis and do not prescribe treatment. "
+        "Use report_internet_search only when it meaningfully strengthens unclear or missing safety points. "
+        "Output must be structured in this order: "
+        "Overview; Key ingredient safety points; Contraindications and interaction cautions; Pregnancy and lactation considerations; What to do next; Safety disclaimer. "
+        "When ingredient-level evidence is available, include a short note per ingredient. "
+        "Keep the response concise, actionable, and aligned with conversation context. "
+        "Return plain text only; do not use markdown, bold, or italics. "
+        f"last_conversation_entries: {json.dumps(context, default=str)}\n"
+    )
+    primary = create_agent(
+        model=_build_openai_model(),
         tools=[report_internet_search],
         response_format=UserFriendlyReportResponse,
-        system_prompt=(
-            "You are a dermatology-focused product-audit assistant. "
-            "Your task is to convert structured product safety evidence into a concise user-facing product audit. "
-            "Use plain language and practical guidance for a non-technical user. "
-            "Do not claim medical diagnosis and do not prescribe treatment. "
-            "Use report_internet_search only when it meaningfully strengthens unclear or missing safety points. "
-            "Output must be structured in this order: "
-            "Overview; Key ingredient safety points; Contraindications and interaction cautions; Pregnancy and lactation considerations; What to do next; Safety disclaimer. "
-            "When ingredient-level evidence is available, include a short note per ingredient. "
-            "Keep the response concise, actionable, and aligned with conversation context. "
-            "Return plain text only; do not use markdown, bold, or italics. "
-            f"last_conversation_entries: {json.dumps(context, default=str)}\n"
-        ),
+        system_prompt=system_prompt,
     )
+    fallback = create_agent(
+        model=_build_gemini_model(),
+        tools=[report_internet_search],
+        response_format=UserFriendlyReportResponse,
+        system_prompt=system_prompt,
+    )
+    return primary, fallback
 
-def _build_skin_review_agent(context: list[dict[str, Any]]) -> Any:
-    """
-    Build a skin review agent
-    """
-    model = _build_qwen_model()
 
-    return create_agent(
-        model=model,
+def _build_skin_review_agents(context: list[dict[str, Any]]) -> tuple[Any, Any]:
+    """
+    Build OpenAI-primary and Gemini-fallback skin review agents.
+
+    Returns:
+        tuple[Any, Any]: Primary and fallback agent instances.
+    """
+    system_prompt = (
+        "You are a dermatology skin-audit assistant. "
+        "Your task is to produce a concise user-facing skin audit from the provided primary concern, condition summary, and needs/treatment context. "
+        "Use the skin_review_search tool to strengthen evidence when useful. "
+        "Return plain text only; do not use markdown, bold, or italics. "
+        "Do not prescribe medications, dosages, or definitive treatment plans. "
+        "Do not claim definitive diagnosis; use cautious language such as 'consistent with'. "
+        "The output must be structured in this order: "
+        "Primary concern; Condition snapshot; Likely contributors; Care priorities (general, non-prescriptive); Cautions and when to seek in-person care; Safety disclaimer. "
+        "Keep it practical, short, and aligned with conversation context. "
+        f"last_conversation_entries: {json.dumps(context, default=str)}\n"
+    )
+    primary = create_agent(
+        model=_build_openai_model(),
         tools=[skin_review_search],
         response_format=SkinReviewResponse,
-        system_prompt=(
-            "You are a dermatology skin-audit assistant. "
-            "Your task is to produce a concise user-facing skin audit from the provided primary concern, condition summary, and needs/treatment context. "
-            "Use the skin_review_search tool to strengthen evidence when useful. "
-            "Return plain text only; do not use markdown, bold, or italics. "
-            "Do not prescribe medications, dosages, or definitive treatment plans. "
-            "Do not claim definitive diagnosis; use cautious language such as 'consistent with'. "
-            "The output must be structured in this order: "
-            "Primary concern; Condition snapshot; Likely contributors; Care priorities (general, non-prescriptive); Cautions and when to seek in-person care; Safety disclaimer. "
-            "Keep it practical, short, and aligned with conversation context. "
-            f"last_conversation_entries: {json.dumps(context, default=str)}\n"
-        )
+        system_prompt=system_prompt,
     )
+    fallback = create_agent(
+        model=_build_gemini_model(),
+        tools=[skin_review_search],
+        response_format=SkinReviewResponse,
+        system_prompt=system_prompt,
+    )
+    return primary, fallback
 
 
 def build_skin_review_report(
@@ -569,7 +685,7 @@ def build_skin_review_report(
     context: list[dict[str, Any]],
 ) -> str:
     """Build a concise user-facing skin review report."""
-    agent = _build_skin_review_agent(context)
+    primary_agent, fallback_agent = _build_skin_review_agents(context)
     prompt = (
         "Generate the final skin audit using the inputs below.\n"
         "If a field is missing, state 'unknown' briefly and continue.\n"
@@ -580,7 +696,8 @@ def build_skin_review_report(
     )
     try:
         response = _invoke_with_retry(
-            agent=agent,
+            primary_agent=primary_agent,
+            fallback_agent=fallback_agent,
             prompt=prompt,
             operation="skin_review_report",
         )
@@ -614,7 +731,7 @@ def build_user_friendly_report(
     Returns:
         User-friendly report as string
     """
-    agent = _build_report_agent(context)
+    primary_agent, fallback_agent = _build_report_agents(context)
     prompt = (
         "Generate the final product audit using the inputs below.\n"
         "If a field is missing, state 'unknown' briefly and continue.\n"
@@ -626,7 +743,8 @@ def build_user_friendly_report(
     )
     try:
         response = _invoke_with_retry(
-            agent=agent,
+            primary_agent=primary_agent,
+            fallback_agent=fallback_agent,
             prompt=prompt,
             operation="product_user_friendly_report",
         )

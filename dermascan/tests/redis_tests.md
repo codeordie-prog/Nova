@@ -320,9 +320,51 @@ Run:
 poetry run pytest dermascan/tests/integration/test_stream_consumer_group.py -m integration -v
 ```
 
-### Step 8 — Concurrency + chaos (next)
+### Step 8a — Reclaim & idempotency ✅
 
-After happy path is green, add lock/rate-limit races and outage injection.
+Implemented in `integration/test_reclaim_recovery.py` and `integration/test_idempotency.py`
+(helpers in `fixtures/reclaim_helpers.py`):
+
+| Test | Production confidence |
+| --- | --- |
+| `test_unacked_message_reclaimed_to_new_consumer` | R2 — worker crash (no XACK) → another consumer recovers the job |
+| `test_reclaimed_message_processed_once` | R1 — reclaim + `mark_processed` → handler runs once |
+| `test_poison_message_moves_to_dlq_after_max_attempts` | R3 — repeated failure → DLQ, not infinite retry |
+| `test_mark_processed_set_nx_wins_once` | C7 — concurrent reclaim cannot double-process |
+| `test_second_pass_acks_without_reprocessing` | R1 — already-processed pending entry acked without handler |
+| `test_handler_uses_mark_processed_before_side_effects` | R1 — idempotency gate before side effects |
+
+Run:
+
+```powershell
+poetry run pytest dermascan/tests/integration/test_reclaim_recovery.py dermascan/tests/integration/test_idempotency.py -m integration -v
+```
+
+### Step 8b — Concurrency + chaos ✅
+
+Implemented across unit, concurrency, and chaos layers (helpers in `fixtures/admission_helpers.py`):
+
+| Test | Production confidence |
+| --- | --- |
+| `test_allows_up_to_rpm` / `test_window_rollover_resets` | S2 — RPM window enforced and resets |
+| `test_rejected_returns_retry_after` | S1/S2 — over-RPM returns 429 + Retry-After |
+| `test_green_below_soft_threshold` / `test_yellow_between_soft_and_hard` / `test_red_at_or_above_hard_threshold` | S3 — green/yellow/red pressure bands |
+| `test_wait_budget_exhaustion_returns_last_state` / `test_green_recovery_within_budget` | S4 — wait budget under backpressure |
+| `test_parallel_consume_never_exceeds_rpm` | C3 — parallel callers never exceed RPM |
+| `test_no_torn_reads_on_window_boundary` | C3 — atomic window rollover under concurrency |
+| `test_depth_stable_under_concurrent_enqueue_ack` | S3 — XPENDING depth stable under concurrent XADD/XACK |
+| `test_pressure_level_transitions_are_monotonic` | S3 — green → yellow → red align with XPENDING counts |
+| `test_transient_redis_blip_retries_and_succeeds` | R4 — transient outage retries then succeeds |
+| `test_sustained_redis_outage_surfaces_after_retries` | R5 — sustained outage surfaces after retry exhaustion |
+| `test_recovery_drains_backlog_after_blip` | R2/R4 — backlog reclaimed after blip recovery |
+| `test_kill_consumer_mid_job_reclaims_message` | R2 — simulated worker crash → reclaim |
+| `test_reclaimed_job_completes_without_double_processing` | R1/R2 — reclaimed job completes once |
+
+Run:
+
+```powershell
+poetry run pytest dermascan/tests/unit/test_rate_limiter.py dermascan/tests/unit/test_queue_depth.py dermascan/tests/concurrency dermascan/tests/chaos/test_redis_outage.py dermascan/tests/chaos/test_worker_kill.py -v
+```
 
 ---
 
@@ -422,9 +464,9 @@ Before production deploy, the Redis suite should demonstrate:
 1. Run the full Redis suite locally:
 
    ```powershell
-   poetry run pytest dermascan/tests/unit/redis dermascan/tests/integration/test_redis_connectivity.py -v
+   poetry run pytest dermascan/tests/unit/redis dermascan/tests/unit/test_rate_limiter.py dermascan/tests/unit/test_queue_depth.py dermascan/tests/integration/test_redis_connectivity.py dermascan/tests/integration/test_stream_consumer_group.py dermascan/tests/integration/test_reclaim_recovery.py dermascan/tests/integration/test_idempotency.py dermascan/tests/concurrency dermascan/tests/chaos/test_redis_outage.py dermascan/tests/chaos/test_worker_kill.py -v
    ```
 
-2. **Step 8:** Concurrency lock/rate-limit races, then chaos outage tests.
+2. **Optional next:** `concurrency/test_dedup_under_race.py` (scaffold), `chaos/test_provider_outage.py`, integration admission/ingress tests.
 
-Current status: **21 passed, 1 skipped** across unit/redis + connectivity + stream integration.
+Current status: **45 passed, 3 skipped** across the full Redis reliability suite.
