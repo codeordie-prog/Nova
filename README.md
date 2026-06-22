@@ -11,8 +11,8 @@ user (Telegram / WhatsApp)
   Backend API (FastAPI, :8088)
          │ XADD orchestrator:jobs
          ▼
-  Orchestrator worker ──► Qwen (primary LLM, Modal vLLM)
-         │                  └── fallbacks: OpenAI, Gemini
+  Orchestrator worker ──► OpenAI GPT-4o (primary LLM, tool calling)
+         │                  └── fallback: Gemini 3
          ├──► MedGemma gateway (vision, via orchestrator tools)
          ├──► rules engine (PostgreSQL) via signal enrichment
          └──► outbound:messages ──► Telegram / WhatsApp
@@ -26,7 +26,8 @@ Workers are started together via `dermascan/scripts/do_work.py`. MedGemma runs a
 - [Poetry](https://python-poetry.org/)
 - Redis (queues, job status, LangGraph checkpoints)
 - PostgreSQL (rules engine ingredient safety data — required for product-review flows)
-- Modal CLI (Qwen + MedGemma GPU inference)
+- Modal CLI (MedGemma GPU inference only)
+- OpenAI API key (`OPENAI_API_KEY_QUTIS`) and Gemini credentials (`GEMINI_API_KEY_QUTIS` or Vertex AI)
 
 ## Setup
 
@@ -35,57 +36,25 @@ poetry install
 cp .env_example .env   # fill in values — see sections below
 ```
 
-## 1. Deploy Qwen (primary orchestrator LLM)
+## 1. Orchestrator LLM (OpenAI → Gemini)
 
-The orchestrator's primary model is **self-hosted Qwen** served on Modal via vLLM as an OpenAI-compatible HTTP endpoint. When `QWEN_BASE_URL` is set, the orchestrator worker uses Qwen first and falls back to OpenAI, then Gemini.
+The orchestrator uses **OpenAI GPT-4o** as the primary model (including tool calling) and **Gemini 3** as the fallback when OpenAI is rate-limited, unavailable, or its circuit breaker is open.
 
-**What it does**
+Required variables (see `.env_example`):
 
-- Hosts `Qwen/Qwen3-8B` on an NVIDIA L40S GPU.
-- Exposes `/v1/chat/completions` and `/v1/models` (standard OpenAI client).
-- Supports tool calling (orchestrator tools: image audit, search, case status, etc.).
+| Variable | Purpose |
+|---|---|
+| `OPENAI_API_KEY_QUTIS` | OpenAI API key for the primary orchestrator model |
+| `ORCHESTRATOR_OPENAI_MODEL` | Primary model (default `gpt-4o`) |
+| `GEMINI_API_KEY_QUTIS` | Google AI Studio key for Gemini fallback (when not using Vertex) |
+| `ORCHESTRATOR_GEMINI_MODEL` | Fallback model (default `gemini-3.1-flash-lite`) |
+| `GOOGLE_APPLICATION_CREDENTIALS_QUTIS` | Service account JSON for Vertex AI (optional) |
+| `GOOGLE_CLOUD_PROJECT_QUTIS` | GCP project when using Vertex |
+| `GOOGLE_CLOUD_LOCATION` | Vertex region (use `global` for Gemini 3.x) |
 
-**Deploy**
+Circuit-breaker tuning: `OPENAI_CB_*` and `GEMINI_CB_*` env vars control failover thresholds and cooldowns.
 
-```bash
-# One-time Modal auth + Hugging Face secret
-modal token new
-modal secret create huggingface HF_TOKEN=
-
-# Deploy (wrapper script)
-poetry run python dermascan/scripts/deploy_qwen_app.py
-
-# Or directly
-modal deploy dermascan/ai_service/modal/qwen_service/app.py
-```
-
-After deploy, Modal prints a public HTTPS URL. Set in `.env`:
-
-```bash
-QWEN_BASE_URL=https://<your-modal-app>--dermascan-qwen-qwenservice-serve.modal.run/v1
-QWEN_SERVED_MODEL_NAME=qwen-3-8b
-QWEN_API_KEY=EMPTY
-```
-
-**Smoke-test the endpoint** (optional):
-
-```bash
-poetry run python dermascan/scripts/qwen_langchain_agent.py
-```
-
-**Shut down the deployed app** (stops GPU billing when you are done testing):
-
-```bash
-# List deployed Modal apps and copy the App ID for the Qwen deployment
-modal app list
-
-# Stop the app (replace with the App ID from the list)
-modal app stop <app-id>
-```
-
-Look for an app named like `dermascan-qwen` in the `modal app list` output. Redeploy with the deploy command above when you need it again.
-
-Config lives in `dermascan/ai_service/modal/qwen_service/config/config.json`.
+Model defaults and temperature/token limits live in `dermascan/backend/services/agents/configurations/agents_config.json`.
 
 ## 2. PostgreSQL & rules engine
 
@@ -137,7 +106,7 @@ This script runs:
 
 | Worker | Role |
 |---|---|
-| `orchestrator_worker` | Consumes jobs + signals; drives Qwen (primary) conversation |
+| `orchestrator_worker` | Consumes jobs + signals; drives OpenAI → Gemini conversation |
 | `outbound_sender_worker` | Compacts and delivers replies to Telegram / WhatsApp |
 
 **Not included:** `knowledge_worker` (optional, start manually) and **MedGemma** (separate AI-service stack below).
@@ -146,7 +115,7 @@ This script runs:
 
 1. Redis
 2. PostgreSQL (if using product / rules flows)
-3. Deploy Qwen on Modal; set `QWEN_BASE_URL` in `.env`
+3. Set `OPENAI_API_KEY_QUTIS` and Gemini credentials in `.env`
 4. MedGemma gateway + worker (if image / skin review flows are needed)
 5. Backend API (`8088`)
 6. `poetry run python dermascan/scripts/do_work.py`
@@ -184,9 +153,9 @@ See `dermascan/ai_service/modal/medgemma_service/README.md` for gateway config.
 | Directory | Purpose |
 |---|---|
 | `dermascan/backend` | API server, agent workers, orchestrator tools |
-| `dermascan/ai_service` | MedGemma + Qwen Modal apps, inference postprocessing |
+| `dermascan/ai_service` | MedGemma Modal app, inference postprocessing |
 | `dermascan/rules_engine` | PostgreSQL-backed ingredient safety engine |
-| `dermascan/scripts` | Worker supervisor (`do_work.py`), Qwen deploy/test scripts |
+| `dermascan/scripts` | Worker supervisor (`do_work.py`) and utility scripts |
 | `dermascan/shared` | Firebase storage, logging utilities |
 | `dermascan/frontend` | Web UI and client-side application |
 
