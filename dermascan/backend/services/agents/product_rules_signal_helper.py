@@ -651,13 +651,16 @@ def _build_skin_review_agents(context: list[dict[str, Any]]) -> tuple[Any, Any]:
     """
     system_prompt = (
         "You are a dermatology skin-audit assistant. "
-        "Your task is to produce a concise user-facing skin audit from the provided primary concern, condition summary, and needs/treatment context. "
+        "Your task is to produce a concise user-facing image-based skin pattern review from the provided candidate pattern, condition summary, and needs/treatment context. "
         "Use the skin_review_search tool to strengthen evidence when useful. "
         "Return plain text only; do not use markdown, bold, or italics. "
         "Do not prescribe medications, dosages, or definitive treatment plans. "
-        "Do not claim definitive diagnosis; use cautious language such as 'consistent with'. "
+        "Treat the candidate pattern as an internal hypothesis, not a confirmed diagnosis. "
+        "Use cautious language such as 'appears consistent with', 'may suggest', 'could reflect', and 'image-based review cannot confirm'. "
+        "Avoid definitive phrasing such as 'has', 'is', 'diagnosis is', or 'confirms'. "
+        "If evidence is limited, explicitly state uncertainty and prefer uncertainty over unsupported specificity. "
         "The output must be structured in this order: "
-        "Primary concern; Condition snapshot; Likely contributors; Care priorities (general, non-prescriptive); Cautions and when to seek in-person care; Safety disclaimer. "
+        "Observed pattern; What this may suggest; Care considerations (general, non-prescriptive); When to seek in-person review; Safety disclaimer. "
         "Keep it practical, short, and aligned with conversation context. "
         f"last_conversation_entries: {json.dumps(context, default=str)}\n"
     )
@@ -687,12 +690,12 @@ def build_skin_review_report(
     """Build a concise user-facing skin review report."""
     primary_agent, fallback_agent = _build_skin_review_agents(context)
     prompt = (
-        "Generate the final skin audit using the inputs below.\n"
+        "Generate the final image-based skin pattern review using the inputs below.\n"
         "If a field is missing, state 'unknown' briefly and continue.\n"
-        f"primary_concern: {diagnosis}\n"
+        f"candidate_pattern: {diagnosis}\n"
         f"skin_condition_summary: {summary}\n"
         f"needs_and_treatment: {treatment}\n"
-        f"internet_research_on_primary_concern: {internet_research}\n"
+        f"internet_research_on_candidate_pattern: {internet_research}\n"
     )
     try:
         response = _invoke_with_retry(
@@ -854,6 +857,7 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
     diagnosis = str(payload.get("diagnosis") or payload.get("diagnosis_text") or "").strip()
     summary = _coerce_summary_payload(payload.get("summary"))
     treatment = _coerce_treatment_payload(payload.get("treatment"))
+    diagnosis_normalized = diagnosis.lower()
 
     logger.info(
         "skin signal rules flow started: request_id=%s case_id=%s client_id=%s diagnosis=%s",
@@ -862,6 +866,30 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
         client_id,
         diagnosis or "<empty>",
     )
+
+    if diagnosis_normalized == "uncertain":
+        logger.info(
+            "skin signal marked uncertain; skipping rules engine: request_id=%s case_id=%s client_id=%s",
+            request_id,
+            case_id,
+            client_id,
+        )
+        user_friendly_report = (
+            "Thanks for sharing the image. The current image-based review does not provide enough clear visual evidence "
+            "for a reliable skin pattern assessment. Please share a clearer, well-lit close-up image, or seek an "
+            "in-person dermatology review if symptoms are worsening or concerning. This information is educational "
+            "and not a medical diagnosis or prescription."
+        )
+        return {
+            "summary": "Image-based skin review is uncertain due to limited visual evidence.",
+            "user_friendly_report": user_friendly_report,
+            "sources": [],
+            "report": {
+                "diagnosis": "uncertain",
+                "summary": summary,
+                "treatment": treatment,
+            },
+        }
 
     rules_engine = get_rules_engine()
     request = RulesEngineRequest(

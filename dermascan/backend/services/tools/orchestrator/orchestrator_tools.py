@@ -50,6 +50,9 @@ _AUDIT_ENQUEUED_KEY_PREFIX: str = "diagnose:enqueued"
 _AUDIT_ENQUEUED_TTL_SEC: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"))
 _INGRESS_PAYLOAD_CACHE_PREFIX: str = "orchestrator:ingress_payload"
 _INGRESS_PAYLOAD_CACHE_TTL_SEC: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"))
+_LATEST_IMAGE_REQUEST_BY_CLIENT_PREFIX: str = "orchestrator:latest_image_request:client"
+_LATEST_IMAGE_REQUEST_BY_CASE_PREFIX: str = "orchestrator:latest_image_request:case"
+_LATEST_IMAGE_REQUEST_TTL_SEC: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"))
 
 
 
@@ -72,6 +75,16 @@ def payload_has_image_attachment(payload: dict) -> bool:
 def _payload_cache_key(request_id: str) -> str:
     """Build Redis key for request-scoped ingress payload cache."""
     return f"{_INGRESS_PAYLOAD_CACHE_PREFIX}:{request_id}"
+
+
+def _latest_image_request_key_for_client(client_id: str) -> str:
+    """Build Redis key for latest image request id scoped by client."""
+    return f"{_LATEST_IMAGE_REQUEST_BY_CLIENT_PREFIX}:{client_id}"
+
+
+def _latest_image_request_key_for_case(case_id: str) -> str:
+    """Build Redis key for latest image request id scoped by case."""
+    return f"{_LATEST_IMAGE_REQUEST_BY_CASE_PREFIX}:{case_id}"
 
 
 def cache_ingress_payload(
@@ -475,6 +488,151 @@ def get_time() -> str:
     """
     logger.info(f"TOOL CALL: get_time")
     return datetime.now().isoformat()
+
+
+@tool
+def save_latest_image_request_id(request_id: str) -> dict[str, str]:
+    """
+    Save the latest image-bearing request_id for this conversation context.
+
+    Args:
+        request_id: The request id that contains the uploaded image.
+
+    Returns:
+        Status payload indicating save result and scope metadata.
+    """
+    logger.info("TOOL CALL: save_latest_image_request_id: request_id=%s", request_id)
+
+    if _redis is None:
+        return {"status": "error", "detail": "REDIS_URL is not configured", "request_id": request_id}
+
+    envelope = _get_cached_ingress_envelope(request_id)
+    if not envelope:
+        return {
+            "status": "error",
+            "detail": "ingress cache not found for request_id",
+            "request_id": request_id,
+        }
+
+    try:
+        payload_obj = json.loads(str(envelope.get("payload") or "{}"))
+    except Exception:
+        payload_obj = {}
+
+    if not payload_has_image_attachment(payload_obj):
+        return {
+            "status": "blocked_missing_image",
+            "request_id": str(envelope.get("request_id") or request_id),
+            "instruction": (
+                "This request does not contain an image attachment. Do NOT call this tool again for this request_id. "
+                "Ask the user to upload a clear image first."
+            ),
+        }
+
+    resolved_request_id = str(envelope.get("request_id") or request_id).strip()
+    client_id = str(envelope.get("client_id") or "anonymous").strip()
+    case_id = str(envelope.get("case_id") or resolved_request_id).strip()
+
+    try:
+        _redis.setex(
+            _latest_image_request_key_for_client(client_id),
+            _LATEST_IMAGE_REQUEST_TTL_SEC,
+            resolved_request_id,
+        )
+        _redis.setex(
+            _latest_image_request_key_for_case(case_id),
+            _LATEST_IMAGE_REQUEST_TTL_SEC,
+            resolved_request_id,
+        )
+    except Exception:
+        logger.exception(
+            "failed to save latest image request id: request_id=%s client_id=%s case_id=%s",
+            resolved_request_id,
+            client_id,
+            case_id,
+        )
+        return {
+            "status": "error",
+            "detail": "failed to persist latest image request id",
+            "request_id": resolved_request_id,
+        }
+
+    return {
+        "status": "saved",
+        "request_id": resolved_request_id,
+        "client_id": client_id,
+        "case_id": case_id,
+        "instruction": (
+            "Latest image request_id has been saved. Continue collecting missing intake context. "
+            "Before routing, call get_latest_image_request_id to retrieve the request_id to enqueue."
+        ),
+    }
+
+
+@tool
+def get_latest_image_request_id(request_id: str) -> dict[str, str]:
+    """
+    Get the latest saved image-bearing request_id for this conversation context.
+
+    Args:
+        request_id: Current turn request id used to resolve client/case scope.
+
+    Returns:
+        Status payload with the latest image request id when available.
+    """
+    logger.info("TOOL CALL: get_latest_image_request_id: request_id=%s", request_id)
+
+    if _redis is None:
+        return {"status": "error", "detail": "REDIS_URL is not configured", "request_id": request_id}
+
+    envelope = _get_cached_ingress_envelope(request_id)
+    if not envelope:
+        return {
+            "status": "error",
+            "detail": "ingress cache not found for request_id",
+            "request_id": request_id,
+        }
+
+    client_id = str(envelope.get("client_id") or "anonymous").strip()
+    case_id = str(envelope.get("case_id") or "").strip()
+
+    latest_request_id = ""
+    try:
+        if case_id:
+            latest_request_id = str(_redis.get(_latest_image_request_key_for_case(case_id)) or "").strip()
+        if not latest_request_id and client_id:
+            latest_request_id = str(_redis.get(_latest_image_request_key_for_client(client_id)) or "").strip()
+    except Exception:
+        logger.exception(
+            "failed to read latest image request id: request_id=%s client_id=%s case_id=%s",
+            request_id,
+            client_id,
+            case_id,
+        )
+        return {
+            "status": "error",
+            "detail": "failed to read latest image request id",
+            "request_id": request_id,
+        }
+
+    if not latest_request_id:
+        return {
+            "status": "not_found",
+            "request_id": request_id,
+            "instruction": (
+                "No saved image request_id found yet for this conversation. "
+                "If the user shared an image in this intake flow, call save_latest_image_request_id with that image request_id first."
+            ),
+        }
+
+    return {
+        "status": "found",
+        "request_id": request_id,
+        "latest_image_request_id": latest_request_id,
+        "instruction": (
+            "Use latest_image_request_id as the request_id argument for enque_request_for_auditing_stream when routing criteria are met."
+        ),
+    }
 
 
 @tool
@@ -917,6 +1075,8 @@ def internet_search(query: str, max_results: int = 3) -> str:
 
 orchestrator_tools: list = [
     get_time,
+    save_latest_image_request_id,
+    get_latest_image_request_id,
     enque_request_for_auditing_stream,
     read_status_of_a_case,
     read_soul_md,
