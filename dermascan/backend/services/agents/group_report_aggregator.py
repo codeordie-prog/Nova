@@ -16,12 +16,18 @@ from typing import Any, Optional
 import redis
 from dotenv import load_dotenv
 from langchain.agents import create_agent
+from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from dermascan.shared.logger import get_logger
+from dermascan.shared.langsmith_observability import (
+    build_invoke_config,
+    configure_worker_project,
+)
 
 load_dotenv()
+configure_worker_project("reports")
 
 logger = get_logger(__name__)
 
@@ -90,6 +96,7 @@ def _compile_group_report(
     *,
     group_id: str,
     signal_type: str,
+    request_id: str,
     entries: list[dict[str, Any]],
     fallback_text: str,
 ) -> str:
@@ -113,7 +120,23 @@ def _compile_group_report(
         f"items_json: {json.dumps(entries, default=str)}\n"
     )
     try:
-        response = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
+        config: RunnableConfig = build_invoke_config(
+            thread_id=group_id,
+            checkpoint_ns="group_report",
+            run_name=f"group_report:{signal_type}",
+            flow="signal",
+            request_id=request_id,
+            extra_metadata={
+                "group_id": group_id,
+                "signal_type": signal_type,
+                "item_count": len(entries),
+            },
+            extra_tags=["group_report", signal_type] if signal_type else ["group_report"],
+        )
+        response = agent.invoke(
+            {"messages": [{"role": "user", "content": prompt}]},
+            config=config,
+        )
         structured = response.get("structured_response") if isinstance(response, dict) else None
         if isinstance(structured, CompiledGroupReport):
             text = str(structured.report_text or "").strip()
@@ -203,6 +226,7 @@ def collect_and_compile_if_ready(
         compiled = _compile_group_report(
             group_id=gid,
             signal_type=signal_type,
+            request_id=request_id,
             entries=parsed_items,
             fallback_text=fallback_text,
         )

@@ -34,11 +34,32 @@ from dermascan.rules_engine.knowledge_agent.prompt import system_prompt
 from dermascan.rules_engine.vector_store.build_vectorstore import VectorStore
 from dermascan.shared.logger import get_logger
 
-# Load environment variables
-load_dotenv()
+# Load environment variables (.env overrides empty shell exports)
+load_dotenv(override=True)
 
 # Initialize logger
 logger = get_logger(__name__)
+
+_POSTGRES_PASSWORD_ENV_KEYS: tuple[str, ...] = (
+    "POSTGRESS_PASSWORD",
+    "POSTGRES_PASSWORD",
+    "CLOUD_POSTGRES_PASSWORD",
+    "postgres_password",
+)
+
+
+def _resolve_postgres_password() -> str:
+    """
+    Resolve Postgres password from supported environment variable names.
+
+    Returns:
+        str: Password string, or empty when unset.
+    """
+    for key in _POSTGRES_PASSWORD_ENV_KEYS:
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    return ""
 
 
 class RulesEngine(Engine):
@@ -98,8 +119,16 @@ class RulesEngine(Engine):
         self.postgres_port = os.environ.get("POSTGRES_PORT", "5432")
         self.postgres_database = os.environ.get("POSTGRES_DATABASE", "qutis_db")
         self.postgres_user = os.environ.get("POSTGRES_USER", "postgres")
-        self.postgres_password = os.environ.get("POSTGRESS_PASSWORD", "")
-        self.postgres_table = os.environ.get("POSTGRES_TABLE", "cir_pdfs")
+        self.postgres_password = _resolve_postgres_password()
+        self.postgres_table = (
+            os.environ.get("POSTGRES_TABLE", "").strip()
+            or os.environ.get("POSTGRESS_TABLE", "").strip()
+            or "cir_pdfs"
+        )
+        self.postgres_sslmode = (
+            os.environ.get("POSTGRES_SSLMODE", "").strip()
+            or os.environ.get("CLOUD_POSTGRES_SSLMODE", "").strip()
+        )
 
     @staticmethod
     def _normalize_ingredient(name: str) -> str:
@@ -167,16 +196,24 @@ class RulesEngine(Engine):
         Establish a postgres connection
 
         """
-        if not self.postgres_password:
-            raise ValueError("POSTGRESS_PASSWORD environment variable is required")
+        password = _resolve_postgres_password()
+        if not password:
+            raise ValueError(
+                "Postgres password is required. Set one of: "
+                + ", ".join(_POSTGRES_PASSWORD_ENV_KEYS)
+            )
 
-        return psycopg2.connect(
-            host=self.postgres_host,
-            port=self.postgres_port,
-            database=self.postgres_database,
-            user=self.postgres_user,
-            password=self.postgres_password,
-        )
+        connect_kwargs: dict[str, Any] = {
+            "host": self.postgres_host,
+            "port": self.postgres_port,
+            "database": self.postgres_database,
+            "user": self.postgres_user,
+            "password": password,
+            "connect_timeout": 15,
+        }
+        if self.postgres_sslmode:
+            connect_kwargs["sslmode"] = self.postgres_sslmode
+        return psycopg2.connect(**connect_kwargs)
 
     def _fetch_report_rows(
         self,

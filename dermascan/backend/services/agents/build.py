@@ -1,5 +1,16 @@
+"""
+Author: Dermascan Team
+Date: 6-26-2026
+Licence: MIT
+
+A module for building agents.
+"""
+
+
+
 import os
-from typing import Any, Optional, Type
+import logging
+from typing import Any, Final, Optional, Type
 
 from google.oauth2 import service_account
 from langchain.agents import create_agent
@@ -9,6 +20,8 @@ from langchain_openai import ChatOpenAI
 
 from dermascan.backend.services.agents.memory.redis_checkpointer import setup_from_url
 from dermascan.shared.env_paths import resolve_env_path
+
+_LOGGER: Final[logging.Logger] = logging.getLogger("dermascan.agents.build")
 
 
 
@@ -85,6 +98,7 @@ def build_gemini_chat_model(
     google_location: str,
     gemini_api_key: str = "",
     top_p: float | None = None,
+    thinking_level: str | None = None,
 ) -> ChatGoogleGenerativeAI:
     """
     Build a Gemini chat model with the correct auth mode for the environment.
@@ -95,12 +109,15 @@ def build_gemini_chat_model(
     Args:
         model: Gemini model name.
         temperature: Sampling temperature.
-        max_tokens: Maximum output tokens.
+        max_tokens: Maximum **output** tokens per generation (visible reply +
+            internal reasoning on Gemini 3.x). Does not include input/prompt tokens.
         google_credentials_path: Service-account JSON path for Vertex mode.
         google_project: GCP project ID for Vertex mode.
         google_location: GCP region for Vertex mode.
         gemini_api_key: Google AI Studio API key for non-Vertex mode.
         top_p: Optional nucleus sampling parameter.
+        thinking_level: Gemini 3+ reasoning depth (``minimal``, ``low``, ``medium``,
+            ``high``). Defaults to model default (``high`` on Gemini 3+).
 
     Returns:
         ChatGoogleGenerativeAI: Configured Gemini client.
@@ -115,6 +132,8 @@ def build_gemini_chat_model(
     }
     if top_p is not None:
         kwargs["top_p"] = top_p
+    if thinking_level is not None:
+        kwargs["thinking_level"] = thinking_level
 
     if _use_vertex_ai():
         kwargs["credentials"] = build_google_credentials(path=google_credentials_path)
@@ -130,12 +149,121 @@ def build_gemini_chat_model(
     return ChatGoogleGenerativeAI(**kwargs)
 
 
+_DEFAULT_SUMMARIZATION_GEMINI_MODEL: Final[str] = "gemini-3.1-flash-lite"
+_DEFAULT_MAX_MODEL_LEN: Final[int] = 128000
+_DEFAULT_MAX_OUTPUT_TOKENS: Final[int] = 2048
+_MIN_SUMMARIZATION_TRIGGER_TOKENS: Final[int] = 1500
+_MIN_RESERVED_OVERHEAD_TOKENS: Final[int] = 2048
+_MIN_RESERVED_OUTPUT_TOKENS: Final[int] = 128
+
+
+def compute_summarization_trigger_tokens(
+    *,
+    max_model_len: Optional[int] = None,
+    max_output_tokens: Optional[int] = None,
+    max_trigger_tokens: Optional[int] = None,
+) -> int:
+    """
+    Compute SummarizationMiddleware trigger token budget from model context limits.
+
+    Reserves output tokens and ~20% overhead before summarization kicks in, matching
+    orchestrator worker budgeting.
+
+    Args:
+        max_model_len: Model context window in tokens (env fallback when omitted).
+        max_output_tokens: Max generation tokens per turn (env fallback when omitted).
+        max_trigger_tokens: Optional upper cap (e.g. OpenAI TPM / context budget).
+
+    Returns:
+        int: Token count at which summarization should trigger.
+    """
+    model_len = max_model_len or int(
+        os.getenv(
+            "AGENT_MAX_MODEL_LEN",
+            os.getenv("ORCHESTRATOR_MAX_MODEL_LEN", str(_DEFAULT_MAX_MODEL_LEN)),
+        )
+    )
+    output_tokens = max_output_tokens or int(
+        os.getenv(
+            "AGENT_MAX_TOKENS",
+            os.getenv("ORCHESTRATOR_MAX_TOKENS", str(_DEFAULT_MAX_OUTPUT_TOKENS)),
+        )
+    )
+    reserved_output_tokens = max(_MIN_RESERVED_OUTPUT_TOKENS, output_tokens)
+    reserved_overhead_tokens = max(
+        _MIN_RESERVED_OVERHEAD_TOKENS,
+        int(model_len * 0.20),
+    )
+    trigger_tokens = max(
+        _MIN_SUMMARIZATION_TRIGGER_TOKENS,
+        model_len - reserved_output_tokens - reserved_overhead_tokens,
+    )
+    if max_trigger_tokens is not None:
+        trigger_tokens = min(trigger_tokens, max_trigger_tokens)
+    _LOGGER.info(
+        "summarization budget: model_len=%s output_reserve=%s overhead_reserve=%s trigger_tokens=%s cap=%s",
+        model_len,
+        reserved_output_tokens,
+        reserved_overhead_tokens,
+        trigger_tokens,
+        max_trigger_tokens,
+    )
+    return trigger_tokens
+
+
+def build_summarization_gemini_model(
+    *,
+    google_credentials_path: str,
+    google_project: str,
+    google_location: str,
+    gemini_api_key: str = "",
+    model: Optional[str] = None,
+    max_tokens: Optional[int] = None,
+) -> ChatGoogleGenerativeAI:
+    """
+    Build a lightweight Gemini model for SummarizationMiddleware.
+
+    Uses ``gemini-3.1-flash-lite`` by default (override via ``SUMMARIZATION_GEMINI_MODEL``).
+
+    Args:
+        google_credentials_path: Service-account JSON path for Vertex mode.
+        google_project: GCP project ID for Vertex mode.
+        google_location: GCP region for Vertex mode.
+        gemini_api_key: Google AI Studio API key for non-Vertex mode.
+        model: Optional model name override.
+        max_tokens: Optional max output tokens for summaries.
+
+    Returns:
+        ChatGoogleGenerativeAI: Configured summarization client.
+    """
+    model_name = (
+        model
+        or os.getenv("SUMMARIZATION_GEMINI_MODEL", _DEFAULT_SUMMARIZATION_GEMINI_MODEL)
+    ).strip()
+    output_tokens = max_tokens or int(os.getenv("SUMMARIZATION_MAX_TOKENS", "1024"))
+    return build_gemini_chat_model(
+        model=model_name,
+        temperature=0.0,
+        max_tokens=output_tokens,
+        google_credentials_path=google_credentials_path,
+        google_project=google_project,
+        google_location=google_location,
+        gemini_api_key=gemini_api_key,
+        top_p=0.95,
+    )
+
+
 def build_agent(
     model: Any,
     tools: list,
     checkpointer: Any,
     system_prompt: Optional[str] = None,
     response_format: Optional[Type[Any]] = None,
+    summarization_model: Optional[Any] = None,
+    summarization_trigger_tokens: Optional[int] = None,
+    max_model_len: Optional[int] = None,
+    max_output_tokens: Optional[int] = None,
+    summarization_keep_messages: int = 10,
 ) -> Any:
     """
     Build an agent with the specified model, tools, and checkpointer.
@@ -146,19 +274,29 @@ def build_agent(
         checkpointer: Checkpointer instance for state management
         system_prompt: Optional system prompt to guide the agent's behavior
         response_format: Optional response format to enforce structured output
+        summarization_model: Optional model for SummarizationMiddleware (defaults to ``model``).
+        summarization_trigger_tokens: Optional explicit trigger token budget.
+        max_model_len: Model context window for trigger computation when trigger omitted.
+        max_output_tokens: Max output tokens for trigger computation when trigger omitted.
+        summarization_keep_messages: Recent messages retained after summarization.
     
     Returns:
         Configured agent instance
     """
+    summary_model = summarization_model or model
+    trigger_tokens = summarization_trigger_tokens or compute_summarization_trigger_tokens(
+        max_model_len=max_model_len,
+        max_output_tokens=max_output_tokens,
+    )
     return create_agent(
         model=model,
         tools=tools,
         system_prompt=system_prompt,
         middleware=[
             SummarizationMiddleware(
-                model=model,
-                trigger=("tokens", 1000),
-                keep=("messages", 10),
+                model=summary_model,
+                trigger=("tokens", trigger_tokens),
+                keep=("messages", summarization_keep_messages),
             )
         ],
         checkpointer=checkpointer,
@@ -191,6 +329,7 @@ def initialize_openai_agent(
         checkpointer=checkpointer,
         system_prompt=system_prompt,
         response_format=response_format,
+        max_output_tokens=int(cfg["max_tokens"]),
     )
 
 
@@ -216,10 +355,18 @@ def initialize_google_agent(
         google_location=google_location,
         gemini_api_key=gemini_api_key,
     )
+    summarization_model = build_summarization_gemini_model(
+        google_credentials_path=google_credentials_path,
+        google_project=google_project,
+        google_location=google_location,
+        gemini_api_key=gemini_api_key,
+    )
     return build_agent(
         model=model,
         tools=tools,
         checkpointer=checkpointer,
         system_prompt=system_prompt,
         response_format=response_format,
+        summarization_model=summarization_model,
+        max_output_tokens=int(cfg["max_tokens"]),
     )

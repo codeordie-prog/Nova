@@ -41,6 +41,7 @@ firebase = "^4.0.1"
 firebase-admin = "^7.4.0"
 boto3 = "^1.43.18"
 langchain-google-community = "^4.0.0"
+langsmith = "^0.9.1"
 
 
 [tool.poetry.group.dev.dependencies]

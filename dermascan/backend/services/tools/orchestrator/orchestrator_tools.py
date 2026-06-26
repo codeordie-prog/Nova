@@ -8,9 +8,10 @@ Description: Orchestrator tools for the orchestrator Agent
 import os
 import json
 import time
+import hashlib
 from logging import Logger
 from uuid import uuid4
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from typing import Any
 
@@ -20,6 +21,7 @@ from redis import Redis
 from tavily import TavilyClient
 
 from dermascan.shared.logger import get_logger
+from dermascan.shared.redis_stability import get_redis_client
 
 load_dotenv()
 
@@ -42,9 +44,23 @@ CASE_STATUS_SCAN_MAX: int = max(CASE_STATUS_SCAN_PAGE, int(os.getenv("CASE_STATU
 CASE_STATUS_HISTORY: int = max(1, int(os.getenv("CASE_STATUS_HISTORY", "5")))
 SEARCH_RESULT_CONTENT_CHARS: int = max(200, int(os.getenv("SEARCH_RESULT_CONTENT_CHARS", "700")))
 SEARCH_RESULT_TOTAL_CHARS: int = max(1000, int(os.getenv("SEARCH_RESULT_TOTAL_CHARS", "4500")))
+TAVILY_TIMEOUT_S: float = max(1.0, float(os.getenv("TAVILY_TIMEOUT_S", "12")))
+SEARCH_CACHE_TTL_S: int = max(0, int(os.getenv("SEARCH_CACHE_TTL_S", str(60 * 60 * 6))))
+MEDGEMMA_HEALTH_TIMEOUT_S: float = max(0.5, float(os.getenv("MEDGEMMA_HEALTH_TIMEOUT_S", "3")))
 
 
-_redis: Redis | None = Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+def _init_redis_client() -> Redis | None:
+    """Build a resilient shared Redis client, failing open when unavailable."""
+    if not REDIS_URL:
+        return None
+    try:
+        return get_redis_client(decode_responses=True)
+    except Exception:
+        logger.exception("failed to initialize resilient redis client")
+        return None
+
+
+_redis: Redis | None = _init_redis_client()
 _SOUL_MD_CACHE: str | None = None
 _AUDIT_ENQUEUED_KEY_PREFIX: str = "diagnose:enqueued"
 _AUDIT_ENQUEUED_TTL_SEC: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"))
@@ -53,6 +69,7 @@ _INGRESS_PAYLOAD_CACHE_TTL_SEC: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"
 _LATEST_IMAGE_REQUEST_BY_CLIENT_PREFIX: str = "orchestrator:latest_image_request:client"
 _LATEST_IMAGE_REQUEST_BY_CASE_PREFIX: str = "orchestrator:latest_image_request:case"
 _LATEST_IMAGE_REQUEST_TTL_SEC: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"))
+_SEARCH_CACHE_PREFIX: str = "orchestrator:search_cache"
 
 
 
@@ -487,7 +504,7 @@ def get_time() -> str:
     Useful when you need to know the current time
     """
     logger.info(f"TOOL CALL: get_time")
-    return datetime.now().isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 @tool
@@ -687,7 +704,11 @@ def enque_request_for_auditing_stream(request_id: str, collected_context: str = 
         }
 
     merged_payload = _merge_collected_context_into_payload(canonical_payload, collected_context)
-    logger.info(f"TOOL CALL: merged_payload={merged_payload}")
+    logger.debug(
+        "audit tool merged payload prepared: request_id=%s bytes=%s",
+        envelope["request_id"],
+        len(merged_payload),
+    )
 
     try:
         merged_obj: dict[str, Any] = json.loads(merged_payload)
@@ -752,6 +773,19 @@ def enque_request_for_auditing_stream(request_id: str, collected_context: str = 
             "request_id": envelope["request_id"],
             "detail": f"audit dispatch failed: {exc}",
         }
+
+    # Backpressure is not a successful enqueue. Clear the dedupe guard so the
+    # request can be retried later, and do not emit a routed event.
+    if result.get("status") == "under_pressure":
+        if _redis is not None:
+            try:
+                _redis.delete(dedupe_key)
+            except Exception:
+                logger.exception(
+                    "failed to clear dedupe key after backpressure: request_id=%s",
+                    envelope["request_id"],
+                )
+        return result
 
     _emit_orchestrator_event(
         {
@@ -1005,6 +1039,104 @@ def _format_tavily_results(result: dict[str, Any], *, max_results: int) -> str:
     return text[:SEARCH_RESULT_TOTAL_CHARS] + "...<truncated>"
 
 
+def _search_cache_key(
+    *, label: str, query: str, include_domains: list[str], max_results: int, search_depth: str
+) -> str:
+    """Build a deterministic Redis cache key for a search invocation."""
+    raw = json.dumps(
+        {
+            "l": label,
+            "q": query.strip().lower(),
+            "d": sorted(include_domains),
+            "n": max_results,
+            "s": search_depth,
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    return f"{_SEARCH_CACHE_PREFIX}:{digest}"
+
+
+def _run_tavily_search(
+    *,
+    label: str,
+    query: str,
+    max_results: int,
+    include_domains: list[str],
+    search_depth: str = "",
+) -> str:
+    """
+    Execute a Tavily search with caching, a bounded timeout, and a terminal
+    failure directive so the agent degrades gracefully instead of looping.
+
+    Args:
+        label: Human-readable tool label used in logs and cache keys.
+        query: Search query string.
+        max_results: Already-capped number of results to retrieve.
+        include_domains: Domain allowlist for the search.
+        search_depth: Optional Tavily search depth (e.g. "advanced").
+
+    Returns:
+        Compact JSON results string, a not-configured notice, or a terminal
+        failure directive string.
+    """
+    client = _get_tavily_client()
+    if client is None:
+        return "Tavily is not configured. Set TAVILY_API_KEY to enable internet research."
+
+    logger.info("TOOL CALL: %s search: query=%s, max_results=%s", label, query, max_results)
+
+    cache_key = _search_cache_key(
+        label=label,
+        query=query,
+        include_domains=include_domains,
+        max_results=max_results,
+        search_depth=search_depth,
+    )
+    if _redis is not None and SEARCH_CACHE_TTL_S > 0:
+        try:
+            cached = _redis.get(cache_key)
+            if cached:
+                logger.info("TOOL CALL CACHE HIT: %s search: query=%s", label, query)
+                return str(cached)
+        except Exception:
+            logger.exception("failed to read search cache: key=%s", cache_key)
+
+    search_kwargs: dict[str, Any] = {
+        "query": query,
+        "max_results": max_results,
+        "include_domains": include_domains,
+        "timeout": TAVILY_TIMEOUT_S,
+    }
+    if search_depth:
+        search_kwargs["search_depth"] = search_depth
+
+    try:
+        result = client.search(**search_kwargs)
+        formatted = _format_tavily_results(result, max_results=max_results)
+    except Exception as exc:
+        logger.warning("%s search failed: query=%s err=%s", label, query, exc)
+        return (
+            f"{label} search failed ({exc}). Do NOT call this tool again in this turn. "
+            "Answer the user from your existing knowledge and clearly note that live "
+            "research was unavailable."
+        )
+
+    if _redis is not None and SEARCH_CACHE_TTL_S > 0 and formatted:
+        try:
+            _redis.setex(cache_key, SEARCH_CACHE_TTL_S, formatted)
+        except Exception:
+            logger.exception("failed to write search cache: key=%s", cache_key)
+
+    logger.info(
+        "TOOL CALL SUCCESS: %s search: query=%s result_chars=%s",
+        label,
+        query,
+        len(formatted),
+    )
+    return formatted
+
+
 @tool
 def wikipedia_search(query: str, max_results: int = 3) -> str:
     """
@@ -1018,21 +1150,12 @@ def wikipedia_search(query: str, max_results: int = 3) -> str:
         query: Search query string.
         max_results: Maximum number of results to retrieve (capped internally).
     """
-    client = _get_tavily_client()
-    if client is None:
-        return "Tavily is not configured. Set TAVILY_API_KEY to enable internet research."
-
-    logger.info(f"TOOL CALL: wikipedia_search: query={query}, max_results={max_results}")
-    try:
-        capped_results = max(1, min(max_results, 5))
-        result = client.search(
-            query=query,
-            max_results=capped_results,
-            include_domains=["wikipedia.org"],
-        )
-        return _format_tavily_results(result, max_results=capped_results)
-    except Exception as exc:
-        return f"Wikipedia search failed: {exc}"
+    return _run_tavily_search(
+        label="Wikipedia",
+        query=query,
+        max_results=max(1, min(max_results, 5)),
+        include_domains=["wikipedia.org"],
+    )
 
 
 @tool
@@ -1048,28 +1171,87 @@ def internet_search(query: str, max_results: int = 3) -> str:
         query: Search query string.
         max_results: Maximum number of results to retrieve (capped internally).
     """
-    client = _get_tavily_client()
-    if client is None:
-        return "Tavily is not configured. Set TAVILY_API_KEY to enable internet research."
+    return _run_tavily_search(
+        label="Internet",
+        query=query,
+        max_results=max(1, min(max_results, 3)),
+        include_domains=["mayoclinic.org", "webmd.com", "healthline.com", "cdc.gov", "nih.gov", "mydawa.com"],
+        search_depth="advanced",
+    )
 
-    logger.info(f"TOOL CALL: internet_search: query={query}, max_results={max_results}")
+
+@tool
+def check_medgemma_health() -> dict[str, str]:
+    """
+    Check whether the image-audit (MedGemma) service is reachable before routing.
+
+    Use this BEFORE enqueueing an image audit when you are unsure the analysis
+    service is available, or after a prior dispatch reported pressure. It performs
+    a lightweight, non-mutating reachability probe and never enqueues anything.
+
+    Returns:
+        A dict with:
+            - `status`: `healthy`, `degraded`, or `unavailable`
+            - `endpoint`: the probed gateway URL
+            - `retry_after_seconds`: present when the service is rate-limited
+            - `instruction`: terminal guidance on whether to enqueue now
+    """
+    logger.info("TOOL CALL: check_medgemma_health")
+
+    base = MEDGEMMA_GATEWAY_URL.rstrip("/")
+    # `/jobs/{id}` returns 404 for unknown ids; any HTTP response proves the
+    # gateway is reachable without creating or mutating a job.
+    endpoint = f"{base}/jobs/__health_probe__"
+    timeout = httpx.Timeout(
+        timeout=MEDGEMMA_HEALTH_TIMEOUT_S,
+        connect=MEDGEMMA_ENDPOINT_CONNECT_TIMEOUT_S,
+    )
+
     try:
-        capped_results = max(1, min(max_results, 3))
-        result = client.search(
-            query=query,
-            max_results=capped_results,
-            search_depth="advanced",
-            include_domains=["mayoclinic.org", "webmd.com", "healthline.com", "cdc.gov", "nih.gov", "mydawa.com"],
-        )
-        formatted = _format_tavily_results(result, max_results=capped_results)
-        logger.info(
-            "TOOL CALL SUCCESS: internet_search: query=%s result_chars=%s",
-            query,
-            len(formatted),
-        )
-        return formatted
-    except Exception as exc:
-        return f"Internet search failed: {exc}"
+        response = httpx.get(endpoint, timeout=timeout)
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+        return {
+            "status": "unavailable",
+            "endpoint": endpoint,
+            "detail": f"health probe failed: {exc}",
+            "instruction": (
+                "The image-audit service is currently unreachable. Do NOT enqueue an image audit now. "
+                "Tell the user the analysis service is temporarily unavailable and to try again shortly."
+            ),
+        }
+
+    if response.status_code == 429:
+        retry_after = _parse_retry_after_seconds(response.headers.get("Retry-After", ""))
+        return {
+            "status": "degraded",
+            "endpoint": endpoint,
+            "retry_after_seconds": retry_after or "1",
+            "instruction": (
+                "The image-audit service is under heavy load. Avoid enqueueing right now and "
+                "tell the user that processing may be delayed."
+            ),
+        }
+
+    if response.status_code >= 500:
+        return {
+            "status": "degraded",
+            "endpoint": endpoint,
+            "detail": f"health probe returned HTTP {response.status_code}",
+            "instruction": (
+                "The image-audit service reports a degraded state. Enqueue only if necessary and "
+                "warn the user of possible delays."
+            ),
+        }
+
+    # 2xx and 4xx (including the expected 404) both prove the gateway is up.
+    return {
+        "status": "healthy",
+        "endpoint": endpoint,
+        "instruction": (
+            "The image-audit service is reachable. You may enqueue image audits as needed. "
+            "Do NOT call this tool again in this turn."
+        ),
+    }
 
 
 
@@ -1079,7 +1261,10 @@ orchestrator_tools: list = [
     get_latest_image_request_id,
     enque_request_for_auditing_stream,
     read_status_of_a_case,
+    check_medgemma_health,
     read_soul_md,
     wikipedia_search,
     internet_search,
 ]
+
+

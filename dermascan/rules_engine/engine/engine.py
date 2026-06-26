@@ -1,4 +1,9 @@
-"""Typed interface contracts for the Rules Engine."""
+"""
+Author: Dermascan Team
+Date: 14-6-2026
+Licence: MIT
+
+Typed interface contracts for the Rules Engine."""
 
 from __future__ import annotations
 

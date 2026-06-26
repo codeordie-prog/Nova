@@ -13,6 +13,10 @@ import redis
 from dotenv import load_dotenv
 
 from dermascan.shared.logger import get_logger
+from dermascan.shared.stream_pipeline_tracing import (
+    log_pipeline_tracing_status,
+    run_traced_stream_handler,
+)
 from dermascan.shared.redis_stability import (
     check_redis_connectivity,
     get_redis_client,
@@ -818,6 +822,7 @@ def run_worker_forever() -> None:
     check_redis_connectivity(decode_responses=True)
     _ensure_consumer_group()
     logger.info("outbound sender started: stream=%s group=%s consumer=%s", OUTBOUND_STREAM, OUTBOUND_CONSUMER_GROUP, OUTBOUND_CONSUMER_NAME)
+    log_pipeline_tracing_status("outbound")
 
     stop_event = threading.Event()
 
@@ -872,9 +877,18 @@ def run_worker_forever() -> None:
                             _ack_delete(mid)
                             continue
                     try:
-                        # How do we reply - if chaos Mode reply to target, otherwise reply to message id
                         should_thread, target = _threading_decision(fields, chaos_mode)
-                        _deliver(fields, reply_to_message_id=target if should_thread else None)
+                        run_traced_stream_handler(
+                            stream=OUTBOUND_STREAM,
+                            group=OUTBOUND_CONSUMER_GROUP,
+                            consumer=OUTBOUND_CONSUMER_NAME,
+                            msg_id=mid,
+                            fields=fields,
+                            handler=lambda: _deliver(
+                                fields,
+                                reply_to_message_id=target if should_thread else None,
+                            ),
+                        )
                         _ack_delete(mid)
 
                         # Mark as processed for idempotency

@@ -24,6 +24,8 @@ from dataclasses import dataclass
 
 from redis import Redis
 
+from dermascan.shared.stream_pipeline_tracing import enrich_stream_fields, record_stream_produce
+
 # load environment variables
 load_dotenv()
 
@@ -378,8 +380,7 @@ def _push_signal(
     else:
         notes = f"The {mode} inference completed above threshold"
 
-    _redis.xadd(
-        _ORCHESTRATOR_SIGNAL_STREAM,
+    signal_fields = enrich_stream_fields(
         {
             "signal_type": signal_type,
             "signal_id": entry.msg_id,
@@ -417,10 +418,21 @@ def _push_signal(
                 }
             ),
             "notes": notes,
-        },
-        maxlen=_EVENTS_STREAM_MAXLEN,
-        approximate=True,
-
+        }
+    )
+    msg_id = str(
+        _redis.xadd(
+            _ORCHESTRATOR_SIGNAL_STREAM,
+            signal_fields,
+            maxlen=_EVENTS_STREAM_MAXLEN,
+            approximate=True,
+        )
+    )
+    record_stream_produce(
+        stream=_ORCHESTRATOR_SIGNAL_STREAM,
+        msg_id=msg_id,
+        fields=signal_fields,
+        extra_metadata={"worker": "medgemma_postprocess", "signal_type": signal_type},
     )
 
 

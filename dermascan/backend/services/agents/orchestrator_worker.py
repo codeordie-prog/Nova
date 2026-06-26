@@ -36,6 +36,8 @@ from dermascan.backend.services.agents.loader import load_agent_configurations
 from dermascan.backend.services.agents.build import (
     open_checkpointer_url,
     build_gemini_chat_model,
+    build_summarization_gemini_model,
+    compute_summarization_trigger_tokens,
 )
 from dermascan.backend.services.agents.product_rules_signal_helper import (
     run_product_signal_rules_flow,
@@ -65,10 +67,22 @@ from dermascan.backend.services.agents.memory.redis_checkpointer import (
     delete_thread as delete_checkpoint_thread,
 )
 from dermascan.shared import agent_call_tracer
+from dermascan.shared.langsmith_observability import (
+    build_invoke_config,
+    configure_worker_project,
+    log_tracing_status,
+)
+from dermascan.shared.stream_pipeline_tracing import (
+    enrich_stream_fields,
+    log_pipeline_tracing_status,
+    record_stream_produce,
+    run_traced_stream_handler,
+)
 
 
 # Load environment variables
 load_dotenv()
+configure_worker_project("orchestrator")
 
 # Get env variables
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY_QUTIS", "")
@@ -78,7 +92,10 @@ PROJECT_ID: str = os.getenv("GOOGLE_CLOUD_PROJECT_QUTIS", "qutisai")
 # Gemini 3.x models require the global Vertex endpoint on this project.
 LOCATION: str = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
 ORCHESTRATOR_GEMINI_MODEL: str = os.getenv(
-    "ORCHESTRATOR_GEMINI_MODEL", "gemini-3.1-flash-lite"
+    "ORCHESTRATOR_GEMINI_MODEL", "gemini-3.5-flash"
+)
+ORCHESTRATOR_GEMINI_THINKING_LEVEL: str = os.getenv(
+    "ORCHESTRATOR_GEMINI_THINKING_LEVEL", "minimal"
 )
 REDIS_URL: str = os.getenv("REDIS_URL", "")
 BASE_DIR: str = os.path.dirname(__file__)
@@ -86,7 +103,12 @@ CONFIG_PATH: str = os.path.join(BASE_DIR, "configurations", "agents_config.json"
 
 # Orchestrator LLM chain: OpenAI GPT-4o (primary, tool calling) -> Gemini (fallback).
 ORCHESTRATOR_MAX_MODEL_LEN: int = int(os.getenv("ORCHESTRATOR_MAX_MODEL_LEN", "128000"))
-ORCHESTRATOR_MAX_TOKENS: int = int(os.getenv("ORCHESTRATOR_MAX_TOKENS", "1000"))
+ORCHESTRATOR_MAX_TOKENS: int = int(os.getenv("ORCHESTRATOR_MAX_TOKENS", "2048"))
+# Cap summarization trigger so OpenAI primary stays under typical TPM / context limits.
+ORCHESTRATOR_OPENAI_SUMMARIZATION_TRIGGER_TOKENS: int = max(
+    1500,
+    int(os.getenv("ORCHESTRATOR_OPENAI_SUMMARIZATION_TRIGGER_TOKENS", "24000")),
+)
 _PROVIDER_MAX_RETRIES_HARD_CAP: int = 3
 OPENAI_REQUEST_TIMEOUT_S: float = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"))
 OPENAI_MAX_RETRIES: int = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("OPENAI_MAX_RETRIES", "2"))))
@@ -109,7 +131,7 @@ ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION: bool = os.getenv(
 DEFAULT_CONFIG: List[Dict[str, Any]] = [{
         "name": "orchestrator-google",
         "description": "Conversational Agent for orchestrating the diagnosis process",
-        "model":"gemini-3.1-flash-lite",
+        "model":"gemini-3.5-flash",
         "temperature": 0.0,
         "max_tokens": 1000,
         "top_p": 0.95,
@@ -525,8 +547,7 @@ def _enqueue_outbound(
 
     priority = 10 if kind == "signal_update" else 20
     sequence = _redis.incr(f"outbound:seq:{client_id}")
-    _redis.xadd(
-        OUTBOUND_STREAM,
+    stream_fields = enrich_stream_fields(
         {
             "client_id": client_id,
             "case_id": case_id,
@@ -540,9 +561,21 @@ def _enqueue_outbound(
             "text": body,
             "dedupe_key": f"{kind}:{request_id}:{case_id}",
             "reply_to_message_id": str(reply_to_message_id or ""),
-        },
-        maxlen=WORKERS_STREAM_MAXLEN,
-        approximate=True,
+        }
+    )
+    msg_id = str(
+        _redis.xadd(
+            OUTBOUND_STREAM,
+            stream_fields,
+            maxlen=WORKERS_STREAM_MAXLEN,
+            approximate=True,
+        )
+    )
+    record_stream_produce(
+        stream=OUTBOUND_STREAM,
+        msg_id=msg_id,
+        fields=stream_fields,
+        extra_metadata={"worker": "orchestrator", "kind": kind},
     )
 
 
@@ -842,11 +875,14 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
             "OpenAI primary provider required: set OPENAI_API_KEY_QUTIS"
         )
 
+    gemini_model_name: str = ORCHESTRATOR_GEMINI_MODEL or str(google_cfg["model"])
+
     gemini_model = build_gemini_chat_model(
-        model=google_cfg["model"],
+        model=gemini_model_name,
         temperature=google_cfg["temperature"],
-        max_tokens=google_cfg["max_tokens"],
+        max_tokens=ORCHESTRATOR_MAX_TOKENS,
         top_p=google_cfg["top_p"],
+        thinking_level=ORCHESTRATOR_GEMINI_THINKING_LEVEL,
         google_credentials_path=CRED_PATH,
         google_project=PROJECT_ID,
         google_location=LOCATION,
@@ -856,7 +892,7 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
     openai_model = ChatOpenAI(
         model=openai_cfg["model"],
         temperature=openai_cfg["temperature"],
-        max_tokens=openai_cfg["max_tokens"],
+        max_tokens=ORCHESTRATOR_MAX_TOKENS,
         api_key=OPENAI_API_KEY,
         timeout=OPENAI_REQUEST_TIMEOUT_S,
         # Avoid SDK-level 429 retries; middleware fails over to Gemini immediately.
@@ -865,13 +901,15 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
 
     model_chain: List[tuple[str, Any]] = [
         (f"openai:{openai_cfg['model']}", openai_model),
-        (f"gemini:{google_cfg['model']}", gemini_model),
+        (f"gemini:{gemini_model_name}", gemini_model),
     ]
     primary_model: Any = openai_model
 
     logger.info(
-        "orchestrator model chain: %s",
+        "orchestrator model chain: %s (gemini fallback thinking_level=%s, max_tokens=%s)",
         " -> ".join(name for name, _ in model_chain),
+        ORCHESTRATOR_GEMINI_THINKING_LEVEL,
+        ORCHESTRATOR_MAX_TOKENS,
     )
 
     provider_breakers: dict[str, CircuitBreaker] = {
@@ -936,21 +974,17 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
                 )
         raise last_exc if last_exc is not None else RuntimeError("model chain empty")
 
-    reserved_output_tokens: int = max(128, ORCHESTRATOR_MAX_TOKENS)
-    reserved_overhead_tokens: int = max(
-        2048,
-        int(ORCHESTRATOR_MAX_MODEL_LEN * 0.20),
+    summarization_trigger_tokens: int = compute_summarization_trigger_tokens(
+        max_model_len=ORCHESTRATOR_MAX_MODEL_LEN,
+        max_output_tokens=ORCHESTRATOR_MAX_TOKENS,
+        max_trigger_tokens=ORCHESTRATOR_OPENAI_SUMMARIZATION_TRIGGER_TOKENS,
     )
-    summarization_trigger_tokens: int = max(
-        1500,
-        ORCHESTRATOR_MAX_MODEL_LEN - reserved_output_tokens - reserved_overhead_tokens,
-    )
-    logger.info(
-        "summarization budget: model_len=%s output_reserve=%s overhead_reserve=%s trigger_tokens=%s",
-        ORCHESTRATOR_MAX_MODEL_LEN,
-        reserved_output_tokens,
-        reserved_overhead_tokens,
-        summarization_trigger_tokens,
+
+    summarization_model = build_summarization_gemini_model(
+        google_credentials_path=CRED_PATH,
+        google_project=PROJECT_ID,
+        google_location=LOCATION,
+        gemini_api_key=GEMINI_API_KEY,
     )
 
     return create_agent(
@@ -960,7 +994,7 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         middleware=[
             dynamic_model_selection,
             SummarizationMiddleware(
-                model=primary_model,
+                model=summarization_model,
                 trigger=("tokens", summarization_trigger_tokens),
                 keep=("messages", 6),
             ),
@@ -1057,7 +1091,14 @@ def _reader_loop(
         for msg_id, fields in messages:
             def _run(_mid: str = str(msg_id), _fields: dict[str, Any] = fields) -> None:
                 try:
-                    handler(agent, _mid, _fields)
+                    run_traced_stream_handler(
+                        stream=stream,
+                        group=group,
+                        consumer=consumer,
+                        msg_id=_mid,
+                        fields=_fields,
+                        handler=lambda: handler(agent, _mid, _fields),
+                    )
                 except Exception:
                     # Handlers are expected to handle their own errors (DLQ + ack).
                     # This is a last-resort guard so a bug cannot leak a slot.
@@ -1168,8 +1209,6 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                 client_id, observed_signal.get("signal_type") or "unknown",
             )
 
-        # Mark our own flow as in-flight so a concurrently arriving signal can
-        # decide (today: does not wait; future: may read for context).
         _set_inflight(
             "job",
             client_id,
@@ -1191,13 +1230,18 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             username=username,
             payload_json=payload_json,
         )
-        config: RunnableConfig = {
-            "configurable": {
-                "thread_id": client_id,
-                "checkpoint_ns": "orchestrator",
-            },
-            "recursion_limit": AGENT_RECURSION_LIMIT,
-        }
+        config: RunnableConfig = build_invoke_config(
+            thread_id=client_id,
+            checkpoint_ns="orchestrator",
+            run_name="orchestrator:job",
+            channel=channel,
+            flow="job",
+            client_id=client_id,
+            request_id=request_id,
+            case_id=case_id,
+            message_id=message_id,
+            recursion_limit=AGENT_RECURSION_LIMIT,
+        )
         cache_ingress_payload(
             request_id=request_id,
             case_id=case_id,
@@ -1236,7 +1280,6 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             payload_obj = {}
         user_text = str(((payload_obj.get("content") or {}).get("text") or "")).strip()
 
-        # Append to conversational Log
         _append_conversation_log(
             client_id,
             role="user",
@@ -1252,7 +1295,6 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             case_id=case_id,
         )
 
-        # Add to outbound stream
         _enqueue_outbound(
             client_id=client_id,
             case_id=case_id,
@@ -1264,24 +1306,18 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             reply_to_message_id=message_id,
         )
 
-        # Acknowledge the job stream message and delete it from the stream
         _redis.xack(ORCHESTRATOR_JOB_STREAM, ORCHESTRATOR_CONSUMER_GROUP, msg_id)
         _redis.xdel(ORCHESTRATOR_JOB_STREAM, msg_id)
 
-        # Mark as processed for idempotency
         reclaim_logic.mark_processed(ORCHESTRATOR_JOB_STREAM, msg_id)
 
     except Exception as exc:
 
-        # Finalize the trace for this turn (no-op if already ended on success).
         agent_call_tracer.end_turn(status="failed", error=str(exc))
 
-        # If the turn failed due to a recursion/loop, the persisted thread state
-        # is likely poisoned. Reset it so subsequent messages start clean.
         if ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION and _is_recursion_error(exc):
             _reset_client_checkpoint(client_id)
 
-        # Always send the client a graceful reply so a failure is never silent.
         try:
             _enqueue_outbound(
                 client_id=client_id,
@@ -1296,7 +1332,6 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         except Exception:
             logger.exception("failed to enqueue fallback reply: request_id=%s", request_id)
 
-        # Add the failed job to the dead letter queue
         _redis.xadd(
             ORCHESTRATOR_DLQ_STREAM,
             {
@@ -1309,14 +1344,11 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             maxlen=WORKERS_STREAM_MAXLEN,
             approximate=True,
         )
-        # Acknowledge the job stream message and delete it from the job stream
         _redis.xack(ORCHESTRATOR_JOB_STREAM, ORCHESTRATOR_CONSUMER_GROUP, msg_id)
         _redis.xdel(ORCHESTRATOR_JOB_STREAM, msg_id)
         logger.exception("orchestrator job failed: request_id=%s client_id=%s", request_id, client_id)
 
     finally:
-        # Always clear the job in-flight marker so a queued peer flow can proceed
-        # without waiting for the TTL to expire.
         _del_inflight("job", client_id)
 
 
@@ -1562,15 +1594,22 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                 conversation_entries=conversation_entries,
                 research_context=research_context,
             )
-            config: RunnableConfig = {
-                "configurable": {
-                    "thread_id": client_id,
-                    # Separate namespace prevents races with concurrent job-flow
-                    # invokes on the same client_id (jobs use ns="orchestrator").
-                    "checkpoint_ns": "orchestrator:signal",
+            config: RunnableConfig = build_invoke_config(
+                thread_id=client_id,
+                checkpoint_ns="orchestrator:signal",
+                run_name=f"orchestrator:signal",
+                channel=channel,
+                flow="signal",
+                client_id=client_id,
+                request_id=request_id,
+                case_id=case_id,
+                message_id=str(fields.get("message_id") or request_id),
+                recursion_limit=AGENT_RECURSION_LIMIT,
+                extra_metadata={
+                    "signal_type": str(fields.get("signal_type") or ""),
+                    "signal_id": str(fields.get("signal_id") or ""),
                 },
-                "recursion_limit": AGENT_RECURSION_LIMIT,
-            }
+            )
             agent_call_tracer.start_turn(
                 request_id=request_id,
                 case_id=case_id,
@@ -1701,6 +1740,9 @@ def run_worker_forever() -> None:
     # Expose the checkpointer for poisoned-thread resets on recursion failures.
     global _checkpointer
     _checkpointer = checkpointer
+
+    log_tracing_status("orchestrator")
+    log_pipeline_tracing_status("orchestrator")
 
     # Initialize the dynamic agent (shared by both readers; safe because the
     # agent is invoked via thread-safe checkpointer state per thread_id).

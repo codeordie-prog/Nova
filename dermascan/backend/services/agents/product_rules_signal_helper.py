@@ -11,7 +11,7 @@ import json
 import os
 import re
 import time
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
@@ -29,10 +29,20 @@ from dermascan.backend.services.agents.provider_circuit_breaker import (
 from dermascan.rules_engine.engine.engine import RulesEngineRequest
 from dermascan.rules_engine.engine.rules_engine import RulesEngine
 from dermascan.shared.logger import get_logger
+from dermascan.shared.langsmith_observability import (
+    build_invoke_config,
+    configure_worker_project,
+)
 from dermascan.shared.redis_stability import get_redis_client, run_with_redis_retries
+from langchain_core.runnables import RunnableConfig
 
+# Load env variables
 load_dotenv()
 
+# Configure worker project
+configure_worker_project("signal_rules")
+
+# Initialize logger
 logger = get_logger(__name__)
 
 TAVILY_API_KEY = str(os.getenv("TAVILY_API_KEY_QUTIS", ""))
@@ -41,7 +51,9 @@ OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY_QUTIS", ""))
 OPENAI_MODEL_NAME = str(os.getenv("ORCHESTRATOR_OPENAI_MODEL") or os.getenv("OPENAI_MODEL_NAME") or "gpt-4o")
 OPENAI_REQUEST_TIMEOUT_S = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"))
 OPENAI_MAX_RETRIES = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("OPENAI_MAX_RETRIES", "2"))))
-GEMINI_MODEL_NAME = str(os.getenv("ORCHESTRATOR_GEMINI_MODEL", "gemini-3.1-flash-lite"))
+GEMINI_MODEL_NAME = str(os.getenv("REPORT_AGENT_MODEL", "gemini-3.5-flash"))
+GEMINI_THINKING_LEVEL = str(os.getenv("ORCHESTRATOR_GEMINI_THINKING_LEVEL", "minimal"))
+ORCHESTRATOR_MAX_TOKENS = max(256, int(os.getenv("ORCHESTRATOR_MAX_TOKENS", "2048")))
 GEMINI_API_KEY = str(os.getenv("GEMINI_API_KEY_QUTIS", ""))
 GOOGLE_CREDENTIALS_PATH = str(os.getenv("GOOGLE_APPLICATION_CREDENTIALS_QUTIS", ""))
 GOOGLE_PROJECT_ID = str(
@@ -52,8 +64,9 @@ GOOGLE_LOCATION = str(os.getenv("GOOGLE_CLOUD_LOCATION", "global"))
 _SKIN_AUDIT_KEY_TEMPLATE = "client:{client_id}:skin_profile"
 _SKIN_AUDIT_TTL_S = max(60, int(os.getenv("SKIN_AUDIT_TTL_S", str(60 * 60 * 24 * 30))))
 
+# Define response models
 class IngredientExtractionResponse(BaseModel):
-    """Structured output from product ingredient extraction agent."""
+    """Structured response model for extracted ingredients from the product ingredient extraction agent."""
 
     ingredients: list[str] = Field(default_factory=list)
     notes: str = ""
@@ -79,7 +92,7 @@ _gemini_breaker: CircuitBreaker = load_gemini_circuit_breaker()
 
 def _build_openai_model() -> ChatOpenAI:
     """
-    Build the OpenAI GPT-4o client for rules-flow subagents (tool calling).
+    Build the OpenAI fallback client for rules-flow subagents (tool calling).
 
     Returns:
         ChatOpenAI: Configured OpenAI client.
@@ -96,12 +109,13 @@ def _build_openai_model() -> ChatOpenAI:
         timeout=OPENAI_REQUEST_TIMEOUT_S,
         max_retries=0,
         temperature=0,
+        max_tokens=ORCHESTRATOR_MAX_TOKENS,
     )
 
 
 def _build_gemini_model() -> Any:
     """
-    Build the Gemini fallback client for rules-flow subagents.
+    Build the Gemini primary client for rules-flow subagents.
 
     Returns:
         Any: Configured Gemini chat model.
@@ -109,7 +123,8 @@ def _build_gemini_model() -> Any:
     return build_gemini_chat_model(
         model=GEMINI_MODEL_NAME,
         temperature=0,
-        max_tokens=1000,
+        max_tokens=ORCHESTRATOR_MAX_TOKENS,
+        thinking_level=GEMINI_THINKING_LEVEL,
         google_credentials_path=GOOGLE_CREDENTIALS_PATH,
         google_project=GOOGLE_PROJECT_ID,
         google_location=GOOGLE_LOCATION,
@@ -117,15 +132,15 @@ def _build_gemini_model() -> Any:
     )
 
 
-def _should_failover_to_gemini(exc: Exception) -> bool:
+def _should_failover_to_openai(exc: Exception) -> bool:
     """
-    Return True when OpenAI failure should trigger Gemini fallback.
+    Return True when Gemini failure should trigger OpenAI fallback.
 
     Args:
         exc: Raised exception from the primary provider.
 
     Returns:
-        bool: True when Gemini should be attempted next.
+        bool: True when OpenAI should be attempted next.
     """
     return _should_retry_provider_error(exc)
 
@@ -161,18 +176,30 @@ def _should_retry_provider_error(exc: Exception) -> bool:
     return any(marker in text for marker in markers)
 
 
-def _invoke_agent_once(*, agent: Any, prompt: str) -> dict[str, Any]:
+def _invoke_agent_once(
+    *,
+    agent: Any,
+    prompt: str,
+    invoke_config: Optional[RunnableConfig] = None,
+) -> dict[str, Any]:
     """
     Invoke an agent once and normalize the response shape.
 
     Args:
         agent: Agent instance.
         prompt: User prompt.
+        invoke_config: Optional LangSmith/checkpointer invoke config.
 
     Returns:
         dict[str, Any]: Agent invoke response.
     """
-    response = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
+    if invoke_config is not None:
+        response = agent.invoke(
+            {"messages": [{"role": "user", "content": prompt}]},
+            config=invoke_config,
+        )
+    else:
+        response = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
     return response if isinstance(response, dict) else {}
 
 
@@ -182,13 +209,14 @@ def _invoke_with_retry(
     fallback_agent: Any,
     prompt: str,
     operation: str,
+    invoke_config: Optional[RunnableConfig] = None,
 ) -> dict[str, Any]:
     """
-    Invoke OpenAI first, then Gemini on rate limits or circuit-open state.
+    Invoke Gemini first, then OpenAI on rate limits or circuit-open state.
 
     Args:
-        primary_agent: OpenAI-backed agent.
-        fallback_agent: Gemini-backed fallback agent.
+        primary_agent: Gemini-backed agent.
+        fallback_agent: OpenAI-backed fallback agent.
         prompt: The prompt for the agent.
         operation: The operation carried out (skin or product review research).
 
@@ -198,36 +226,56 @@ def _invoke_with_retry(
     Raises:
         RuntimeError: When both providers fail or circuits are open.
     """
-    if not _openai_breaker.allow():
+    if not _gemini_breaker.allow():
         logger.warning(
-            "openai circuit open (state=%s); using gemini for %s",
-            _openai_breaker.state,
+            "gemini circuit open (state=%s); using openai for %s",
+            _gemini_breaker.state,
             operation,
         )
-        return _invoke_gemini_once(agent=fallback_agent, prompt=prompt, operation=operation)
+        return _invoke_openai_once(
+            agent=fallback_agent,
+            prompt=prompt,
+            operation=operation,
+            invoke_config=invoke_config,
+        )
 
     try:
-        response = _invoke_agent_once(agent=primary_agent, prompt=prompt)
-        _openai_breaker.record_success()
+        response = _invoke_agent_once(
+            agent=primary_agent,
+            prompt=prompt,
+            invoke_config=invoke_config,
+        )
+        _gemini_breaker.record_success()
         return response
     except Exception as exc:
-        _openai_breaker.record_failure()
-        if not _should_failover_to_gemini(exc):
+        _gemini_breaker.record_failure()
+        if not _should_failover_to_openai(exc):
             raise
         logger.warning(
-            "%s openai failed (%s); failing over to gemini",
+            "%s gemini failed (%s); failing over to openai",
             operation,
             exc,
         )
-        return _invoke_gemini_once(agent=fallback_agent, prompt=prompt, operation=operation)
+        return _invoke_openai_once(
+            agent=fallback_agent,
+            prompt=prompt,
+            operation=operation,
+            invoke_config=invoke_config,
+        )
 
 
-def _invoke_gemini_once(*, agent: Any, prompt: str, operation: str) -> dict[str, Any]:
+def _invoke_openai_once(
+    *,
+    agent: Any,
+    prompt: str,
+    operation: str,
+    invoke_config: Optional[RunnableConfig] = None,
+) -> dict[str, Any]:
     """
-    Invoke the Gemini fallback agent with circuit-breaker guarding.
+    Invoke the OpenAI fallback agent with circuit-breaker guarding.
 
     Args:
-        agent: Gemini-backed agent.
+        agent: OpenAI-backed agent.
         prompt: User prompt.
         operation: Operation name for logging/errors.
 
@@ -235,18 +283,22 @@ def _invoke_gemini_once(*, agent: Any, prompt: str, operation: str) -> dict[str,
         dict[str, Any]: Agent invoke response.
 
     Raises:
-        RuntimeError: When the Gemini circuit is open or the call fails.
+        RuntimeError: When the OpenAI circuit is open or the call fails.
     """
-    if not _gemini_breaker.allow():
+    if not _openai_breaker.allow():
         raise RuntimeError(
-            f"gemini circuit open (state={_gemini_breaker.state}); skipping {operation}"
+            f"openai circuit open (state={_openai_breaker.state}); skipping {operation}"
         )
     try:
-        response = _invoke_agent_once(agent=agent, prompt=prompt)
-        _gemini_breaker.record_success()
+        response = _invoke_agent_once(
+            agent=agent,
+            prompt=prompt,
+            invoke_config=invoke_config,
+        )
+        _openai_breaker.record_success()
         return response
     except Exception as exc:
-        _gemini_breaker.record_failure()
+        _openai_breaker.record_failure()
         raise
 
 
@@ -502,7 +554,7 @@ def skin_review_search(query: str, max_results: int = 4) -> str:
 
 def _build_ingredient_agents() -> tuple[Any, Any]:
     """
-    Build OpenAI-primary and Gemini-fallback ingredient extraction agents.
+    Build Gemini-primary and OpenAI-fallback ingredient extraction agents.
 
     Returns:
         tuple[Any, Any]: Primary and fallback agent instances.
@@ -517,13 +569,13 @@ def _build_ingredient_agents() -> tuple[Any, Any]:
         "Avoid formatting your responses, reply with a clean well structured response, No bold or italics."
     )
     primary = create_agent(
-        model=_build_openai_model(),
+        model=_build_gemini_model(),
         tools=[inci_decoder_search],
         response_format=IngredientExtractionResponse,
         system_prompt=system_prompt,
     )
     fallback = create_agent(
-        model=_build_gemini_model(),
+        model=_build_openai_model(),
         tools=[inci_decoder_search],
         response_format=IngredientExtractionResponse,
         system_prompt=system_prompt,
@@ -531,7 +583,12 @@ def _build_ingredient_agents() -> tuple[Any, Any]:
     return primary, fallback
 
 
-def extract_product_ingredients(*, product_name: str, description: str) -> IngredientExtractionResponse:
+def extract_product_ingredients(
+    *,
+    product_name: str,
+    description: str,
+    invoke_config: Optional[RunnableConfig] = None,
+) -> IngredientExtractionResponse:
     """
     Extract product ingredients.
     Args:
@@ -554,6 +611,7 @@ def extract_product_ingredients(*, product_name: str, description: str) -> Ingre
             fallback_agent=fallback_agent,
             prompt=prompt,
             operation="ingredient_extraction",
+            invoke_config=invoke_config,
         )
         structured = response.get("structured_response") if isinstance(response, dict) else None
         if isinstance(structured, IngredientExtractionResponse):
@@ -609,7 +667,7 @@ def report_internet_search(query: str, max_results: int = 8) -> str:
 
 def _build_report_agents(context: list[dict[str, Any]]) -> tuple[Any, Any]:
     """
-    Build OpenAI-primary and Gemini-fallback product report agents.
+    Build Gemini-primary and OpenAI-fallback product report agents.
 
     Returns:
         tuple[Any, Any]: Primary and fallback agent instances.
@@ -628,13 +686,13 @@ def _build_report_agents(context: list[dict[str, Any]]) -> tuple[Any, Any]:
         f"last_conversation_entries: {json.dumps(context, default=str)}\n"
     )
     primary = create_agent(
-        model=_build_openai_model(),
+        model=_build_gemini_model(),
         tools=[report_internet_search],
         response_format=UserFriendlyReportResponse,
         system_prompt=system_prompt,
     )
     fallback = create_agent(
-        model=_build_gemini_model(),
+        model=_build_openai_model(),
         tools=[report_internet_search],
         response_format=UserFriendlyReportResponse,
         system_prompt=system_prompt,
@@ -644,7 +702,7 @@ def _build_report_agents(context: list[dict[str, Any]]) -> tuple[Any, Any]:
 
 def _build_skin_review_agents(context: list[dict[str, Any]]) -> tuple[Any, Any]:
     """
-    Build OpenAI-primary and Gemini-fallback skin review agents.
+    Build Gemini-primary and OpenAI-fallback skin review agents.
 
     Returns:
         tuple[Any, Any]: Primary and fallback agent instances.
@@ -665,13 +723,13 @@ def _build_skin_review_agents(context: list[dict[str, Any]]) -> tuple[Any, Any]:
         f"last_conversation_entries: {json.dumps(context, default=str)}\n"
     )
     primary = create_agent(
-        model=_build_openai_model(),
+        model=_build_gemini_model(),
         tools=[skin_review_search],
         response_format=SkinReviewResponse,
         system_prompt=system_prompt,
     )
     fallback = create_agent(
-        model=_build_gemini_model(),
+        model=_build_openai_model(),
         tools=[skin_review_search],
         response_format=SkinReviewResponse,
         system_prompt=system_prompt,
@@ -686,6 +744,7 @@ def build_skin_review_report(
     treatment: str,
     internet_research: str,
     context: list[dict[str, Any]],
+    invoke_config: Optional[RunnableConfig] = None,
 ) -> str:
     """Build a concise user-facing skin review report."""
     primary_agent, fallback_agent = _build_skin_review_agents(context)
@@ -703,6 +762,7 @@ def build_skin_review_report(
             fallback_agent=fallback_agent,
             prompt=prompt,
             operation="skin_review_report",
+            invoke_config=invoke_config,
         )
         structured = response.get("structured_response") if isinstance(response, dict) else None
         if isinstance(structured, SkinReviewResponse) and structured.report_text.strip():
@@ -720,6 +780,7 @@ def build_user_friendly_report(
     report: dict[str, Any],
     sources: list[str],
     context: list[dict[str, Any]],
+    invoke_config: Optional[RunnableConfig] = None,
 ) -> str:
     """
     Build a user-friendly report from the rules engine report.
@@ -750,6 +811,7 @@ def build_user_friendly_report(
             fallback_agent=fallback_agent,
             prompt=prompt,
             operation="product_user_friendly_report",
+            invoke_config=invoke_config,
         )
         structured = response.get("structured_response") if isinstance(response, dict) else None
         if isinstance(structured, UserFriendlyReportResponse) and structured.report_text.strip():
@@ -777,6 +839,20 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
     message_id = str(fields.get("message_id") or request_id)
     channel = str(fields.get("channel") or "whatsapp")
 
+    trace_config = build_invoke_config(
+        thread_id=client_id,
+        checkpoint_ns="signal_rules:product",
+        run_name="signal_rules:product",
+        channel=channel,
+        flow="signal",
+        client_id=client_id,
+        request_id=request_id,
+        case_id=case_id,
+        message_id=message_id,
+        extra_metadata={"review_type": "product"},
+        extra_tags=["product"],
+    )
+
     product_name = str(payload.get("product_name") or "").strip()
     description = str(payload.get("description") or "").strip()
 
@@ -790,7 +866,11 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
         product_name or "<empty>",
     )
 
-    extraction = extract_product_ingredients(product_name=product_name, description=description)
+    extraction = extract_product_ingredients(
+        product_name=product_name,
+        description=description,
+        invoke_config=trace_config,
+    )
     logger.info(
         "ingredient extraction completed: request_id=%s ingredients_count=%s ingredients=%s",
         request_id,
@@ -833,6 +913,7 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
         report=result.report,
         sources=result.sources,
         context=context,
+        invoke_config=trace_config,
     )
 
     return {
@@ -853,6 +934,20 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
     client_id = str(fields.get("client_id") or "anonymous")
     message_id = str(fields.get("message_id") or request_id)
     channel = str(fields.get("channel") or "whatsapp")
+
+    trace_config = build_invoke_config(
+        thread_id=client_id,
+        checkpoint_ns="signal_rules:skin",
+        run_name="signal_rules:skin",
+        channel=channel,
+        flow="signal",
+        client_id=client_id,
+        request_id=request_id,
+        case_id=case_id,
+        message_id=message_id,
+        extra_metadata={"review_type": "skin"},
+        extra_tags=["skin"],
+    )
 
     diagnosis = str(payload.get("diagnosis") or payload.get("diagnosis_text") or "").strip()
     summary = _coerce_summary_payload(payload.get("summary"))
@@ -916,6 +1011,7 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
         treatment=str(report.get("treatment") or treatment),
         internet_research=str(report.get("internet_research") or ""),
         context=context,
+        invoke_config=trace_config,
     )
 
     return {

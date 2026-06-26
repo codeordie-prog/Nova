@@ -30,6 +30,10 @@ from dermascan.ai_service.modal.medgemma_service.redis_client import redis_clien
 from dermascan.ai_service.postprocessing.escalation import route_case_after_inference
 from dermascan.shared.firebase_storage import download_client_image_bytes
 from dermascan.shared.logger import get_logger
+from dermascan.shared.stream_pipeline_tracing import (
+    log_pipeline_tracing_status,
+    run_traced_stream_handler,
+)
 from dermascan.backend.services.agents import reclaim_logic
 
 _redis = redis_client_from_env().get_redis()
@@ -608,20 +612,37 @@ def _collect_batch_result(batch: list[_JobEntry], call_handle: Any) -> None:
             else:
                 text_str = str(text)
 
-            route_case_after_inference(entry, text_str, confidence_num)
-            _mark_status(
-                entry.job_id,
-                status="done",
-                boot_id=boot_id,
-                text=text_str,
-                confidence=confidence_str,
-                finished_at=str(int(time.time())),
-            )
-            _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, entry.msg_id)
-            _redis.xdel(_JOB_STREAM, entry.msg_id)
+            job_fields = {
+                "request_id": entry.request_id,
+                "case_id": entry.case_id,
+                "client_id": entry.client_id,
+                "message_id": entry.message_id,
+                "channel": entry.channel,
+                "job_id": entry.job_id,
+            }
 
-            # Mark as processed for idempotency
-            reclaim_logic.mark_processed(_JOB_STREAM, entry.msg_id)
+            def _finish_job() -> None:
+                route_case_after_inference(entry, text_str, confidence_num)
+                _mark_status(
+                    entry.job_id,
+                    status="done",
+                    boot_id=boot_id,
+                    text=text_str,
+                    confidence=confidence_str,
+                    finished_at=str(int(time.time())),
+                )
+                _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, entry.msg_id)
+                _redis.xdel(_JOB_STREAM, entry.msg_id)
+                reclaim_logic.mark_processed(_JOB_STREAM, entry.msg_id)
+
+            run_traced_stream_handler(
+                stream=_JOB_STREAM,
+                group=_CONSUMER_GROUP,
+                consumer=_CONSUMER_NAME,
+                msg_id=entry.msg_id,
+                fields=job_fields,
+                handler=_finish_job,
+            )
 
         logger.info("batch inference done: size=%s boot_id=%s", len(batch), boot_id)
 
@@ -806,6 +827,7 @@ def run_worker_forever() -> None:
             _BLOCK_MS,
             _MAX_INFLIGHT,
         )
+        log_pipeline_tracing_status("medgemma_worker")
 
         stop_event = threading.Event()
 

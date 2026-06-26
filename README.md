@@ -12,7 +12,7 @@ user (Telegram / WhatsApp)
          │ XADD orchestrator:jobs
          ▼
   Orchestrator worker ──► OpenAI GPT-4o (primary LLM, tool calling)
-         │                  └── fallback: Gemini 3
+         │                  └── fallback: Gemini 3.5 Flash
          ├──► MedGemma gateway (vision, via orchestrator tools)
          ├──► rules engine (PostgreSQL) via signal enrichment
          └──► outbound:messages ──► Telegram / WhatsApp
@@ -38,18 +38,21 @@ cp .env_example .env   # fill in values — see sections below
 
 ## 1. Orchestrator LLM (OpenAI → Gemini)
 
-The orchestrator uses **OpenAI GPT-4o** as the primary model (including tool calling) and **Gemini 3** as the fallback when OpenAI is rate-limited, unavailable, or its circuit breaker is open.
+The orchestrator uses **OpenAI GPT-4o** as the primary model (including tool calling) and **Gemini 3.5 Flash** as the fallback when OpenAI is rate-limited, unavailable, or its circuit breaker is open.
+
+Skin and product **report subagents** (`product_rules_signal_helper`) use the opposite chain: **Gemini primary** via `REPORT_AGENT_MODEL`, OpenAI fallback.
 
 Required variables (see `.env_example`):
 
 | Variable | Purpose |
 |---|---|
-| `OPENAI_API_KEY_QUTIS` | OpenAI API key for the primary orchestrator model |
+| `OPENAI_API_KEY_QUTIS` | OpenAI API key for orchestrator primary |
 | `ORCHESTRATOR_OPENAI_MODEL` | Primary model (default `gpt-4o`) |
-| `GEMINI_API_KEY_QUTIS` | Google AI Studio key for Gemini fallback (when not using Vertex) |
-| `ORCHESTRATOR_GEMINI_MODEL` | Fallback model (default `gemini-3.1-flash-lite`) |
-| `GOOGLE_APPLICATION_CREDENTIALS_QUTIS` | Service account JSON for Vertex AI (optional) |
-| `GOOGLE_CLOUD_PROJECT_QUTIS` | GCP project when using Vertex |
+| `ORCHESTRATOR_GEMINI_MODEL` | Orchestrator fallback (default `gemini-3.5-flash`) |
+| `REPORT_AGENT_MODEL` | Gemini model for skin/product report subagents (default `gemini-3.5-flash`) |
+| `ORCHESTRATOR_GEMINI_THINKING_LEVEL` | Gemini reasoning depth for fallback/report paths |
+| `GOOGLE_APPLICATION_CREDENTIALS_QUTIS` | Service account JSON for Vertex AI |
+| `GOOGLE_CLOUD_PROJECT_QUTIS` | GCP project ID |
 | `GOOGLE_CLOUD_LOCATION` | Vertex region (use `global` for Gemini 3.x) |
 
 Circuit-breaker tuning: `OPENAI_CB_*` and `GEMINI_CB_*` env vars control failover thresholds and cooldowns.
@@ -115,7 +118,7 @@ This script runs:
 
 1. Redis
 2. PostgreSQL (if using product / rules flows)
-3. Set `OPENAI_API_KEY_QUTIS` and Gemini credentials in `.env`
+3. Set `OPENAI_API_KEY_QUTIS` and Vertex/Gemini credentials in `.env`
 4. MedGemma gateway + worker (if image / skin review flows are needed)
 5. Backend API (`8088`)
 6. `poetry run python dermascan/scripts/do_work.py`
