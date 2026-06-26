@@ -29,7 +29,8 @@
         "description": "Conversational Agent for orchestrating the diagnosis process",
         "model":"gemini-3.5-flash",
         "temperature": 0.0,
-        "max_tokens": 1000,
+        "max_tokens": 1024,
+        "thinking_level": "low",
         "top_p": 0.95,
         "top_k": 40
     },

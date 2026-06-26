@@ -1,6 +1,8 @@
 """
-Shared Redis stability utilities.
-
+Author: Dermascan Team
+Date: 2026-06-20
+License: MIT
+Description:
 This module centralizes resilient Redis client construction and retry helpers.
 It is intended to be imported by all services that communicate with Redis so
 timeouts, retries, and connection-health behavior remain consistent.
