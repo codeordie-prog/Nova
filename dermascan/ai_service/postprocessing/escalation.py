@@ -58,6 +58,7 @@ class _JobEntry:
     channel: str
     group_id: str = ""
     group_expected_count: int = 0
+    image_blob_path: str = ""
 
 
 def _to_str(value: Any) -> str:
@@ -73,6 +74,13 @@ def _to_str(value: Any) -> str:
     if isinstance(value, (bytes, bytearray)):
         return value.decode("utf-8", errors="ignore")
     return "" if value is None else str(value)
+
+
+def _stream_json(value: Any) -> str:
+    """Serialize dict/list fields to JSON for the Redis stream; pass scalars through."""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    return _to_str(value)
 
 
 def _extract_structured_fields(text: str) -> tuple[dict[str, Any], bool]:
@@ -346,6 +354,13 @@ def _push_escalation(
             "contraindications": base_fields.get("contraindications", ""),
             "how_to_use": base_fields.get("how_to_use", ""),
             "special_instructions": base_fields.get("special_instructions", ""),
+            "image_blob_path": entry.image_blob_path or "",
+            # Carried so the worker builds a full-fidelity {mode}_escalated payload
+            # for the physician-return path without a racy events/signal-stream join.
+            "review_type": base_fields.get("review_type", ""),
+            "rationale": base_fields.get("rationale", ""),
+            "summary": _stream_json(base_fields.get("summary")),
+            "treatment": _stream_json(base_fields.get("treatment")),
         },
         maxlen=_EVENTS_STREAM_MAXLEN,
         approximate=True,
