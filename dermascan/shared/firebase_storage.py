@@ -183,6 +183,33 @@ def extract_blob_path_from_url(url: str) -> str:
     raise ValueError(f"Unsupported Firebase/Google storage URL format: {url}")
 
 
+def download_client_image_bytes_by_path(blob_path: str) -> bytes:
+    """
+    Download a client image by durable Firebase blob path (no signed URL).
+
+    Args:
+        blob_path: Object path inside the configured bucket.
+
+    Returns:
+        The image bytes.
+
+    Raises:
+        FileNotFoundError: If the blob is not found.
+        ValueError: If blob_path is empty.
+    """
+    normalized = str(blob_path or "").strip()
+    if not normalized:
+        raise ValueError("blob_path is required")
+    # Defense-in-depth: only ever serve client media, never an arbitrary bucket path.
+    if not normalized.startswith(f"{CLIENT_MEDIA_PREFIX}/"):
+        raise ValueError("blob_path outside client media prefix")
+    bucket = get_storage_bucket()
+    blob = bucket.blob(normalized)
+    if not blob.exists():
+        raise FileNotFoundError(f"Blob not found: {normalized}")
+    return blob.download_as_bytes()
+
+
 def download_client_image_bytes(*, url: str) -> bytes:
     """
     Download a client image using Firebase Admin credentials (private buckets).
