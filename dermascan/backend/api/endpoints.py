@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import APIRouter, Body, File, Header, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Body, File, Header, HTTPException, Request, Response, UploadFile
 import redis
 import requests
 
@@ -35,8 +35,9 @@ from dermascan.backend.api.group_media_helper import (
     enrich_payload_with_group_metadata,
     wait_for_media_batch_quiet,
 )
-from dermascan.shared.firebase_storage import upload_client_image
+from dermascan.shared.firebase_storage import upload_client_image, download_client_image_bytes_by_path
 from dermascan.shared.global_rate_limiter import _enforce_global_rate_limit
+from dermascan.shared.hmac_auth import SIGNATURE_HEADER, TIMESTAMP_HEADER, verify as verify_hmac
 from dermascan.shared.logger import get_logger
 from dermascan.shared.queue_depth_manager import _wait_for_queue_capacity
 
@@ -61,6 +62,9 @@ _WHATSAPP_INGRESS_SECRET: str = os.getenv(
     os.getenv("INTERNAL_API_SECRET", ""),
 )
 _INGRESS_RETRY_AFTER_S: str = os.getenv("INGRESS_RETRY_AFTER_SECONDS", "1")
+_ORCHESTRATOR_SIGNAL_STREAM: str = os.getenv("ORCHESTRATOR_SIGNAL_STREAM", "orchestrator:signals")
+_EVENTS_STREAM: str = os.getenv("EVENTS_STREAM", "events:stream")
+_ESCALATION_CLOSED_TTL_SEC: int = 7 * 24 * 3600
 
 # Initialize redis client
 _redis = redis.Redis.from_url(_REDIS_URL, decode_responses=True) if _REDIS_URL else None
@@ -891,3 +895,134 @@ async def telegram_webhook(
         raise HTTPException(status_code=503, detail="Redis unavailable") from exc
 
     return {"status": "queued", "queued_count": 1, "request_ids": [normalized.request_id]}
+
+
+def _require_redis() -> redis.Redis:
+    if _redis is None:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+    return _redis
+
+
+async def _verify_qutis_hmac(request: Request) -> bytes:
+    raw_body = await request.body()
+    verify_hmac(
+        raw_body,
+        request.headers.get(SIGNATURE_HEADER),
+        request.headers.get(TIMESTAMP_HEADER),
+    )
+    return raw_body
+
+
+@router.post("/webhooks/escalation")
+async def escalation_physician_return_webhook(request: Request) -> dict[str, str]:
+    raw_body = await _verify_qutis_hmac(request)
+    try:
+        body = json.loads(raw_body.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON body") from exc
+
+    case_id = str(body.get("case_id") or "").strip()
+    derma_notes = body.get("derma_notes")
+    if not case_id or not isinstance(derma_notes, dict):
+        raise HTTPException(status_code=400, detail="case_id and derma_notes are required")
+
+    required_note_fields = ("physician_id", "reviewed_at_ms", "disposition", "summary", "clinical_notes")
+    if any(field not in derma_notes for field in required_note_fields):
+        raise HTTPException(status_code=400, detail="derma_notes missing required fields")
+
+    redis_client = _require_redis()
+    cache_key = f"escalation:signal_payload:{case_id}"
+    cached_raw = redis_client.get(cache_key)
+    if not cached_raw:
+        raise HTTPException(status_code=404, detail="case not found or expired")
+
+    try:
+        payload = json.loads(cached_raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="cached payload corrupt") from exc
+
+    payload["derma_notes"] = derma_notes
+    mode = str(payload.get("mode") or "diagnose")
+    request_id = str(payload.get("request_id") or case_id)
+    client_id = str(payload.get("client_id") or "")
+    message_id = str(payload.get("message_id") or "")
+    channel = str(payload.get("channel") or "")
+
+    redis_client.xadd(
+        _ORCHESTRATOR_SIGNAL_STREAM,
+        {
+            "signal_type": f"{mode}_physician_reviewed",
+            "signal_id": uuid.uuid4().hex,
+            "request_id": request_id,
+            "case_id": case_id,
+            "client_id": client_id,
+            "message_id": message_id,
+            "channel": channel,
+            "source_event_id": "",
+            "payload": json.dumps(payload, default=str),
+            "notes": "Physician review completed",
+        },
+        maxlen=_WORKERS_STREAM_MAXLEN,
+        approximate=True,
+    )
+    redis_client.setex(f"escalation:closed:{case_id}", _ESCALATION_CLOSED_TTL_SEC, "1")
+
+    redis_client.xadd(
+        _EVENTS_STREAM,
+        {
+            "request_id": request_id,
+            "case_id": case_id,
+            "client_id": client_id,
+            "message_id": message_id,
+            "channel": channel,
+            "agent": "escalation",
+            "mode": mode,
+            "status": "physician_review_completed",
+        },
+        maxlen=_WORKERS_STREAM_MAXLEN,
+        approximate=True,
+    )
+
+    try:
+        redis_client.delete(cache_key)
+    except redis.RedisError:
+        logger.exception("failed to delete cached escalation payload: case_id=%s", case_id)
+
+    return {"status": "accepted"}
+
+
+@router.get("/escalations/{case_id}/image")
+async def escalation_case_image_proxy(case_id: str, request: Request) -> Response:
+    # Bodyless GET: sign/verify the request PATH so the signature is bound to this
+    # case_id (which lives in the path, not a body) and cannot be replayed across cases.
+    verify_hmac(
+        request.url.path.encode("utf-8"),
+        request.headers.get(SIGNATURE_HEADER),
+        request.headers.get(TIMESTAMP_HEADER),
+    )
+    redis_client = _require_redis()
+
+    if redis_client.exists(f"escalation:closed:{case_id}"):
+        raise HTTPException(status_code=410, detail="case review closed")
+
+    blob_path = redis_client.get(f"escalation:image_path:{case_id}")
+    if not blob_path:
+        raise HTTPException(status_code=404, detail="image not found")
+
+    try:
+        image_bytes = download_client_image_bytes_by_path(str(blob_path))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="image not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    head = image_bytes[:16]
+    media_type = "image/jpeg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        media_type = "image/png"
+    elif head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+        media_type = "image/gif"
+    elif len(head) >= 12 and head[0:4] == b"RIFF" and head[8:12] == b"WEBP":
+        media_type = "image/webp"
+
+    return Response(content=image_bytes, media_type=media_type)
