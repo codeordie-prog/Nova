@@ -1593,6 +1593,46 @@ def _perform_signal_research(fields: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+_ESCALATION_DEFERRED_MESSAGE = (
+    "Thanks for your patience. A skin specialist is reviewing your case and "
+    "will follow up shortly with their assessment."
+)
+
+
+def _compose_physician_reviewed_reply(payload: dict[str, Any]) -> str:
+    derma_notes = payload.get("derma_notes") or {}
+    if not isinstance(derma_notes, dict):
+        derma_notes = {}
+
+    disposition = str(derma_notes.get("disposition") or "").strip().lower()
+    if disposition == "confirmed":
+        intro = "A specialist has reviewed and confirmed the assessment."
+    elif disposition == "revised":
+        intro = "A specialist reviewed and adjusted the assessment."
+    elif disposition == "unable_to_assess":
+        intro = (
+            "A specialist reviewed your case but could not assess it clearly from the photo provided. "
+            "Please share a clearer, well-lit image if you would like another review."
+        )
+    else:
+        intro = "A specialist has reviewed your case."
+
+    parts: list[str] = [intro]
+    for key in ("summary", "clinical_notes", "follow_up"):
+        value = str(derma_notes.get(key) or "").strip()
+        if value:
+            parts.append(value)
+
+    diagnosis = str(payload.get("diagnosis") or payload.get("diagnosis_text") or "").strip()
+    product_name = str(payload.get("product_name") or "").strip()
+    if diagnosis:
+        parts.append(f"Original AI finding: {diagnosis}")
+    elif product_name:
+        parts.append(f"Original product reviewed: {product_name}")
+
+    return "\n\n".join(parts)
+
+
 def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> None:
     """
     Process an internal orchestrator signal message.
@@ -1655,7 +1695,23 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             },
         )
 
-        if signal_type.startswith("product_review_"):
+        if signal_type.endswith("_physician_reviewed"):
+            logger.info(
+                "processing physician-reviewed signal: request_id=%s case_id=%s signal_type=%s",
+                request_id,
+                case_id,
+                signal_type,
+            )
+            reply = _compose_physician_reviewed_reply(payload_obj)
+        elif signal_type.endswith("_escalation_deferred"):
+            logger.info(
+                "processing escalation-deferred signal: request_id=%s case_id=%s signal_type=%s",
+                request_id,
+                case_id,
+                signal_type,
+            )
+            reply = _ESCALATION_DEFERRED_MESSAGE
+        elif signal_type.startswith("product_review_"):
             logger.info(
                 "processing product-review signal through rules flow: request_id=%s case_id=%s client_id=%s signal_type=%s",
                 request_id,
