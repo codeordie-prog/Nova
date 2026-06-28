@@ -28,7 +28,7 @@ from dermascan.ai_service.modal.medgemma_service.app import MedGemmaService, app
 from dermascan.ai_service.modal.medgemma_service.gateways.validation import _validate_image_bytes
 from dermascan.ai_service.modal.medgemma_service.redis_client import redis_client_from_env
 from dermascan.ai_service.postprocessing.escalation import route_case_after_inference
-from dermascan.shared.firebase_storage import download_client_image_bytes
+from dermascan.shared.firebase_storage import download_client_image_bytes, extract_blob_path_from_url
 from dermascan.shared.logger import get_logger
 from dermascan.backend.services.agents import reclaim_logic
 
@@ -159,6 +159,17 @@ def _resolve_image_bytes(payload: dict[str, Any]) -> bytes:
     return image_bytes
 
 
+def _resolve_image_blob_path(payload: dict[str, Any]) -> str:
+    source_kind = _to_str(payload.get("image_source_kind") or payload.get(b"image_source_kind")).strip().lower()
+    source_value = _to_str(payload.get("image_source_value") or payload.get(b"image_source_value")).strip()
+    if source_kind in {"url", "image_url"} and source_value:
+        try:
+            return extract_blob_path_from_url(source_value)
+        except ValueError:
+            return source_value
+    return source_value
+
+
 def _dispatch_with_retry(dispatch_func, *args, **kwargs) -> Any:
     """
     Dispatch RPC call with retry logic for transient errors.
@@ -228,6 +239,7 @@ class _JobEntry:
     channel: str
     group_id: str
     group_expected_count: int = 0
+    image_blob_path: str = ""
 
 
 @dataclass
@@ -455,6 +467,7 @@ def _build_job_entry(pending: _PendingJob, image_bytes: bytes) -> _JobEntry:
             or "0"
         ),
         prompt=_to_str(payload.get("prompt") or payload.get(b"prompt")),
+        image_blob_path=_resolve_image_blob_path(payload),
     )
 
 
