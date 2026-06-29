@@ -331,7 +331,10 @@ def _deliver(fields: dict[str, Any], reply_to_message_id: int | None = None) -> 
         reply_to_message_id: Telegram reply target when threading is enabled.
     """
     channel = str(fields.get("channel") or "")
-    case_id = str(fields.get("case_id") or "")
+    # Recipient is the conversation/channel identity (phone for WhatsApp, chat for
+    # Telegram), carried as client_id. case_id is the case identifier (a request_id)
+    # and must never be used as a delivery address.
+    recipient = str(fields.get("client_id") or "")
     text = str(fields.get("text") or "").strip()
     if not text:
         return
@@ -339,13 +342,13 @@ def _deliver(fields: dict[str, Any], reply_to_message_id: int | None = None) -> 
     _send_typing_best_effort(fields)
 
     if channel == "telegram":
-        if not case_id:
-            raise ValueError("missing case_id for telegram outbound")
-        _send_telegram(case_id, text, reply_to_message_id=reply_to_message_id)
+        if not recipient:
+            raise ValueError("missing client_id for telegram outbound")
+        _send_telegram(recipient, text, reply_to_message_id=reply_to_message_id)
         return
 
     if channel == "whatsapp":
-        _send_whatsapp(case_id, text, reply_to_wamid=_whatsapp_reply_wamid(fields))
+        _send_whatsapp(recipient, text, reply_to_wamid=_whatsapp_reply_wamid(fields))
         return
     raise ValueError(f"unsupported channel: {channel}")
 

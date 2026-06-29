@@ -99,6 +99,45 @@ def _validate_image_bytes(image_bytes: bytes) -> None:
         raise HTTPException(status_code=400, detail="Unsupported or invalid image format")
 
 
+def _store_whatsapp_image_attachment(
+    *,
+    client_id: str,
+    message_id: str,
+    image_bytes: bytes,
+    mime_type: str,
+) -> tuple[AttachmentSource, int]:
+    """Upload WhatsApp image bytes to Firebase and return a URL attachment source."""
+    if _redis is None:
+        raise HTTPException(status_code=500, detail="REDIS_URL is not configured")
+
+    try:
+        download_url = upload_client_image(
+            client_id=client_id,
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Firebase client image upload failed: client_id=%s message_id=%s",
+            client_id,
+            message_id,
+        )
+        raise HTTPException(status_code=502, detail="Failed to store image") from exc
+
+    media_ref = f"media:whatsapp:{client_id}:{uuid.uuid4().hex}"
+    try:
+        _redis.setex(media_ref, _MEDIA_TTL_S, download_url)
+    except redis.RedisError as exc:
+        logger.exception(
+            "Redis media URL cache failed: media_ref=%s client_id=%s",
+            media_ref,
+            client_id,
+        )
+        raise HTTPException(status_code=503, detail="Redis unavailable") from exc
+
+    return AttachmentSource(kind="url", value=download_url), len(image_bytes)
+
+
 async def _enforce_ingress_capacity(*, cost: int = 1) -> None:
     """
     Apply global RPM and orchestrator queue-depth gates before enqueueing.
@@ -330,8 +369,12 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
             except (binascii.Error, ValueError) as exc:
                 raise HTTPException(status_code=400, detail="Invalid image base64") from exc
             _validate_image_bytes(image_bytes)
-            source = AttachmentSource(kind="base64", value=image_b64)
-            size_bytes: int | None = len(image_bytes)
+            source, size_bytes = _store_whatsapp_image_attachment(
+                client_id=client_id,
+                message_id=message_id,
+                image_bytes=image_bytes,
+                mime_type=mime_type,
+            )
         elif media_ref:
             source = AttachmentSource(kind="blob_ref", value=media_ref)
             size_bytes = raw_attachment.get("size_bytes")
@@ -374,8 +417,12 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
             except (binascii.Error, ValueError) as exc:
                 raise HTTPException(status_code=400, detail="Invalid image base64") from exc
             _validate_image_bytes(image_bytes)
-            source = AttachmentSource(kind="base64", value=image_b64)
-            size_bytes: int | None = len(image_bytes)
+            source, size_bytes = _store_whatsapp_image_attachment(
+                client_id=client_id,
+                message_id=message_id,
+                image_bytes=image_bytes,
+                mime_type=mime_type,
+            )
         elif media_ref:
             source = AttachmentSource(kind="blob_ref", value=media_ref)
             size_bytes = None
@@ -434,9 +481,10 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
     if not content.text and not content.attachments:
         raise HTTPException(status_code=400, detail=f"Unsupported or empty message type: {msg_type}")
 
+    _rid = uuid.uuid4().hex
     return OrchestratorIngressRequest(
-        request_id=uuid.uuid4().hex,
-        case_id=client_id,
+        request_id=_rid,
+        case_id=_rid,  # each escalation is its own case; client_id (phone) is delivery only
         client_id=client_id,
         message_id=message_id,
         conversation_id=client_id,
@@ -561,9 +609,10 @@ def _normalize_telegram_message(message: Dict[str, Any]) -> OrchestratorIngressR
     if not content.text and not content.attachments:
         raise HTTPException(status_code=400, detail="Unsupported or empty Telegram message")
 
+    _rid = uuid.uuid4().hex
     return OrchestratorIngressRequest(
-        request_id=uuid.uuid4().hex,
-        case_id=conversation_id,
+        request_id=_rid,
+        case_id=_rid,  # each escalation is its own case; client_id (phone) is delivery only
         client_id=client_id,
         message_id=message_id,
         conversation_id=conversation_id,
