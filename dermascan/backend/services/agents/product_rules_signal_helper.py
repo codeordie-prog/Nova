@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import time
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -26,12 +25,23 @@ from dermascan.backend.services.agents.provider_circuit_breaker import (
     load_gemini_circuit_breaker,
     load_openai_circuit_breaker,
 )
-from dermascan.rules_engine.engine.engine import RulesEngineRequest
+from dermascan.rules_engine.engine.engine import RulesEngineRequest, SkinContext
 from dermascan.rules_engine.engine.rules_engine import RulesEngine
 from dermascan.shared.logger import get_logger
 from dermascan.shared.langsmith_observability import (
     build_invoke_config,
     configure_worker_project,
+)
+from dermascan.shared.stream_pipeline_tracing import (
+    extract_confidence_from_fields,
+    extract_threshold_from_fields,
+)
+from dermascan.shared.delivery_context import (
+    DeliveryContext,
+    build_rules_skin_context,
+    format_delivery_context_for_prompt,
+    load_delivery_context,
+    merge_profile_into_skin_audit,
 )
 from dermascan.shared.redis_stability import get_redis_client, run_with_redis_retries
 from langchain_core.runnables import RunnableConfig
@@ -61,8 +71,8 @@ GOOGLE_PROJECT_ID = str(
     or os.getenv("GOOGLE_PROJECT_ID_QUTIS", "qutisai")
 )
 GOOGLE_LOCATION = str(os.getenv("GOOGLE_CLOUD_LOCATION", "global"))
-_SKIN_AUDIT_KEY_TEMPLATE = "client:{client_id}:skin_profile"
-_SKIN_AUDIT_TTL_S = max(60, int(os.getenv("SKIN_AUDIT_TTL_S", str(60 * 60 * 24 * 30))))
+_SKIN_AUDIT_KEY_TEMPLATE = "skin_profile:{client_id}"
+_REPORT_MAX_SOURCES = max(1, int(os.getenv("SIGNAL_RULES_MAX_SOURCES", "2")))
 
 # Define response models
 class IngredientExtractionResponse(BaseModel):
@@ -387,44 +397,6 @@ def _load_latest_skin_audit(client_id: str) -> tuple[dict[str, Any], int | None]
     return parsed, None
 
 
-def _persist_latest_skin_audit(client_id: str, skin_audit: Any) -> None:
-    """
-    Persist latest skin audit in Redis with TTL.
-    Args:
-        client_id (str): The client ID
-        skin_audit (Any): The skin audit
-
-    Returns:
-        None
-    """
-    if isinstance(skin_audit, BaseModel):
-        payload = skin_audit.model_dump()
-    elif isinstance(skin_audit, dict):
-        payload = skin_audit
-    else:
-        payload = {}
-
-    if not payload:
-        return
-
-    key = _skin_audit_key(client_id)
-    serialized = json.dumps(
-        {
-            "skin_audit": payload,
-            "updated_at_ts": int(time.time()),
-        },
-        default=str,
-    )
-    try:
-        redis_client = get_redis_client(decode_responses=True)
-        run_with_redis_retries(
-            lambda: redis_client.set(key, serialized, ex=_SKIN_AUDIT_TTL_S),
-            operation_name="skin_audit_set",
-        )
-    except Exception as exc:
-        logger.warning("failed to persist skin audit to redis: client_id=%s err=%s", client_id, exc)
-
-
 def _coerce_summary_payload(value: Any) -> str:
     """
     Normalize summary payload into a deterministic string representation.
@@ -498,6 +470,28 @@ def _strip_markdown_formatting(text: str) -> str:
     return cleaned.strip()
 
 
+def _limit_sources(sources: list[str], limit: int = _REPORT_MAX_SOURCES) -> list[str]:
+    """
+    Return up to ``limit`` unique source URLs for outbound messages.
+
+    Args:
+        sources: Candidate source URLs.
+        limit: Maximum number of sources to retain.
+
+    Returns:
+        list[str]: Deduplicated sources, capped at ``limit``.
+    """
+    unique: list[str] = []
+    for item in sources:
+        candidate = str(item).strip()
+        if not candidate or candidate in unique:
+            continue
+        unique.append(candidate)
+        if len(unique) >= limit:
+            break
+    return unique
+
+
 @tool
 def inci_decoder_search(query: str, max_results: int = 8) -> str:
     """
@@ -526,7 +520,7 @@ def inci_decoder_search(query: str, max_results: int = 8) -> str:
 
 
 @tool
-def skin_review_search(query: str, max_results: int = 4) -> str:
+def skin_review_search(query: str, max_results: int = 2) -> str:
     """
     Internet search for dermatology and skin condition information from reputable medical sources.
     Use this tool to strengthen the skin audit report.
@@ -641,7 +635,7 @@ def get_rules_engine() -> RulesEngine:
     return _rules_engine_singleton
 
 @tool
-def report_internet_search(query: str, max_results: int = 8) -> str:
+def report_internet_search(query: str, max_results: int = 2) -> str:
     """
     Search the internet for information to help with the report.
     Args:
@@ -665,7 +659,10 @@ def report_internet_search(query: str, max_results: int = 8) -> str:
     except Exception as exc:
         return f"Report internet search failed: {exc}" 
 
-def _build_report_agents(context: list[dict[str, Any]]) -> tuple[Any, Any]:
+def _build_report_agents(
+    context: list[dict[str, Any]],
+    delivery_prompt: str = "",
+) -> tuple[Any, Any]:
     """
     Build Gemini-primary and OpenAI-fallback product report agents.
 
@@ -674,16 +671,26 @@ def _build_report_agents(context: list[dict[str, Any]]) -> tuple[Any, Any]:
     """
     system_prompt = (
         "You are a dermatology-focused product-audit assistant. "
-        "Your task is to convert structured product safety evidence into a concise user-facing product audit. "
-        "Use plain language and practical guidance for a non-technical user. "
+        "Convert structured product safety evidence into a short, readable audit for a non-technical user. "
         "Do not claim medical diagnosis and do not prescribe treatment. "
         "Use report_internet_search only when it meaningfully strengthens unclear or missing safety points. "
-        "Output must be structured in this order: "
-        "Overview; Key ingredient safety points; Contraindications and interaction cautions; Pregnancy and lactation considerations; What to do next; Safety disclaimer. "
-        "When ingredient-level evidence is available, include a short note per ingredient. "
-        "Keep the response concise, actionable, and aligned with conversation context. "
-        "Return plain text only; do not use markdown, bold, or italics. "
+        "Target 100-180 words total. Use 1-2 short sentences per section; no bullet laundry lists. "
+        "Do NOT report ingredient-by-ingredient. Synthesize across the formula into safety themes "
+        "(e.g. pregnancy/lactation cautions, contraindications or drug interactions, irritation or "
+        "sensitization risk, photosensitivity, actives to introduce slowly). "
+        "For a retinol serum, emphasize pregnancy avoidance, irritation potential, and sun protection "
+        "rather than listing every INCI name. "
+        "Output must use these section labels in order (plain text, no markdown): "
+        "Overview; Key safety themes; Contraindications and interaction cautions; "
+        "Pregnancy and lactation considerations; What to do next; Safety disclaimer. "
+        "Overview must include the product name when known. "
+        "Safety disclaimer must state the review is educational, not medical advice, and not a substitute "
+        "for a healthcare professional. "
+        "Do not include URLs in the report body (sources are appended separately). "
+        "When client context includes pregnancy, breastfeeding, allergies, or goals, "
+        "address them explicitly in pregnancy/lactation and safety sections. "
         f"last_conversation_entries: {json.dumps(context, default=str)}\n"
+        f"{delivery_prompt}\n"
     )
     primary = create_agent(
         model=_build_gemini_model(),
@@ -700,7 +707,10 @@ def _build_report_agents(context: list[dict[str, Any]]) -> tuple[Any, Any]:
     return primary, fallback
 
 
-def _build_skin_review_agents(context: list[dict[str, Any]]) -> tuple[Any, Any]:
+def _build_skin_review_agents(
+    context: list[dict[str, Any]],
+    delivery_prompt: str = "",
+) -> tuple[Any, Any]:
     """
     Build Gemini-primary and OpenAI-fallback skin review agents.
 
@@ -709,18 +719,27 @@ def _build_skin_review_agents(context: list[dict[str, Any]]) -> tuple[Any, Any]:
     """
     system_prompt = (
         "You are a dermatology skin-audit assistant. "
-        "Your task is to produce a concise user-facing image-based skin pattern review from the provided candidate pattern, condition summary, and needs/treatment context. "
-        "Use the skin_review_search tool to strengthen evidence when useful. "
+        "Produce a short image-based skin pattern review from the candidate pattern, condition summary, "
+        "and needs/treatment context. "
+        "Use skin_review_search only when it materially improves uncertain or thin evidence. "
+        "Target 80-150 words total. Use 1-2 short sentences per section. "
         "Return plain text only; do not use markdown, bold, or italics. "
         "Do not prescribe medications, dosages, or definitive treatment plans. "
         "Treat the candidate pattern as an internal hypothesis, not a confirmed diagnosis. "
-        "Use cautious language such as 'appears consistent with', 'may suggest', 'could reflect', and 'image-based review cannot confirm'. "
+        "Use cautious language such as 'appears consistent with', 'may suggest', 'could reflect', "
+        "and 'image-based review cannot confirm'. "
         "Avoid definitive phrasing such as 'has', 'is', 'diagnosis is', or 'confirms'. "
-        "If evidence is limited, explicitly state uncertainty and prefer uncertainty over unsupported specificity. "
-        "The output must be structured in this order: "
-        "Observed pattern; What this may suggest; Care considerations (general, non-prescriptive); When to seek in-person review; Safety disclaimer. "
-        "Keep it practical, short, and aligned with conversation context. "
+        "If evidence is limited, state uncertainty explicitly. "
+        "Use these section labels in order: "
+        "Observed pattern; What this may suggest; Care considerations (general, non-prescriptive); "
+        "When to seek in-person review; Safety disclaimer. "
+        "Safety disclaimer must state the review is educational, not a medical diagnosis or prescription, "
+        "and that image-based review cannot confirm a condition. "
+        "Do not include URLs in the report body (sources are appended separately). "
+        "Personalize care considerations using allergies, pregnancy/breastfeeding status, "
+        "skin type, and the user's primary concern when provided in client context. "
         f"last_conversation_entries: {json.dumps(context, default=str)}\n"
+        f"{delivery_prompt}\n"
     )
     primary = create_agent(
         model=_build_gemini_model(),
@@ -744,18 +763,24 @@ def build_skin_review_report(
     treatment: str,
     internet_research: str,
     context: list[dict[str, Any]],
+    delivery: Optional[DeliveryContext] = None,
     invoke_config: Optional[RunnableConfig] = None,
 ) -> str:
     """Build a concise user-facing skin review report."""
-    primary_agent, fallback_agent = _build_skin_review_agents(context)
+    delivery_prompt = format_delivery_context_for_prompt(delivery) if delivery else ""
+    primary_agent, fallback_agent = _build_skin_review_agents(context, delivery_prompt)
     prompt = (
         "Generate the final image-based skin pattern review using the inputs below.\n"
+        "Keep every required section label; be concise (1-2 sentences per section).\n"
         "If a field is missing, state 'unknown' briefly and continue.\n"
+        "Personalize using client context when allergies, pregnancy, or goals are present.\n"
         f"candidate_pattern: {diagnosis}\n"
         f"skin_condition_summary: {summary}\n"
         f"needs_and_treatment: {treatment}\n"
         f"internet_research_on_candidate_pattern: {internet_research}\n"
     )
+    if delivery_prompt:
+        prompt = f"{prompt}\n{delivery_prompt}\n"
     try:
         response = _invoke_with_retry(
             primary_agent=primary_agent,
@@ -780,6 +805,7 @@ def build_user_friendly_report(
     report: dict[str, Any],
     sources: list[str],
     context: list[dict[str, Any]],
+    delivery: Optional[DeliveryContext] = None,
     invoke_config: Optional[RunnableConfig] = None,
 ) -> str:
     """
@@ -795,15 +821,22 @@ def build_user_friendly_report(
     Returns:
         User-friendly report as string
     """
-    primary_agent, fallback_agent = _build_report_agents(context)
+    primary_agent, fallback_agent = _build_report_agents(
+        context,
+        format_delivery_context_for_prompt(delivery) if delivery else "",
+    )
+    limited_sources = _limit_sources(sources)
     prompt = (
         "Generate the final product audit using the inputs below.\n"
+        "Synthesize safety themes across ingredients; do not list each ingredient separately.\n"
+        "Include the product name in Overview when available.\n"
         "If a field is missing, state 'unknown' briefly and continue.\n"
+        "Personalize pregnancy/lactation and allergy guidance using client context when present.\n"
         f"product_name: {product_name}\n"
         f"description: {description}\n"
         f"ingredients: {json.dumps(ingredients, default=str)}\n"
         f"rules_engine_report_json: {json.dumps(report, default=str)}\n"
-        f"sources: {json.dumps(sources, default=str)}\n"
+        f"reference_sources: {json.dumps(limited_sources, default=str)}\n"
     )
     try:
         response = _invoke_with_retry(
@@ -838,6 +871,8 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
     client_id = str(fields.get("client_id") or "anonymous")
     message_id = str(fields.get("message_id") or request_id)
     channel = str(fields.get("channel") or "whatsapp")
+    signal_confidence = extract_confidence_from_fields(fields)
+    signal_threshold = extract_threshold_from_fields(fields)
 
     trace_config = build_invoke_config(
         thread_id=client_id,
@@ -849,14 +884,22 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
         request_id=request_id,
         case_id=case_id,
         message_id=message_id,
-        extra_metadata={"review_type": "product"},
+        extra_metadata={
+            "review_type": "product",
+            **({"confidence": signal_confidence} if signal_confidence else {}),
+            **({"threshold": signal_threshold} if signal_threshold else {}),
+        },
         extra_tags=["product"],
     )
+
+    delivery = load_delivery_context(case_id, client_id)
+    skin_context = SkinContext.model_validate(build_rules_skin_context(delivery))
 
     product_name = str(payload.get("product_name") or "").strip()
     description = str(payload.get("description") or "").strip()
 
     latest_skin_audit, _ = _load_latest_skin_audit(client_id)
+    latest_skin_audit = merge_profile_into_skin_audit(latest_skin_audit, delivery)
 
     logger.info(
         "product signal rules flow started: request_id=%s case_id=%s client_id=%s product_name=%s",
@@ -888,6 +931,8 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
         review_type="product",
         ingredients=extraction.ingredients,
         skin_audit=latest_skin_audit,
+        skin_context=skin_context,
+        escalation_notes=delivery.collected_context_summary or delivery.primary_concern,
         product_name=product_name,
         description=description,
         indications=str(payload.get("indications") or ""),
@@ -913,13 +958,15 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
         report=result.report,
         sources=result.sources,
         context=context,
+        delivery=delivery,
         invoke_config=trace_config,
     )
+    outbound_sources = _limit_sources(result.sources)
 
     return {
         "summary": result.summary,
         "user_friendly_report": user_friendly_report,
-        "sources": result.sources,
+        "sources": outbound_sources,
         "ingredients": extraction.ingredients,
         "indexed_ingredients": [item.model_dump() for item in result.indexed_ingredients],
         "report": result.report,
@@ -934,6 +981,8 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
     client_id = str(fields.get("client_id") or "anonymous")
     message_id = str(fields.get("message_id") or request_id)
     channel = str(fields.get("channel") or "whatsapp")
+    signal_confidence = extract_confidence_from_fields(fields)
+    signal_threshold = extract_threshold_from_fields(fields)
 
     trace_config = build_invoke_config(
         thread_id=client_id,
@@ -945,9 +994,16 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
         request_id=request_id,
         case_id=case_id,
         message_id=message_id,
-        extra_metadata={"review_type": "skin"},
+        extra_metadata={
+            "review_type": "skin",
+            **({"confidence": signal_confidence} if signal_confidence else {}),
+            **({"threshold": signal_threshold} if signal_threshold else {}),
+        },
         extra_tags=["skin"],
     )
+
+    delivery = load_delivery_context(case_id, client_id)
+    skin_context = SkinContext.model_validate(build_rules_skin_context(delivery))
 
     diagnosis = str(payload.get("diagnosis") or payload.get("diagnosis_text") or "").strip()
     summary = _coerce_summary_payload(payload.get("summary"))
@@ -997,6 +1053,8 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
         diagnosis=diagnosis,
         summary=summary,
         treatment=treatment,
+        skin_context=skin_context,
+        escalation_notes=delivery.collected_context_summary or delivery.primary_concern,
         raw_model_json=str(fields.get("payload") or ""),
     )
 
@@ -1004,20 +1062,20 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
     result = rules_engine.process(request)
 
     report = result.report if isinstance(result.report, dict) else {}
-    _persist_latest_skin_audit(client_id, report.get("skin_audit"))
     user_friendly_report = build_skin_review_report(
         diagnosis=str(report.get("diagnosis") or diagnosis),
         summary=str(report.get("summary") or summary),
         treatment=str(report.get("treatment") or treatment),
         internet_research=str(report.get("internet_research") or ""),
         context=context,
+        delivery=delivery,
         invoke_config=trace_config,
     )
 
     return {
         "summary": result.summary,
         "user_friendly_report": user_friendly_report,
-        "sources": result.sources,
+        "sources": _limit_sources(result.sources),
         "report": result.report,
     }
 

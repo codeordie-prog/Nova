@@ -47,14 +47,26 @@ from dermascan.backend.services.agents.group_report_aggregator import (
     collect_and_compile_if_ready,
 )
 from dermascan.shared.logger import get_logger
+from dermascan.shared.ingress_payload import resolve_image_urls_from_payload
+from dermascan.shared.delivery_context import (
+    format_delivery_context_for_prompt,
+    load_delivery_context,
+)
+from dermascan.shared.intake_session_store import (
+    IntakeSessionStoreError,
+    archive_intake_session,
+    load_archived_intake_session,
+    load_intake_session,
+)
 from dermascan.shared.redis_stability import (
     check_redis_connectivity,
     get_redis_client,
     run_with_redis_retries,
 )
+from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langchain.agents import create_agent
-from langchain.agents.middleware import SummarizationMiddleware, wrap_model_call, ModelRequest, ModelResponse
+from langchain.agents.middleware import SummarizationMiddleware, ToolCallLimitMiddleware, wrap_model_call, ModelRequest, ModelResponse
 from langchain_openai import ChatOpenAI
 from dermascan.backend.services.agents.prompts.orchestrator_prompt import system_prompt
 from dermascan.backend.services.agents import reclaim_logic
@@ -74,6 +86,8 @@ from dermascan.shared.langsmith_observability import (
 )
 from dermascan.shared.stream_pipeline_tracing import (
     enrich_stream_fields,
+    extract_confidence_from_fields,
+    extract_threshold_from_fields,
     log_pipeline_tracing_status,
     record_stream_produce,
     run_traced_stream_handler,
@@ -114,6 +128,10 @@ OPENAI_REQUEST_TIMEOUT_S: float = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "4
 OPENAI_MAX_RETRIES: int = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("OPENAI_MAX_RETRIES", "2"))))
 # Hard ceiling on agent reasoning/tool-call steps per turn.
 AGENT_RECURSION_LIMIT: int = max(1, int(os.getenv("ORCHESTRATOR_AGENT_RECURSION_LIMIT", "12")))
+ORCHESTRATOR_TOOL_RUN_LIMIT: int = max(3, int(os.getenv("ORCHESTRATOR_TOOL_RUN_LIMIT", "8")))
+ORCHESTRATOR_GET_INTAKE_STATUS_RUN_LIMIT: int = max(
+    1, int(os.getenv("ORCHESTRATOR_GET_INTAKE_STATUS_RUN_LIMIT", "1"))
+)
 # User-facing reply sent when a turn fails (e.g. recursion limit / provider
 # error) so the client is never left without a response.
 ORCHESTRATOR_FAILURE_REPLY: str = os.getenv(
@@ -460,6 +478,31 @@ def _append_proactive_log(client_id: str, entry: dict[str, Any]) -> None:
         logger.exception("failed to append proactive log: client_id=%s", client_id)
 
 
+def _finalize_intake_after_delivery(case_id: str, client_id: str) -> None:
+    """
+    Mark intake delivered and clear the active worksheet after outbound report.
+
+    Args:
+        case_id: Case identifier from the signal envelope.
+        client_id: Client identifier from the signal envelope.
+    """
+    cid = str(client_id or "anonymous").strip() or "anonymous"
+    case = str(case_id or "").strip()
+    session = load_archived_intake_session(case, redis_client=_redis)
+    if session is None:
+        session = load_intake_session(cid, redis_client=_redis)
+    if session is None:
+        return
+    try:
+        archive_intake_session(session, redis_client=_redis, delete_active=True)
+    except IntakeSessionStoreError:
+        logger.exception(
+            "failed to finalize intake after delivery: case_id=%s client_id=%s",
+            case,
+            cid,
+        )
+
+
 def _append_conversation_log(
     client_id: str,
     *,
@@ -524,6 +567,8 @@ def _enqueue_outbound(
     kind: str,
     must_deliver: bool,
     reply_to_message_id: Optional[str] = None,
+    confidence: Optional[str] = None,
+    threshold: Optional[str] = None,
 ) -> None:
     """
     Enqueue one outbound user-facing message for ordered channel delivery.
@@ -547,22 +592,25 @@ def _enqueue_outbound(
 
     priority = 10 if kind == "signal_update" else 20
     sequence = _redis.incr(f"outbound:seq:{client_id}")
-    stream_fields = enrich_stream_fields(
-        {
-            "client_id": client_id,
-            "case_id": case_id,
-            "channel": channel,
-            "request_id": request_id,
-            "kind": kind,
-            "must_deliver": "true" if must_deliver else "false",
-            "priority": str(priority),
-            "created_at_ms": str(int(time.time() * 1000)),
-            "seq": str(sequence),
-            "text": body,
-            "dedupe_key": f"{kind}:{request_id}:{case_id}",
-            "reply_to_message_id": str(reply_to_message_id or ""),
-        }
-    )
+    outbound_fields: dict[str, str] = {
+        "client_id": client_id,
+        "case_id": case_id,
+        "channel": channel,
+        "request_id": request_id,
+        "kind": kind,
+        "must_deliver": "true" if must_deliver else "false",
+        "priority": str(priority),
+        "created_at_ms": str(int(time.time() * 1000)),
+        "seq": str(sequence),
+        "text": body,
+        "dedupe_key": f"{kind}:{request_id}:{case_id}",
+        "reply_to_message_id": str(reply_to_message_id or ""),
+    }
+    if confidence:
+        outbound_fields["confidence"] = confidence
+    if threshold:
+        outbound_fields["threshold"] = threshold
+    stream_fields = enrich_stream_fields(outbound_fields)
     msg_id = str(
         _redis.xadd(
             OUTBOUND_STREAM,
@@ -575,7 +623,12 @@ def _enqueue_outbound(
         stream=OUTBOUND_STREAM,
         msg_id=msg_id,
         fields=stream_fields,
-        extra_metadata={"worker": "orchestrator", "kind": kind},
+        extra_metadata={
+            "worker": "orchestrator",
+            "kind": kind,
+            **({"confidence": confidence} if confidence else {}),
+            **({"threshold": threshold} if threshold else {}),
+        },
     )
 
 
@@ -747,48 +800,40 @@ def _wait_for_inflight(
     return initial
 
 
-# Build the orchestrator input
-# TO BE REVISED WITH RESPECT TO THE SCHEMA OF THE PAYLOAD SEND FROM WHATSAPP WEBHOOK ENDPOINT
-# TODO: Add more fields to the input - This maybe change with respect to the SCHEMA of the payload
-def _build_orchestrator_input(
+# Build the orchestrator ingress context (text + optional multimodal image blocks)
+def _build_orchestrator_text_context(
+    *,
     request_id: str,
     case_id: str,
     client_id: str,
     message_id: str,
     channel: str,
     username: Optional[str],
-    payload_json: str,
+    payload: dict[str, Any],
+    resolved_images: list[Any],
 ) -> str:
-
     """
-    Builds the input for the orchestrator agent.
-    
+    Build the text portion of the orchestrator user message.
+
     Args:
-        request_id (str): Request ID
-        case_id (str): Case ID
-        client_id (str): Client ID
-        message_id (str): Message ID
-        channel (str): Channel
-        username (Optional[str]): Username
-        payload_json (str): JSON string containing the payload
-        
+        request_id: Ingress request id for this turn.
+        case_id: Case id.
+        client_id: Client id.
+        message_id: Source message id.
+        channel: Ingress channel.
+        username: Optional display name.
+        payload: Parsed ingress payload object.
+        resolved_images: Image attachments resolved for vision input.
+
     Returns:
-        str: The input for the orchestrator agent
+        str: Text context for the orchestrator agent.
     """
-    try:
-        # Parse the payload
-        payload: dict[str, Any] = json.loads(payload_json)
-    except Exception:
-        payload = {}
-
-    # Extract content
     content = payload.get("content") or {}
-
-    # Extract text and attachments
     text: str = str(content.get("text") or "").strip()
     attachments: list = content.get("attachments") or []
+    if not isinstance(attachments, list):
+        attachments = []
 
-    # Build summary lines
     summary_lines = [
         "You are handling one orchestrator ingress job.",
         "Use tool calls when routing is needed.",
@@ -800,11 +845,32 @@ def _build_orchestrator_input(
         f"username: {username}",
         f"text: {text or '<empty>'}",
         f"attachments_count: {len(attachments)}",
-        "full_payload_json:",
-        json.dumps(payload, default=str),
+        f"resolved_image_count: {len(resolved_images)}",
     ]
 
-    # Add routing hints
+    if resolved_images:
+        summary_lines.append(
+            "Vision hint: image block(s) are attached after this text. "
+            "Inspect each image before classifying it or deciding routing."
+        )
+        summary_lines.append(
+            "ingress_images_for_this_message: "
+            + json.dumps(
+                [
+                    {
+                        "attachment_id": image.attachment_id,
+                        "index": image.index,
+                        "mime_type": image.mime_type,
+                    }
+                    for image in resolved_images
+                ],
+                default=str,
+            )
+        )
+    else:
+        summary_lines.append("full_payload_json:")
+        summary_lines.append(json.dumps(payload, default=str))
+
     if text and attachments:
         summary_lines.append(
             "Routing hint: user provided both text and attachment(s). You may need to forward for diagnosis."
@@ -816,9 +882,11 @@ def _build_orchestrator_input(
     if not text and not attachments:
         summary_lines.append("Routing hint: missing content; ask clarification.")
 
-    # Inject the recent proactive-message log so the orchestrator is aware of
-    # what the system has already proactively sent to this client. This is a
-    # read-only snapshot from the signal flow; the job flow never writes here.
+    intake_session = load_intake_session(client_id, redis_client=_redis)
+    if intake_session is not None:
+        summary_lines.append("intake_session_snapshot:")
+        summary_lines.append(json.dumps(intake_session.model_dump(mode="json"), default=str))
+
     proactive_entries = _read_proactive_log(client_id, PROACTIVE_LOG_INCLUDE_N)
     if proactive_entries:
         summary_lines.append("proactive_messages_recently_sent_to_client:")
@@ -828,6 +896,58 @@ def _build_orchestrator_input(
         )
 
     return "\n".join(summary_lines)
+
+
+def _build_orchestrator_user_content(
+    request_id: str,
+    case_id: str,
+    client_id: str,
+    message_id: str,
+    channel: str,
+    username: Optional[str],
+    payload_json: str,
+) -> list[dict[str, Any]]:
+    """
+    Build multimodal user message content for the orchestrator agent.
+
+    Args:
+        request_id: Ingress request id.
+        case_id: Case id.
+        client_id: Client id.
+        message_id: Message id.
+        channel: Channel name.
+        username: Optional username.
+        payload_json: Raw ingress payload JSON string.
+
+    Returns:
+        list[dict[str, Any]]: LangChain/OpenAI-style content blocks (text + image_url).
+    """
+    try:
+        payload: dict[str, Any] = json.loads(payload_json)
+    except Exception:
+        payload = {}
+
+    resolved_images = resolve_image_urls_from_payload(payload, redis_client=_redis)
+    text_context = _build_orchestrator_text_context(
+        request_id=request_id,
+        case_id=case_id,
+        client_id=client_id,
+        message_id=message_id,
+        channel=channel,
+        username=username,
+        payload=payload,
+        resolved_images=resolved_images,
+    )
+
+    blocks: list[dict[str, Any]] = [{"type": "text", "text": text_context}]
+    for image in resolved_images:
+        blocks.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": image.image_url},
+            }
+        )
+    return blocks
 
 # Create/ensure a consumer group for the job stream exists
 def _ensure_consumer_group(stream: str = "orchestrator_job") -> None:
@@ -993,6 +1113,15 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         system_prompt=system_prompt,
         middleware=[
             dynamic_model_selection,
+            ToolCallLimitMiddleware(
+                tool_name="get_intake_status",
+                run_limit=ORCHESTRATOR_GET_INTAKE_STATUS_RUN_LIMIT,
+                exit_behavior="continue",
+            ),
+            ToolCallLimitMiddleware(
+                run_limit=ORCHESTRATOR_TOOL_RUN_LIMIT,
+                exit_behavior="continue",
+            ),
             SummarizationMiddleware(
                 model=summarization_model,
                 trigger=("tokens", summarization_trigger_tokens),
@@ -1221,7 +1350,7 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             },
         )
 
-        user_prompt = _build_orchestrator_input(
+        user_content = _build_orchestrator_user_content(
             request_id=request_id,
             case_id=case_id,
             client_id=client_id,
@@ -1259,7 +1388,7 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             flow="job",
         )
         res = agent.invoke(
-            {"messages": [{"role": "user", "content": user_prompt}]},
+            {"messages": [HumanMessage(content=user_content)]},
             config=config,
         )
         agent_call_tracer.set_tool_names(agent_call_tracer.extract_tool_names(res))
@@ -1531,6 +1660,8 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         extras_obj = extras_obj if isinstance(extras_obj, dict) else {}
         group_id = str(extras_obj.get("group_id") or "").strip()
         group_expected_count = int(str(extras_obj.get("group_expected_count") or "1"))
+        signal_confidence = extract_confidence_from_fields(fields)
+        signal_threshold = extract_threshold_from_fields(fields)
 
         # Mark signal-in-flight so a concurrent job flow knows to wait briefly
         # for this signal's proactive_log write before composing its reply.
@@ -1608,6 +1739,8 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                 extra_metadata={
                     "signal_type": str(fields.get("signal_type") or ""),
                     "signal_id": str(fields.get("signal_id") or ""),
+                    **({"confidence": signal_confidence} if signal_confidence else {}),
+                    **({"threshold": signal_threshold} if signal_threshold else {}),
                 },
             )
             agent_call_tracer.start_turn(
@@ -1634,6 +1767,10 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         print(reply)
         logger.info("Orchestrator proactive reply: %s", reply)
 
+        delivery_prompt = format_delivery_context_for_prompt(
+            load_delivery_context(case_id, client_id, redis_client=_redis)
+        )
+
         # If the signal is part of a group, aggregate the replies
         if group_id and group_expected_count > 1:
             logger.info("___-------------------_______")
@@ -1650,6 +1787,7 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                     "fields": fields,
                     "reply": reply,
                 },
+                delivery_context_prompt=delivery_prompt,
             )
             if not aggregate_result.should_send:
                 _redis.xack(ORCHESTRATOR_SIGNAL_STREAM, ORCHESTRATOR_SIGNAL_CONSUMER_GROUP, msg_id)
@@ -1667,7 +1805,11 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             kind="signal_update",
             must_deliver=True,
             reply_to_message_id=reply_to_message_id,
+            confidence=signal_confidence or None,
+            threshold=signal_threshold or None,
         )
+
+        _finalize_intake_after_delivery(case_id, client_id)
 
         # Persist a compact record of the proactive message so the next user
         # turn (job flow) can see what was already sent. Best-effort.

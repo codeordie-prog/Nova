@@ -418,6 +418,8 @@ def _push_signal(
                 }
             ),
             "notes": notes,
+            "confidence": "" if confidence is None else str(confidence),
+            "threshold": str(threshold_used),
         }
     )
     msg_id = str(
@@ -432,7 +434,12 @@ def _push_signal(
         stream=_ORCHESTRATOR_SIGNAL_STREAM,
         msg_id=msg_id,
         fields=signal_fields,
-        extra_metadata={"worker": "medgemma_postprocess", "signal_type": signal_type},
+        extra_metadata={
+            "worker": "medgemma_postprocess",
+            "signal_type": signal_type,
+            "confidence": "" if confidence is None else str(confidence),
+            "threshold": str(threshold_used),
+        },
     )
 
 

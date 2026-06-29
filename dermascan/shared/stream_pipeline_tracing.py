@@ -12,6 +12,7 @@ filterable by ``request_id``.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -43,6 +44,8 @@ _CORRELATION_KEYS: Final[tuple[str, ...]] = (
     "kind",
     "trace_run_id",
     "group_id",
+    "confidence",
+    "threshold",
 )
 
 T = TypeVar("T")
@@ -153,6 +156,56 @@ def _distributed_parent_from_fields(fields: Optional[Mapping[str, Any]]) -> Opti
         Optional[str]: Parent run id for distributed tracing, if present.
     """
     return _valid_langsmith_run_id(_field_value(fields or {}, "trace_run_id"))
+
+
+def extract_confidence_from_fields(fields: Optional[Mapping[str, Any]]) -> str:
+    """
+    Extract model confidence from Redis stream fields or embedded JSON payload.
+
+    Args:
+        fields: Redis stream field mapping.
+
+    Returns:
+        str: Confidence value as string, or empty when absent.
+    """
+    direct = _field_value(fields or {}, "confidence")
+    if direct:
+        return direct
+    payload_raw = _field_value(fields or {}, "payload")
+    if not payload_raw:
+        return ""
+    try:
+        payload = json.loads(payload_raw)
+        if isinstance(payload, dict) and payload.get("confidence") is not None:
+            return str(payload.get("confidence")).strip()
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return ""
+    return ""
+
+
+def extract_threshold_from_fields(fields: Optional[Mapping[str, Any]]) -> str:
+    """
+    Extract confidence threshold from Redis stream fields or embedded JSON payload.
+
+    Args:
+        fields: Redis stream field mapping.
+
+    Returns:
+        str: Threshold value as string, or empty when absent.
+    """
+    direct = _field_value(fields or {}, "threshold")
+    if direct:
+        return direct
+    payload_raw = _field_value(fields or {}, "payload")
+    if not payload_raw:
+        return ""
+    try:
+        payload = json.loads(payload_raw)
+        if isinstance(payload, dict) and payload.get("threshold") is not None:
+            return str(payload.get("threshold")).strip()
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return ""
+    return ""
 
 
 @contextmanager
@@ -502,6 +555,8 @@ __all__ = [
     "build_correlation_metadata",
     "capture_trace_run_id",
     "enrich_stream_fields",
+    "extract_confidence_from_fields",
+    "extract_threshold_from_fields",
     "get_pipeline_project",
     "is_pipeline_tracing_enabled",
     "log_pipeline_tracing_status",

@@ -99,6 +99,7 @@ def _compile_group_report(
     request_id: str,
     entries: list[dict[str, Any]],
     fallback_text: str,
+    delivery_context_prompt: str = "",
 ) -> str:
     if not entries:
         return fallback_text
@@ -115,10 +116,13 @@ def _compile_group_report(
         "- Keep it concise and easy to read.\n"
         "- Always include the sources of the information at the end of the report. Sources should be a list of URLs not exceeding 3."
         "- Output plain text only.\n"
+        "- Personalize using client profile and intake context when provided.\n"
         f"group_id: {group_id}\n"
         f"signal_type: {signal_type}\n"
         f"items_json: {json.dumps(entries, default=str)}\n"
     )
+    if delivery_context_prompt:
+        prompt = f"{prompt}\nclient_context_for_personalization:\n{delivery_context_prompt}\n"
     try:
         config: RunnableConfig = build_invoke_config(
             thread_id=group_id,
@@ -156,6 +160,7 @@ def collect_and_compile_if_ready(
     signal_type: str,
     item_text: str,
     item_payload: dict[str, Any],
+    delivery_context_prompt: str = "",
 ) -> GroupAggregationResult:
     """
     Add one group item and compile final report when all items are available.
@@ -229,6 +234,7 @@ def collect_and_compile_if_ready(
             request_id=request_id,
             entries=parsed_items,
             fallback_text=fallback_text,
+            delivery_context_prompt=delivery_context_prompt,
         )
         return GroupAggregationResult(should_send=True, compiled_text=compiled, reason="compiled")
     except Exception:

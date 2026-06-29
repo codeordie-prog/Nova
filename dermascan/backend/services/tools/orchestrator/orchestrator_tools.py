@@ -13,15 +13,45 @@ from logging import Logger
 from uuid import uuid4
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-from typing import Any
+from typing import Any, Dict, Optional, Annotated
 
 import httpx
 from langchain.tools import tool
 from redis import Redis
 from tavily import TavilyClient
+from pydantic import BaseModel, ConfigDict, Field
+from datetime import datetime
+
 
 from dermascan.shared.logger import get_logger
-from dermascan.shared.redis_stability import get_redis_client
+from dermascan.shared.redis_stability import get_redis_client, run_with_redis_retries
+from dermascan.shared.ingress_payload import (
+    payload_has_image_attachment,
+    resolve_first_image_url_from_payload,
+    resolve_image_urls_from_payload,
+)
+from dermascan.shared.intake_session import (
+    IntakeImageCategory,
+    IntakeImageRef,
+    IntakePhase,
+    IntakeSession,
+    MISSING_PRIMARY_CONCERN,
+    MISSING_PRODUCT_IMAGE,
+    MISSING_PROFILE_MINIMUM,
+    MISSING_REPRODUCTIVE_STATUS,
+    MISSING_SERVICE_INTENT,
+    MISSING_SKIN_IMAGE,
+    ServiceIntent,
+    build_collected_context_summary,
+    is_ready_to_route,
+)
+from dermascan.shared.intake_session_store import (
+    IntakeSessionStoreError,
+    archive_intake_session,
+    get_or_create_intake_session,
+    save_intake_session_recomputed,
+)
+from dermascan.shared.firebase_storage import initialize_firebase_app
 
 load_dotenv()
 
@@ -66,42 +96,468 @@ _AUDIT_ENQUEUED_KEY_PREFIX: str = "diagnose:enqueued"
 _AUDIT_ENQUEUED_TTL_SEC: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"))
 _INGRESS_PAYLOAD_CACHE_PREFIX: str = "orchestrator:ingress_payload"
 _INGRESS_PAYLOAD_CACHE_TTL_SEC: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"))
-_LATEST_IMAGE_REQUEST_BY_CLIENT_PREFIX: str = "orchestrator:latest_image_request:client"
-_LATEST_IMAGE_REQUEST_BY_CASE_PREFIX: str = "orchestrator:latest_image_request:case"
-_LATEST_IMAGE_REQUEST_TTL_SEC: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"))
 _SEARCH_CACHE_PREFIX: str = "orchestrator:search_cache"
+_SKIN_PROFILE_CACHE_PREFIX: str = "skin_profile"
+_SKIN_PROFILE_CACHE_TTL_SEC: int = max(60, int(os.getenv("SKIN_PROFILE_CACHE_TTL_S", str(60 * 60 * 24 * 30))))
+
+class SkinProfile(BaseModel):
+    """Canonical skin profile stored for a client."""
+
+    age: int = Field(default=0, ge=0, description="Client age in years.")
+    gender: str = Field(
+        default="",
+        description="Gender or sex relevant to care (e.g. female, male, non-binary).",
+    )
+    location: str = Field(
+        default="",
+        description="City, region, or climate context when relevant to skin care.",
+    )
+    skin_type: str = Field(
+        default="",
+        description="Self-reported skin type: oily, dry, combination, sensitive, or normal.",
+    )
+    current_products: list[str] = Field(
+        default_factory=list,
+        description="Skincare or cosmetic products currently in the client's routine.",
+    )
+    current_medications: list[str] = Field(
+        default_factory=list,
+        description="Current medications that may affect skin (topical or systemic).",
+    )
+    current_conditions: list[str] = Field(
+        default_factory=list,
+        description="Active or chronic skin or related health conditions.",
+    )
+    current_goals: list[str] = Field(
+        default_factory=list,
+        description="Client skincare goals or concerns (e.g. acne, hyperpigmentation, anti-aging).",
+    )
+    allergies: list[str] = Field(
+        default_factory=list,
+        description="Known allergies or ingredient sensitivities.",
+    )
+    pregnancy: bool = Field(default=False, description="Whether the client is currently pregnant.")
+    breastfeeding: bool = Field(
+        default=False,
+        description="Whether the client is currently breastfeeding.",
+    )
+    notes: str = Field(
+        default="",
+        description="Free-text intake notes: onset, symptoms, spread, recent changes, or other context.",
+    )
 
 
+class SkinProfileUpdate(BaseModel):
+    """
+    Partial skin profile update payload for the update_skin_profile tool.
 
-def payload_has_image_attachment(payload: dict) -> bool:
-    """True when ingress payload includes at least one image attachment."""
-    attachments = (payload.get("content") or {}).get("attachments") or []
-    for attachment in attachments:
-        if not isinstance(attachment, dict):
-            continue
-        attachment_type = str(attachment.get("type") or "")
-        mime_type = str(attachment.get("mime_type") or "")
-        if attachment_type != "image" and not mime_type.startswith("image/"):
-            continue
-        source = attachment.get("source") or {}
-        if str(source.get("value") or "").strip():
-            return True
-    return False
+    Only include fields the user stated or you inferred during intake. Omitted fields
+    are left unchanged on an existing profile.
+    """
 
+    age: Optional[int] = Field(default=None, ge=0, description="Client age in years.")
+    gender: Optional[str] = Field(
+        default=None,
+        description="Gender or sex relevant to care (e.g. female, male, non-binary).",
+    )
+    location: Optional[str] = Field(
+        default=None,
+        description="City, region, or climate context when relevant to skin care.",
+    )
+    skin_type: Optional[str] = Field(
+        default=None,
+        description="Self-reported skin type: oily, dry, combination, sensitive, or normal.",
+    )
+    current_products: Optional[list[str]] = Field(
+        default=None,
+        description="Skincare or cosmetic products currently in the client's routine.",
+    )
+    current_medications: Optional[list[str]] = Field(
+        default=None,
+        description="Current medications that may affect skin (topical or systemic).",
+    )
+    current_conditions: Optional[list[str]] = Field(
+        default=None,
+        description="Active or chronic skin or related health conditions.",
+    )
+    current_goals: Optional[list[str]] = Field(
+        default=None,
+        description="Client skincare goals or concerns (e.g. acne, hyperpigmentation, anti-aging).",
+    )
+    allergies: Optional[list[str]] = Field(
+        default=None,
+        description="Known allergies or ingredient sensitivities.",
+    )
+    pregnancy: Optional[bool] = Field(
+        default=None,
+        description="Whether the client is currently pregnant.",
+    )
+    breastfeeding: Optional[bool] = Field(
+        default=None,
+        description="Whether the client is currently breastfeeding.",
+    )
+    notes: Optional[str] = Field(
+        default=None,
+        description="Free-text intake notes: onset, symptoms, spread, recent changes, or other context.",
+    )
+
+
+class UpdateSkinProfileInput(BaseModel):
+    """
+    Flat tool input for update_skin_profile (OpenAI strict function schemas).
+
+    Nested object parameters are rejected by OpenAI tool calling; all profile
+    fields are top-level optional arguments alongside client_id.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    client_id: str = Field(
+        min_length=1,
+        description=(
+            "Required. Exact client_id from the orchestrator input "
+            "(copy the value shown after 'client_id:'). "
+            "Do not use request_id or case_id."
+        ),
+    )
+    age: Optional[int] = Field(default=None, ge=0, description="Client age in years.")
+    gender: Optional[str] = Field(
+        default=None,
+        description="Gender or sex relevant to care (e.g. female, male, non-binary).",
+    )
+    location: Optional[str] = Field(
+        default=None,
+        description="City, region, or climate context when relevant to skin care.",
+    )
+    skin_type: Optional[str] = Field(
+        default=None,
+        description="Self-reported skin type: oily, dry, combination, sensitive, or normal.",
+    )
+    current_products: Optional[list[str]] = Field(
+        default=None,
+        description="Skincare or cosmetic products currently in the client's routine.",
+    )
+    current_medications: Optional[list[str]] = Field(
+        default=None,
+        description="Current medications that may affect skin (topical or systemic).",
+    )
+    current_conditions: Optional[list[str]] = Field(
+        default=None,
+        description="Active or chronic skin or related health conditions.",
+    )
+    current_goals: Optional[list[str]] = Field(
+        default=None,
+        description="Client skincare goals or concerns (e.g. acne, hyperpigmentation, anti-aging).",
+    )
+    allergies: Optional[list[str]] = Field(
+        default=None,
+        description="Known allergies or ingredient sensitivities.",
+    )
+    pregnancy: Optional[bool] = Field(
+        default=None,
+        description="Whether the client is currently pregnant.",
+    )
+    breastfeeding: Optional[bool] = Field(
+        default=None,
+        description="Whether the client is currently breastfeeding.",
+    )
+    notes: Optional[str] = Field(
+        default=None,
+        description="Free-text intake notes: onset, symptoms, spread, recent changes, or other context.",
+    )
+
+    def to_profile_update(self) -> SkinProfileUpdate:
+        """
+        Build a partial SkinProfileUpdate from set fields only.
+
+        Returns:
+            SkinProfileUpdate: Fields explicitly provided on this input.
+        """
+        return SkinProfileUpdate(**self.model_dump(exclude={"client_id"}, exclude_none=True))
+
+
+# Tool argument annotations (surfaced to the model in the JSON schema).
+OrchestratorRequestIdArg = Annotated[
+    str,
+    Field(
+        description=(
+            "Required. Exact request_id from the orchestrator input for this turn "
+            "(copy the value shown after 'request_id:' in the message). "
+            "Do not use client_id, case_id, or message_id."
+        ),
+    ),
+]
+
+OrchestratorClientIdArg = Annotated[
+    str,
+    Field(
+        description=(
+            "Required. Exact client_id from the orchestrator input "
+            "(copy the value shown after 'client_id:'). "
+            "Do not use request_id or case_id."
+        ),
+    ),
+]
+
+ServiceIntentArg = Annotated[
+    ServiceIntent,
+    Field(
+        description=(
+            "Required. User's chosen service. Exactly one of: "
+            "skin_review (skin photo review), "
+            "product_review (product label/packaging review), "
+            "combined (both skin and product), "
+            "general (no image audit routing)."
+        ),
+    ),
+]
+
+IntakeImageCategoryArg = Annotated[
+    IntakeImageCategory,
+    Field(
+        description=(
+            "Required. Category after visually inspecting the image. "
+            "skin = photo of face/body skin; "
+            "product = product label, packaging, or bottle."
+        ),
+    ),
+]
+
+AuditTypeArg = Annotated[
+    IntakeImageCategory,
+    Field(
+        description=(
+            "Required. Which registered intake image to enqueue: "
+            "skin = skin photo audit; product = product label audit. "
+            "For combined intent, call enque_request_for_auditing_stream twice "
+            "(skin then product) using each slot's request_id from get_intake_status."
+        ),
+    ),
+]
+
+IntakeVisualNoteArg = Annotated[
+    str,
+    Field(
+        default="",
+        description=(
+            "Optional. Short non-diagnostic intake note about what you see "
+            "(e.g. 'SPF label visible', 'rash on cheek'). Not a diagnosis."
+        ),
+    ),
+]
+
+IntakeAttachmentIdArg = Annotated[
+    str,
+    Field(
+        default="",
+        description=(
+            "Optional. attachment_id from ingress_images_for_this_message when the user "
+            "sent multiple images in one message. Omit when only one image is present."
+        ),
+    ),
+]
+
+PrimaryConcernArg = Annotated[
+    str,
+    Field(
+        description=(
+            "Required. User's main question or goal in one short sentence "
+            "(e.g. 'Is this moisturizer safe during pregnancy?')."
+        ),
+    ),
+]
+
+IntakeNoteArg = Annotated[
+    str,
+    Field(
+        description=(
+            "Required. One short consultation fact from the user "
+            "(symptom, timeline, product change). Not the main question."
+        ),
+    ),
+]
+
+AuditCollectedContextArg = Annotated[
+    str,
+    Field(
+        default="",
+        description=(
+            "Optional supplement to the server-built intake summary. "
+            "Short facts only; do not paste raw chat. Leave empty to use intake session summary."
+        ),
+    ),
+]
+
+
+def _normalize_client_id(client_id: str) -> str:
+    """
+    Normalize user-provided client id into a safe cache/document key.
+    
+    Args:
+        client_id (str): The exact client id provided
+
+    Returns:
+        str - The normalized client id
+    """
+    return str(client_id or "").strip()
+
+
+def _skin_profile_cache_key(client_id: str) -> str:
+    """
+    Build Redis key for a client's skin profile.
+
+    Args:
+        client_id (str): The exact client id provided
+
+    Returns:
+        str - The Redis key
+    """
+    return f"{_SKIN_PROFILE_CACHE_PREFIX}:{client_id}"
+
+
+def _serialize_skin_profile(profile: dict[str, Any]) -> str:
+    """
+    Serialize a skin profile for Redis storage.
+
+    Args:
+        profile (dict[str, Any]): The skin profile to serialize
+
+    Returns:
+        str - The serialized skin profile
+    """
+    return json.dumps(profile, default=str)
+
+
+def _deserialize_skin_profile(raw_profile: Any) -> dict[str, Any]:
+    """
+    Deserialize a skin profile value from Redis payload to dict.
+
+    Args:
+        raw_profile (Any): The raw profile to deserialize
+
+    Returns:
+        dict[str, Any] - The deserialized skin profile
+    """
+    if isinstance(raw_profile, dict):
+        return raw_profile
+    if isinstance(raw_profile, str):
+        try:
+            parsed = json.loads(raw_profile)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _fetch_skin_profile_dict(cid: str) -> dict[str, Any]:
+    """
+    Load a client's skin profile from Redis cache or Firestore.
+
+    Args:
+        cid: Normalized client id.
+
+    Returns:
+        dict[str, Any]: Profile fields, or empty dict when absent.
+    """
+    if not cid:
+        return {}
+
+    cache_key = _skin_profile_cache_key(cid)
+    if _redis is not None:
+        try:
+            cached_profile = run_with_redis_retries(
+                lambda: _redis.get(cache_key),
+                operation_name="skin_profile_get",
+            )
+            parsed_cached = _deserialize_skin_profile(cached_profile)
+            if parsed_cached:
+                return parsed_cached
+        except Exception:
+            logger.exception("failed to read skin profile cache: client_id=%s", cid)
+
+    firestore_client = _get_firestore_client()
+    if firestore_client is None:
+        return {}
+
+    try:
+        doc = firestore_client.collection("skin_profiles").document(cid).get()
+    except Exception:
+        logger.exception("failed to read skin profile from firestore: client_id=%s", cid)
+        return {}
+
+    if not doc.exists:
+        return {}
+
+    skin_profile = doc.to_dict() or {}
+    if not isinstance(skin_profile, dict):
+        return {}
+
+    if _redis is not None and skin_profile:
+        try:
+            run_with_redis_retries(
+                lambda: _redis.setex(
+                    cache_key,
+                    _SKIN_PROFILE_CACHE_TTL_SEC,
+                    _serialize_skin_profile(skin_profile),
+                ),
+                operation_name="skin_profile_set",
+            )
+        except Exception:
+            logger.exception("failed to cache skin profile from firestore: client_id=%s", cid)
+    return skin_profile
+
+
+def _merge_skin_profile(
+    existing: dict[str, Any],
+    updates: SkinProfileUpdate,
+) -> dict[str, Any]:
+    """
+    Merge partial profile updates onto defaults and any stored profile.
+
+    Args:
+        existing: Current stored profile fields.
+        updates: Partial update from the orchestrator tool call.
+
+    Returns:
+        dict[str, Any]: Validated full profile ready for persistence.
+
+    Raises:
+        ValueError: When merged fields fail SkinProfile validation.
+    """
+    base = SkinProfile().model_dump()
+    patch = updates.model_dump(exclude_none=True)
+    merged = {**base, **existing, **patch}
+    return SkinProfile.model_validate(merged).model_dump()
+
+
+def _get_firestore_client() -> Any | None:
+    """
+    Best-effort Firestore client init; fails open to keep tool flow resilient.
+
+    Returns:
+        Any | None - The Firestore client
+    """
+    try:
+        initialize_firebase_app()
+        from firebase_admin import firestore
+
+        return firestore.client()
+    except Exception:
+        logger.exception("failed to initialize firestore client")
+        return None
+    
 
 def _payload_cache_key(request_id: str) -> str:
-    """Build Redis key for request-scoped ingress payload cache."""
+    """
+    Build Redis key for request-scoped ingress payload cache.
+
+    Args:
+        request_id (str): The request id
+
+    Returns:
+        str - The Redis key
+    """
     return f"{_INGRESS_PAYLOAD_CACHE_PREFIX}:{request_id}"
-
-
-def _latest_image_request_key_for_client(client_id: str) -> str:
-    """Build Redis key for latest image request id scoped by client."""
-    return f"{_LATEST_IMAGE_REQUEST_BY_CLIENT_PREFIX}:{client_id}"
-
-
-def _latest_image_request_key_for_case(case_id: str) -> str:
-    """Build Redis key for latest image request id scoped by case."""
-    return f"{_LATEST_IMAGE_REQUEST_BY_CASE_PREFIX}:{case_id}"
 
 
 def cache_ingress_payload(
@@ -150,6 +606,9 @@ def cache_ingress_payload(
 def _get_cached_ingress_payload(request_id: str) -> str:
     """
     Get cached ingress payload for request id.
+    
+    Args:
+        request_id (str): The request id
 
     Returns:
         Cached payload JSON string or empty string.
@@ -227,6 +686,316 @@ def _get_cached_ingress_envelope(request_id: str) -> dict[str, str]:
         "channel": "whatsapp",
         "payload": json.dumps(cached_obj, default=str),
     }
+
+
+def _ingress_error(request_id: str, detail: str) -> dict[str, Any]:
+    """
+    Build a standard ingress resolution error payload for tool responses.
+
+    Args:
+        request_id (str): The request id
+        detail (str): The detail of the error
+
+    Returns:
+        dict[str, Any] - The error payload
+    """
+    return {
+        "status": "error",
+        "detail": detail,
+        "request_id": str(request_id or "").strip(),
+    }
+
+
+def _require_ingress_envelope(request_id: str) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+    """
+    Load cached ingress envelope or return an agent-facing error payload.
+
+    Args:
+        request_id (str): The request id
+
+    Returns:
+        tuple[dict[str, str] | None, dict[str, Any] | None] - The envelope and error
+    """
+    envelope = _get_cached_ingress_envelope(request_id)
+    if envelope:
+        return envelope, None
+    return None, _ingress_error(
+        request_id,
+        "ingress cache not found for request_id. Use the exact request_id from the current turn.",
+    )
+
+
+def _load_skin_profile_mapping(client_id: str) -> dict[str, Any]:
+    """
+    Load skin profile fields for intake recomputation.
+
+    Args:
+        client_id (str): The client id
+
+    Returns:
+        dict[str, Any] - The skin profile
+    """
+    cid = _normalize_client_id(client_id)
+    profile = _fetch_skin_profile_dict(cid)
+    if profile:
+        return profile
+    return SkinProfile().model_dump()
+
+
+def _persist_intake_session(
+    session: IntakeSession,
+    profile: dict[str, Any],
+) -> tuple[IntakeSession | None, dict[str, Any] | None]:
+    """
+    Recompute and save an intake session after a tool mutation.
+
+    Args:
+        session (IntakeSession): The intake session
+        profile (dict[str, Any]): The skin profile
+
+    Returns:
+        tuple[IntakeSession | None, dict[str, Any] | None] - The updated session and error
+    """
+    try:
+        updated = save_intake_session_recomputed(session, profile, redis_client=_redis)
+        return updated, None
+    except IntakeSessionStoreError as exc:
+        logger.exception("failed to persist intake session: client_id=%s", session.client_id)
+        return None, {
+            "status": "error",
+            "detail": f"failed to persist intake session: {exc}",
+            "client_id": session.client_id,
+            "case_id": session.case_id,
+        }
+    except Exception as exc:
+        logger.exception("unexpected intake session persistence failure: client_id=%s", session.client_id)
+        return None, {
+            "status": "error",
+            "detail": f"failed to persist intake session: {exc}",
+            "client_id": session.client_id,
+            "case_id": session.case_id,
+        }
+
+
+def _archive_intake_for_signal_delivery(session: IntakeSession) -> None:
+    """
+    Archive intake worksheet for signal delivery without clearing the active key.
+
+    Args:
+        session (IntakeSession): Session to archive (typically awaiting_audit).
+    """
+    try:
+        archive_intake_session(session, redis_client=_redis, delete_active=False)
+    except IntakeSessionStoreError:
+        logger.exception(
+            "failed to archive intake for signal delivery: case_id=%s client_id=%s",
+            session.case_id,
+            session.client_id,
+        )
+
+
+def _mark_intake_awaiting_audit(
+    session: IntakeSession,
+    profile: dict[str, Any],
+) -> None:
+    """
+    Set intake phase to awaiting_audit, persist, and archive for signal handlers.
+
+    Args:
+        session (IntakeSession): Current intake session.
+        profile (dict[str, Any]): Skin profile for recomputation.
+    """
+    awaiting_session = session.model_copy(update={"phase": IntakePhase.AWAITING_AUDIT})
+    updated, _ = _persist_intake_session(awaiting_session, profile)
+    if updated is not None:
+        _archive_intake_for_signal_delivery(updated)
+
+
+def _intake_stop_suffix() -> str:
+    """
+    Standard instruction suffix to prevent tool-call loops within one turn.
+
+    Returns:
+        str: Anti-loop guidance for tool responses.
+    """
+    return (
+        " Then compose your final reply to the user in this turn. "
+        "Do NOT call get_intake_status again this turn. "
+        "Do NOT repeat a tool that already returned saved/registered/queued."
+    )
+
+
+def _derive_intake_next_action(session: IntakeSession, profile: dict[str, Any]) -> str:
+    """
+    Recommend exactly one next tool for the orchestrator model.
+
+    Args:
+        session (IntakeSession): Current intake session.
+        profile (dict[str, Any]): Skin profile mapping.
+
+    Returns:
+        str: Tool name the model should call next, or reply_only when done.
+    """
+    if is_ready_to_route(session, profile):
+        return "enque_request_for_auditing_stream"
+
+    missing = session.missing_for_routing
+    if MISSING_SERVICE_INTENT in missing:
+        return "set_service_intent"
+    if MISSING_SKIN_IMAGE in missing or MISSING_PRODUCT_IMAGE in missing:
+        return "register_intake_image"
+    if MISSING_PRIMARY_CONCERN in missing:
+        return "set_primary_concern"
+    if MISSING_PROFILE_MINIMUM in missing:
+        return "update_skin_profile"
+    if MISSING_REPRODUCTIVE_STATUS in missing:
+        return "confirm_reproductive_status"
+    return "reply_only"
+
+
+def _intake_instruction(session: IntakeSession, profile: dict[str, Any]) -> str:
+    """
+    Build a short next-step instruction for the agent from intake state.
+
+    Args:
+        session (IntakeSession): The intake session
+        profile (dict[str, Any]): Skin profile for routing checks
+
+    Returns:
+        str - The instruction
+    """
+    stop = _intake_stop_suffix()
+    next_tool = _derive_intake_next_action(session, profile)
+
+    if session.phase == IntakePhase.AWAITING_AUDIT:
+        return (
+            "Audits are already queued. Tell the user their photo is being reviewed. "
+            "Do NOT call enque_request_for_auditing_stream or get_intake_status."
+        )
+
+    if is_ready_to_route(session, profile):
+        if session.service_intent == ServiceIntent.COMBINED:
+            return (
+                "Call enque_request_for_auditing_stream twice: audit_type=skin then product "
+                f"(current turn request_id).{stop}"
+            )
+        audit_type = "skin"
+        if session.service_intent == ServiceIntent.PRODUCT_REVIEW:
+            audit_type = "product"
+        return (
+            f"Call enque_request_for_auditing_stream once with audit_type={audit_type} "
+            f"(current turn request_id).{stop}"
+        )
+
+    if MISSING_PROFILE_MINIMUM in session.missing_for_routing:
+        gaps = ", ".join(session.profile_gaps) or "profile fields from profile_gaps"
+        return (
+            f"Call update_skin_profile with client_id and: {gaps}. "
+            f"Use values the user stated in their latest message.{stop}"
+        )
+
+    if MISSING_REPRODUCTIVE_STATUS in session.missing_for_routing:
+        return (
+            "Set pregnancy/breastfeeding via update_skin_profile if the user answered, "
+            f"then call confirm_reproductive_status once.{stop}"
+        )
+
+    if session.missing_for_routing:
+        missing = ", ".join(session.missing_for_routing)
+        return (
+            f"Missing: {missing}. Call {next_tool} once using the latest user message.{stop}"
+        )
+
+    return f"Continue intake. Next tool: {next_tool}.{stop}"
+
+
+def _format_intake_status(
+    session: IntakeSession,
+    profile: dict[str, Any],
+    *,
+    request_id: str = "",
+) -> dict[str, Any]:
+    """
+    Format intake session state for agent tool responses.
+    
+    Args:
+        session (IntakeSession): The intake session
+        profile (dict[str, Any]): The skin profile
+        request_id (str): The request id
+
+    Returns:
+        dict[str, Any] - The intake status
+    """
+    skin_ref = session.images.get(IntakeImageCategory.SKIN.value)
+    product_ref = session.images.get(IntakeImageCategory.PRODUCT.value)
+    ready = is_ready_to_route(session, profile)
+
+    return {
+        "status": "ok",
+        "request_id": request_id,
+        "phase": session.phase.value,
+        "service_intent": session.service_intent.value if session.service_intent else None,
+        "primary_concern": session.primary_concern,
+        "reproductive_status_confirmed": session.reproductive_status_confirmed,
+        "images": {
+            "skin": {
+                "present": skin_ref is not None,
+                "request_id": skin_ref.request_id if skin_ref else "",
+            },
+            "product": {
+                "present": product_ref is not None,
+                "request_id": product_ref.request_id if product_ref else "",
+            },
+        },
+        "profile_gaps": list(session.profile_gaps),
+        "missing_for_routing": list(session.missing_for_routing),
+        "ready_to_route": ready,
+        "collected_context_summary": session.collected_context_summary,
+        "next_recommended_tool": _derive_intake_next_action(session, profile),
+        "instruction": _intake_instruction(session, profile),
+    }
+
+
+def _resolve_registration_image(
+    envelope: dict[str, str],
+    attachment_id: Optional[str] = None,
+) -> tuple[str, str, str] | None:
+    """
+    Resolve one image URL from an ingress envelope for intake registration.
+
+    Args:
+        envelope (dict[str, str]): The ingress envelope
+        attachment_id (Optional[str]): The attachment id
+
+    Returns:
+        tuple[str, str, str] | None - The image url
+    """
+    try:
+        payload_obj: dict[str, Any] = json.loads(str(envelope.get("payload") or "{}"))
+    except Exception:
+        payload_obj = {}
+
+    resolved_images = resolve_image_urls_from_payload(payload_obj, redis_client=_redis)
+    if not resolved_images:
+        return None
+
+    target_attachment = str(attachment_id or "").strip()
+    if target_attachment:
+        for image in resolved_images:
+            if image.attachment_id == target_attachment:
+                return (
+                    str(envelope.get("request_id") or "").strip(),
+                    image.attachment_id,
+                    image.image_url,
+                )
+        return None
+
+    first = resolved_images[0]
+    return (
+        str(envelope.get("request_id") or "").strip(),
+        first.attachment_id,
+        first.image_url,
+    )
 
 
 def _resolve_canonical_payload(*, request_id: str, payload: str) -> str:
@@ -315,49 +1084,7 @@ def _resolve_image_url_from_payload(payload_obj: dict[str, Any]) -> str:
     Returns:
         Image URL string, or empty string when not resolvable.
     """
-    attachments = (payload_obj.get("content") or {}).get("attachments") or []
-    for attachment in attachments:
-        if not isinstance(attachment, dict):
-            continue
-        attachment_type = str(attachment.get("type") or "")
-        mime_type = str(attachment.get("mime_type") or "")
-        if attachment_type != "image" and not mime_type.startswith("image/"):
-            continue
-
-        source = attachment.get("source") or {}
-        source_kind = str(source.get("kind") or "").strip().lower()
-        source_value = str(source.get("value") or "").strip()
-        if not source_value:
-            continue
-
-        if source_kind == "url" and source_value.lower().startswith(("http://", "https://")):
-            return source_value
-
-        # Blob refs are expected to map to signed/object URLs in Redis.
-        if source_kind == "blob_ref" and _redis is not None:
-            try:
-                cached = str(_redis.get(source_value) or "").strip()
-                if cached.lower().startswith(("http://", "https://")):
-                    return cached
-            except Exception:
-                logger.exception("failed to resolve blob_ref to image url: ref=%s", source_value)
-
-    # Fallback for Telegram-style metadata extras.
-    extras_obj = ((payload_obj.get("metadata") or {}).get("extras") or {})
-    if isinstance(extras_obj, dict):
-        telegram_media_ref = str(extras_obj.get("telegram_media_ref") or "").strip()
-        if telegram_media_ref and _redis is not None:
-            try:
-                cached = str(_redis.get(telegram_media_ref) or "").strip()
-                if cached.lower().startswith(("http://", "https://")):
-                    return cached
-            except Exception:
-                logger.exception(
-                    "failed to resolve telegram_media_ref to image url: ref=%s",
-                    telegram_media_ref,
-                )
-
-    return ""
+    return resolve_first_image_url_from_payload(payload_obj, redis_client=_redis)
 
 
 def _extract_prompt_context(payload_obj: dict[str, Any]) -> str:
@@ -416,6 +1143,188 @@ def _parse_retry_after_seconds(value: str) -> str:
         return ""
 
 
+def _audit_enqueued_dedupe_key(request_id: str) -> str:
+    """
+    Build Redis dedupe key for a dispatched image audit.
+
+    Args:
+        request_id (str): Ingress request id of the image message.
+
+    Returns:
+        str: Redis key string.
+    """
+    return f"{_AUDIT_ENQUEUED_KEY_PREFIX}:{request_id}"
+
+
+def _is_audit_enqueued(request_id: str) -> bool:
+    """
+    Return True when an audit dispatch dedupe marker exists for request_id.
+
+    Args:
+        request_id (str): Ingress request id of the image message.
+
+    Returns:
+        bool: True when already enqueued.
+    """
+    if _redis is None:
+        return False
+    try:
+        return bool(_redis.get(_audit_enqueued_dedupe_key(request_id)))
+    except Exception:
+        logger.exception("failed to read audit dedupe key: request_id=%s", request_id)
+        return False
+
+
+def _required_audit_categories(session: IntakeSession) -> list[IntakeImageCategory]:
+    """
+    List image categories that must be enqueued for the session service intent.
+
+    Args:
+        session (IntakeSession): Current intake session.
+
+    Returns:
+        list[IntakeImageCategory]: Required audit categories.
+    """
+    intent = session.service_intent
+    if intent == ServiceIntent.SKIN_REVIEW:
+        return [IntakeImageCategory.SKIN]
+    if intent == ServiceIntent.PRODUCT_REVIEW:
+        return [IntakeImageCategory.PRODUCT]
+    if intent == ServiceIntent.COMBINED:
+        return [IntakeImageCategory.SKIN, IntakeImageCategory.PRODUCT]
+    return []
+
+
+def _all_required_audits_enqueued(session: IntakeSession) -> bool:
+    """
+    Return True when every required audit category has a dedupe marker in Redis.
+
+    Args:
+        session (IntakeSession): Current intake session.
+
+    Returns:
+        bool: True when all required image audits were dispatched.
+    """
+    required = _required_audit_categories(session)
+    if not required:
+        return False
+    for category in required:
+        ref = session.images.get(category.value)
+        if ref is None or not _is_audit_enqueued(ref.request_id):
+            return False
+    return True
+
+
+def _audit_type_allowed(session: IntakeSession, audit_type: IntakeImageCategory) -> bool:
+    """
+    Return True when audit_type matches the session service intent.
+
+    Args:
+        session (IntakeSession): Current intake session.
+        audit_type (IntakeImageCategory): Requested audit category.
+
+    Returns:
+        bool: True when enqueue is allowed for this audit type.
+    """
+    intent = session.service_intent
+    if intent == ServiceIntent.SKIN_REVIEW:
+        return audit_type == IntakeImageCategory.SKIN
+    if intent == ServiceIntent.PRODUCT_REVIEW:
+        return audit_type == IntakeImageCategory.PRODUCT
+    if intent == ServiceIntent.COMBINED:
+        return audit_type in (IntakeImageCategory.SKIN, IntakeImageCategory.PRODUCT)
+    return False
+
+
+def _enqueue_group_params(session: IntakeSession) -> tuple[str, int]:
+    """
+    Derive grouped-media parameters for combined skin+product enqueue.
+
+    Args:
+        session (IntakeSession): Current intake session.
+
+    Returns:
+        tuple[str, int]: group_id and group_expected_count for MedGemma dispatch.
+    """
+    if session.service_intent == ServiceIntent.COMBINED:
+        return session.case_id, 2
+    return "", 0
+
+
+def _build_audit_context_text(
+    session: IntakeSession,
+    profile: dict[str, Any],
+    audit_type: IntakeImageCategory,
+    collected_context: str,
+) -> str:
+    """
+    Build MedGemma audit context from intake summary plus audit focus.
+
+    Args:
+        session (IntakeSession): Current intake session.
+        profile (dict[str, Any]): Skin profile mapping.
+        audit_type (IntakeImageCategory): Audit category being enqueued.
+        collected_context (str): Optional model supplement.
+
+    Returns:
+        str: Context string for audit dispatch.
+    """
+    base_summary = session.collected_context_summary.strip()
+    if not base_summary:
+        base_summary = build_collected_context_summary(session, profile)
+
+    focus = (
+        "Audit focus: skin image review (dermatological assessment)."
+        if audit_type == IntakeImageCategory.SKIN
+        else "Audit focus: product image review (label and ingredient assessment)."
+    )
+    parts = [base_summary, focus]
+    extra = str(collected_context or "").strip()
+    if extra:
+        parts.append(extra)
+    return "\n".join(parts)
+
+
+def _enqueue_audit_instruction(
+    session: IntakeSession,
+    audit_type: IntakeImageCategory,
+    dispatch_status: str,
+) -> str:
+    """
+    Build agent instruction after a terminal enqueue outcome.
+
+    Args:
+        session (IntakeSession): Current intake session.
+        audit_type (IntakeImageCategory): Audit category just enqueued.
+        dispatch_status (str): Dispatch result status.
+
+    Returns:
+        str: Instruction for the orchestrator model.
+    """
+    if dispatch_status not in {"queued", "already_queued"}:
+        return ""
+
+    if session.service_intent == ServiceIntent.COMBINED:
+        other = (
+            IntakeImageCategory.PRODUCT
+            if audit_type == IntakeImageCategory.SKIN
+            else IntakeImageCategory.SKIN
+        )
+        other_ref = session.images.get(other.value)
+        if other_ref and not _is_audit_enqueued(other_ref.request_id):
+            return (
+                f"The {audit_type.value} audit is queued. Call enque_request_for_auditing_stream "
+                f"again with audit_type={other.value}. Do NOT re-enqueue {audit_type.value}. "
+                "Tell the user both photos are being reviewed when both are queued."
+            )
+
+    return (
+        "The image audit request is now in the queue. Do NOT call this tool again. "
+        "Tell the user their photo was received and is being reviewed by the specialist team, "
+        "and that results will follow shortly."
+    )
+
+
 def _dispatch_audit_image_ref(
     *,
     request_id: str,
@@ -425,6 +1334,8 @@ def _dispatch_audit_image_ref(
     channel: str,
     image_url: str,
     context: str,
+    group_id: str = "",
+    group_expected_count: int = 0,
 ) -> dict[str, str]:
     """
     Dispatch directly to MedGemma ref endpoint.
@@ -437,12 +1348,14 @@ def _dispatch_audit_image_ref(
         channel: Source channel.
         image_url: Signed/downloadable image URL.
         context: Model context text.
+        group_id: Group identifier.
+        group_expected_count: Group expected count.
 
     Returns:
         Status dictionary for tool caller.
     """
     endpoint = f"{MEDGEMMA_GATEWAY_URL.rstrip('/')}/audit_image_ref"
-    payload = {
+    payload: dict[str, Any] = {
         "request_id": request_id,
         "case_id": case_id,
         "client_id": client_id,
@@ -451,6 +1364,10 @@ def _dispatch_audit_image_ref(
         "image_url": image_url,
         "context": context,
     }
+    if group_id:
+        payload["group_id"] = group_id
+    if group_expected_count > 0:
+        payload["group_expected_count"] = group_expected_count
 
     timeout = httpx.Timeout(
         timeout=MEDGEMMA_ENDPOINT_TIMEOUT_S,
@@ -508,31 +1425,133 @@ def get_time() -> str:
 
 
 @tool
-def save_latest_image_request_id(request_id: str) -> dict[str, str]:
+def get_intake_status(request_id: OrchestratorRequestIdArg) -> dict[str, Any]:
     """
-    Save the latest image-bearing request_id for this conversation context.
+    Read the intake worksheet: phase, service intent, saved skin/product images,
+    profile gaps, missing items, and whether routing is allowed.
 
-    Args:
-        request_id: The request id that contains the uploaded image.
+    Arguments:
+        request_id (string, required): Exact request_id from the current orchestrator input.
 
     Returns:
-        Status payload indicating save result and scope metadata.
+        JSON with status, phase, service_intent, images.skin/product (present + request_id),
+        profile_gaps, missing_for_routing, ready_to_route, collected_context_summary, instruction.
+
+    Call after any intake change and always before enque_request_for_auditing_stream.
     """
-    logger.info("TOOL CALL: save_latest_image_request_id: request_id=%s", request_id)
+    logger.info("TOOL CALL: get_intake_status: request_id=%s", request_id)
 
-    if _redis is None:
-        return {"status": "error", "detail": "REDIS_URL is not configured", "request_id": request_id}
+    envelope, error = _require_ingress_envelope(request_id)
+    if error:
+        return error
 
-    envelope = _get_cached_ingress_envelope(request_id)
-    if not envelope:
+    client_id = str(envelope.get("client_id") or "anonymous").strip()
+    case_id = str(envelope.get("case_id") or envelope.get("request_id") or request_id).strip()
+    profile = _load_skin_profile_mapping(client_id)
+
+    try:
+        session = get_or_create_intake_session(client_id, case_id, redis_client=_redis)
+    except IntakeSessionStoreError as exc:
         return {
             "status": "error",
-            "detail": "ingress cache not found for request_id",
+            "detail": f"failed to load intake session: {exc}",
             "request_id": request_id,
         }
 
+    updated, persist_error = _persist_intake_session(session, profile)
+    if persist_error:
+        return persist_error
+    assert updated is not None
+
+    return _format_intake_status(updated, profile, request_id=request_id)
+
+
+@tool
+def set_service_intent(
+    request_id: OrchestratorRequestIdArg,
+    intent: ServiceIntentArg,
+) -> dict[str, Any]:
+    """
+    Record which review service the user wants.
+
+    Arguments:
+        request_id (string, required): Exact request_id from the current orchestrator input.
+        intent (enum, required): Exactly one of:
+            - skin_review: user wants a skin image reviewed.
+            - product_review: user wants a product label/packaging reviewed.
+            - combined: user wants both skin and product reviewed.
+            - general: general enquiry; no image audit routing.
+
+    Returns:
+        Updated intake status JSON (same shape as get_intake_status) with status saved.
+
+    Call when the user picks a menu option or states their goal. Then call get_intake_status.
+    """
+    logger.info("TOOL CALL: set_service_intent: request_id=%s intent=%s", request_id, intent)
+
+    envelope, error = _require_ingress_envelope(request_id)
+    if error:
+        return error
+
+    client_id = str(envelope.get("client_id") or "anonymous").strip()
+    case_id = str(envelope.get("case_id") or envelope.get("request_id") or request_id).strip()
+    profile = _load_skin_profile_mapping(client_id)
+
     try:
-        payload_obj = json.loads(str(envelope.get("payload") or "{}"))
+        session = get_or_create_intake_session(client_id, case_id, redis_client=_redis)
+    except IntakeSessionStoreError as exc:
+        return {"status": "error", "detail": f"failed to load intake session: {exc}", "request_id": request_id}
+
+    session = session.model_copy(update={"service_intent": intent})
+    updated, persist_error = _persist_intake_session(session, profile)
+    if persist_error:
+        return persist_error
+    assert updated is not None
+
+    result = _format_intake_status(updated, profile, request_id=request_id)
+    result["status"] = "saved"
+    return result
+
+
+@tool
+def register_intake_image(
+    request_id: OrchestratorRequestIdArg,
+    image_category: IntakeImageCategoryArg,
+    visual_note: IntakeVisualNoteArg = "",
+    attachment_id: IntakeAttachmentIdArg = "",
+) -> dict[str, Any]:
+    """
+    Register a categorized image after you have inspected it in the message.
+
+    Arguments:
+        request_id (string, required): request_id of the message that contained the image
+            (from ingress_images_for_this_message, not necessarily the current turn if
+            the image was sent earlier).
+        image_category (enum, required): skin or product (see schema).
+        visual_note (string, optional): Brief non-diagnostic observation; default empty.
+        attachment_id (string, optional): From ingress_images_for_this_message when
+            multiple images were sent together; default empty.
+
+    Do not pass image URLs — the server resolves them from the cached ingress payload.
+
+    Returns:
+        Intake status JSON plus status registered, registered_category, registered_image_request_id.
+
+    Call once per image after visually classifying it. Then call get_intake_status.
+    """
+    logger.info(
+        "TOOL CALL: register_intake_image: request_id=%s category=%s attachment_id=%s",
+        request_id,
+        image_category,
+        attachment_id,
+    )
+
+    envelope, error = _require_ingress_envelope(request_id)
+    if error:
+        return error
+
+    try:
+        payload_obj: dict[str, Any] = json.loads(str(envelope.get("payload") or "{}"))
     except Exception:
         payload_obj = {}
 
@@ -541,220 +1560,399 @@ def save_latest_image_request_id(request_id: str) -> dict[str, str]:
             "status": "blocked_missing_image",
             "request_id": str(envelope.get("request_id") or request_id),
             "instruction": (
-                "This request does not contain an image attachment. Do NOT call this tool again for this request_id. "
-                "Ask the user to upload a clear image first."
+                "This request_id has no image attachment. Do NOT call this tool again for it. "
+                "Ask the user to send a clear photo, then register using that message's request_id."
             ),
         }
 
-    resolved_request_id = str(envelope.get("request_id") or request_id).strip()
-    client_id = str(envelope.get("client_id") or "anonymous").strip()
-    case_id = str(envelope.get("case_id") or resolved_request_id).strip()
-
-    try:
-        _redis.setex(
-            _latest_image_request_key_for_client(client_id),
-            _LATEST_IMAGE_REQUEST_TTL_SEC,
-            resolved_request_id,
-        )
-        _redis.setex(
-            _latest_image_request_key_for_case(case_id),
-            _LATEST_IMAGE_REQUEST_TTL_SEC,
-            resolved_request_id,
-        )
-    except Exception:
-        logger.exception(
-            "failed to save latest image request id: request_id=%s client_id=%s case_id=%s",
-            resolved_request_id,
-            client_id,
-            case_id,
-        )
+    resolved = _resolve_registration_image(envelope, attachment_id=attachment_id or None)
+    if resolved is None:
         return {
             "status": "error",
-            "detail": "failed to persist latest image request id",
-            "request_id": resolved_request_id,
-        }
-
-    return {
-        "status": "saved",
-        "request_id": resolved_request_id,
-        "client_id": client_id,
-        "case_id": case_id,
-        "instruction": (
-            "Latest image request_id has been saved. Continue collecting missing intake context. "
-            "Before routing, call get_latest_image_request_id to retrieve the request_id to enqueue."
-        ),
-    }
-
-
-@tool
-def get_latest_image_request_id(request_id: str) -> dict[str, str]:
-    """
-    Get the latest saved image-bearing request_id for this conversation context.
-
-    Args:
-        request_id: Current turn request id used to resolve client/case scope.
-
-    Returns:
-        Status payload with the latest image request id when available.
-    """
-    logger.info("TOOL CALL: get_latest_image_request_id: request_id=%s", request_id)
-
-    if _redis is None:
-        return {"status": "error", "detail": "REDIS_URL is not configured", "request_id": request_id}
-
-    envelope = _get_cached_ingress_envelope(request_id)
-    if not envelope:
-        return {
-            "status": "error",
-            "detail": "ingress cache not found for request_id",
-            "request_id": request_id,
-        }
-
-    client_id = str(envelope.get("client_id") or "anonymous").strip()
-    case_id = str(envelope.get("case_id") or "").strip()
-
-    latest_request_id = ""
-    try:
-        if case_id:
-            latest_request_id = str(_redis.get(_latest_image_request_key_for_case(case_id)) or "").strip()
-        if not latest_request_id and client_id:
-            latest_request_id = str(_redis.get(_latest_image_request_key_for_client(client_id)) or "").strip()
-    except Exception:
-        logger.exception(
-            "failed to read latest image request id: request_id=%s client_id=%s case_id=%s",
-            request_id,
-            client_id,
-            case_id,
-        )
-        return {
-            "status": "error",
-            "detail": "failed to read latest image request id",
-            "request_id": request_id,
-        }
-
-    if not latest_request_id:
-        return {
-            "status": "not_found",
-            "request_id": request_id,
+            "request_id": str(envelope.get("request_id") or request_id),
+            "detail": "could not resolve a downloadable image URL for this request",
             "instruction": (
-                "No saved image request_id found yet for this conversation. "
-                "If the user shared an image in this intake flow, call save_latest_image_request_id with that image request_id first."
+                "The image could not be resolved for storage. Ask the user to resend the photo."
             ),
         }
 
-    return {
-        "status": "found",
-        "request_id": request_id,
-        "latest_image_request_id": latest_request_id,
-        "instruction": (
-            "Use latest_image_request_id as the request_id argument for enque_request_for_auditing_stream when routing criteria are met."
-        ),
-    }
+    image_request_id, resolved_attachment_id, image_url = resolved
+    client_id = str(envelope.get("client_id") or "anonymous").strip()
+    case_id = str(envelope.get("case_id") or image_request_id).strip()
+    profile = _load_skin_profile_mapping(client_id)
+
+    try:
+        session = get_or_create_intake_session(client_id, case_id, redis_client=_redis)
+    except IntakeSessionStoreError as exc:
+        return {"status": "error", "detail": f"failed to load intake session: {exc}", "request_id": request_id}
+
+    images = dict(session.images)
+    images[image_category.value] = IntakeImageRef(
+        request_id=image_request_id,
+        image_url=image_url,
+        attachment_id=resolved_attachment_id,
+        registered_at_ms=int(time.time() * 1000),
+        visual_note=str(visual_note or "").strip(),
+    )
+    session = session.model_copy(update={"images": images})
+
+    updated, persist_error = _persist_intake_session(session, profile)
+    if persist_error:
+        return persist_error
+    assert updated is not None
+
+    result = _format_intake_status(updated, profile, request_id=request_id)
+    result["status"] = "registered"
+    result["registered_category"] = image_category.value
+    result["registered_image_request_id"] = image_request_id
+    return result
 
 
 @tool
-def enque_request_for_auditing_stream(request_id: str, collected_context: str = "") -> dict[str, str]:
+def set_primary_concern(
+    request_id: OrchestratorRequestIdArg,
+    concern: PrimaryConcernArg,
+) -> dict[str, Any]:
     """
-    Route the current request to the specialist team for image audit.
+    Set the user's main question or goal for this review.
 
-    Args:
-        request_id: The exact request_id shown in the current orchestrator input.
-        collected_context: A concise structured summary for the image audit. Include
-            only facts gathered from the user, not raw chat or internal details.
+    Arguments:
+        request_id (string, required): Exact request_id from the current orchestrator input.
+        concern (string, required): One short sentence with the user's primary question
+            (e.g. "Is this serum safe during pregnancy?", "Rash on my cheek for two weeks").
 
     Returns:
-        Dispatch result with status and job metadata from the image audit worker.
+        Updated intake status JSON with status saved.
+
+    Use for the main ask only; use append_intake_note for extra facts. Then get_intake_status.
+    """
+    logger.info("TOOL CALL: set_primary_concern: request_id=%s", request_id)
+
+    concern_text = str(concern or "").strip()
+    if not concern_text:
+        return {
+            "status": "error",
+            "detail": "concern must be a non-empty string",
+            "request_id": request_id,
+        }
+
+    envelope, error = _require_ingress_envelope(request_id)
+    if error:
+        return error
+
+    client_id = str(envelope.get("client_id") or "anonymous").strip()
+    case_id = str(envelope.get("case_id") or envelope.get("request_id") or request_id).strip()
+    profile = _load_skin_profile_mapping(client_id)
+
+    try:
+        session = get_or_create_intake_session(client_id, case_id, redis_client=_redis)
+    except IntakeSessionStoreError as exc:
+        return {"status": "error", "detail": f"failed to load intake session: {exc}", "request_id": request_id}
+
+    if session.primary_concern.strip() == concern_text:
+        updated, persist_error = _persist_intake_session(session, profile)
+        if persist_error:
+            return persist_error
+        assert updated is not None
+        result = _format_intake_status(updated, profile, request_id=request_id)
+        result["status"] = "unchanged"
+        result["instruction"] = (
+            "primary_concern is already set. Follow next_recommended_tool. "
+            "Do NOT call set_primary_concern again this turn."
+        )
+        return result
+
+    session = session.model_copy(update={"primary_concern": concern_text})
+    updated, persist_error = _persist_intake_session(session, profile)
+    if persist_error:
+        return persist_error
+    assert updated is not None
+
+    result = _format_intake_status(updated, profile, request_id=request_id)
+    result["status"] = "saved"
+    return result
+
+
+@tool
+def append_intake_note(
+    request_id: OrchestratorRequestIdArg,
+    note: IntakeNoteArg,
+) -> dict[str, Any]:
+    """
+    Append one consultation detail gathered from the user.
+
+    Arguments:
+        request_id (string, required): Exact request_id from the current orchestrator input.
+        note (string, required): One short fact (symptom, duration, recent product change,
+            e.g. "itching for 2 weeks", "started retinol 10 days ago").
+
+    Returns:
+        Updated intake status JSON with status saved.
+
+    Do not repeat the primary concern (use set_primary_concern for that). Then get_intake_status.
+    """
+    logger.info("TOOL CALL: append_intake_note: request_id=%s", request_id)
+
+    note_text = str(note or "").strip()
+    if not note_text:
+        return {
+            "status": "error",
+            "detail": "note must be a non-empty string",
+            "request_id": request_id,
+        }
+
+    envelope, error = _require_ingress_envelope(request_id)
+    if error:
+        return error
+
+    client_id = str(envelope.get("client_id") or "anonymous").strip()
+    case_id = str(envelope.get("case_id") or envelope.get("request_id") or request_id).strip()
+    profile = _load_skin_profile_mapping(client_id)
+
+    try:
+        session = get_or_create_intake_session(client_id, case_id, redis_client=_redis)
+    except IntakeSessionStoreError as exc:
+        return {"status": "error", "detail": f"failed to load intake session: {exc}", "request_id": request_id}
+
+    notes = list(session.consultation_notes)
+    notes.append(note_text)
+    session = session.model_copy(update={"consultation_notes": notes})
+
+    updated, persist_error = _persist_intake_session(session, profile)
+    if persist_error:
+        return persist_error
+    assert updated is not None
+
+    result = _format_intake_status(updated, profile, request_id=request_id)
+    result["status"] = "saved"
+    return result
+
+
+@tool
+def confirm_reproductive_status(request_id: OrchestratorRequestIdArg) -> dict[str, Any]:
+    """
+    Confirm pregnancy and breastfeeding status was discussed and recorded.
+
+    Arguments:
+        request_id (string, required): Exact request_id from the current orchestrator input.
+
+    Returns:
+        Updated intake status JSON with status saved.
+
+    Call only after asking the user and setting pregnancy/breastfeeding via update_skin_profile
+    when applicable. Required for skin_review, product_review, and combined before routing.
+    """
+    logger.info("TOOL CALL: confirm_reproductive_status: request_id=%s", request_id)
+
+    envelope, error = _require_ingress_envelope(request_id)
+    if error:
+        return error
+
+    client_id = str(envelope.get("client_id") or "anonymous").strip()
+    case_id = str(envelope.get("case_id") or envelope.get("request_id") or request_id).strip()
+    profile = _load_skin_profile_mapping(client_id)
+
+    try:
+        session = get_or_create_intake_session(client_id, case_id, redis_client=_redis)
+    except IntakeSessionStoreError as exc:
+        return {"status": "error", "detail": f"failed to load intake session: {exc}", "request_id": request_id}
+
+    if session.reproductive_status_confirmed:
+        updated, persist_error = _persist_intake_session(session, profile)
+        if persist_error:
+            return persist_error
+        assert updated is not None
+        result = _format_intake_status(updated, profile, request_id=request_id)
+        result["status"] = "unchanged"
+        result["instruction"] = (
+            "Reproductive status already confirmed. Follow next_recommended_tool. "
+            "Do NOT call confirm_reproductive_status again this turn."
+        )
+        return result
+
+    session = session.model_copy(update={"reproductive_status_confirmed": True})
+    updated, persist_error = _persist_intake_session(session, profile)
+    if persist_error:
+        return persist_error
+    assert updated is not None
+
+    result = _format_intake_status(updated, profile, request_id=request_id)
+    result["status"] = "saved"
+    return result
+
+
+@tool
+def enque_request_for_auditing_stream(
+    request_id: OrchestratorRequestIdArg,
+    audit_type: AuditTypeArg,
+    collected_context: AuditCollectedContextArg = "",
+) -> dict[str, Any]:
+    """
+    Send a registered intake image to the specialist audit team (MedGemma).
+
+    Arguments:
+        request_id (string, required): Exact request_id from the current orchestrator turn
+            (used to resolve client and intake session; not the image message id).
+        audit_type (string, required): skin or product — which registered intake slot to enqueue.
+        collected_context (string, optional): Extra short context; server merges intake summary.
+            Default empty.
+
+    Returns:
+        JSON with status (queued, already_queued, blocked_not_ready, blocked_wrong_audit_type,
+        blocked_missing_image, error), audit_type, image_request_id, instruction.
+
+    Call only when get_intake_status shows ready_to_route true. For combined intent, call twice
+    (audit_type skin then product). Do not call repeatedly on success for the same audit_type.
     """
 
     logger.info(
-        "TOOL CALL: enque_request_for_auditing_stream: request_id=%s, collected_context=%s",
+        "TOOL CALL: enque_request_for_auditing_stream: request_id=%s, audit_type=%s, "
+        "collected_context=%s",
         request_id,
+        audit_type,
         collected_context,
     )
 
-    envelope = _get_cached_ingress_envelope(request_id)
-    if not envelope:
+    envelope, error = _require_ingress_envelope(request_id)
+    if error:
+        return error
+
+    client_id = str(envelope.get("client_id") or "anonymous").strip()
+    case_id = str(envelope.get("case_id") or envelope.get("request_id") or request_id).strip()
+    profile = _load_skin_profile_mapping(client_id)
+
+    try:
+        session = get_or_create_intake_session(client_id, case_id, redis_client=_redis)
+    except IntakeSessionStoreError as exc:
         return {
             "status": "error",
-            "detail": "ingress cache not found for request_id",
+            "detail": f"failed to load intake session: {exc}",
             "request_id": request_id,
         }
 
-    canonical_payload = _resolve_canonical_payload(
-        request_id=envelope["request_id"],
-        payload=envelope["payload"],
-    )
+    updated, persist_error = _persist_intake_session(session, profile)
+    if persist_error:
+        return persist_error
+    assert updated is not None
+    session = updated
 
-    # Hard invariant: image audit requires an image. Block (terminally) when none
-    # is present so the agent cannot loop on this tool for text-only turns.
-    try:
-        canonical_obj: dict[str, Any] = json.loads(canonical_payload)
-    except Exception:
-        canonical_obj = {}
-    if not payload_has_image_attachment(canonical_obj):
-        logger.info("audit tool blocked (no image): request_id=%s", envelope["request_id"])
+    if session.phase == IntakePhase.AWAITING_AUDIT:
         return {
-            "status": "blocked_missing_image",
-            "request_id": envelope["request_id"],
+            "status": "already_queued",
+            "request_id": request_id,
+            "audit_type": audit_type.value,
             "instruction": (
-                "No image is attached to this request. Do NOT call this tool again. "
-                "Ask the user to upload a clear photo of the affected skin area, then "
-                "reply to the user directly."
+                "All required image audits were already dispatched. Do NOT call this tool again. "
+                "Tell the user their photo(s) are being reviewed."
             ),
         }
 
-    merged_payload = _merge_collected_context_into_payload(canonical_payload, collected_context)
-    logger.debug(
-        "audit tool merged payload prepared: request_id=%s bytes=%s",
-        envelope["request_id"],
-        len(merged_payload),
-    )
+    if not is_ready_to_route(session, profile):
+        return {
+            "status": "blocked_not_ready",
+            "request_id": request_id,
+            "audit_type": audit_type.value,
+            "missing_for_routing": list(session.missing_for_routing),
+            "instruction": (
+                "Intake is not ready to route. Call get_intake_status, complete missing items, "
+                "then enqueue."
+            ),
+        }
 
-    try:
-        merged_obj: dict[str, Any] = json.loads(merged_payload)
-    except Exception:
-        merged_obj = canonical_obj
+    if not _audit_type_allowed(session, audit_type):
+        expected = ", ".join(cat.value for cat in _required_audit_categories(session))
+        return {
+            "status": "blocked_wrong_audit_type",
+            "request_id": request_id,
+            "audit_type": audit_type.value,
+            "service_intent": session.service_intent.value if session.service_intent else None,
+            "instruction": (
+                f"audit_type={audit_type.value} does not match service intent. "
+                f"Expected audit types: {expected or 'none (general intent cannot enqueue audits)'}."
+            ),
+        }
 
-    image_url = _resolve_image_url_from_payload(merged_obj)
+    image_ref = session.images.get(audit_type.value)
+    if image_ref is None:
+        return {
+            "status": "blocked_missing_image",
+            "request_id": request_id,
+            "audit_type": audit_type.value,
+            "instruction": (
+                f"No {audit_type.value} image registered. Call register_intake_image for that "
+                "category before enqueueing."
+            ),
+        }
+
+    image_envelope = _get_cached_ingress_envelope(image_ref.request_id)
+    if not image_envelope:
+        return {
+            "status": "error",
+            "detail": "ingress cache not found for registered image request_id",
+            "request_id": request_id,
+            "image_request_id": image_ref.request_id,
+            "audit_type": audit_type.value,
+        }
+
+    image_url = str(image_ref.image_url or "").strip()
+    if not image_url:
+        try:
+            payload_obj: dict[str, Any] = json.loads(str(image_envelope.get("payload") or "{}"))
+        except Exception:
+            payload_obj = {}
+        image_url = _resolve_image_url_from_payload(payload_obj)
+
     if not image_url:
         logger.info(
-            "audit tool blocked (image url unresolved): request_id=%s",
-            envelope["request_id"],
+            "audit tool blocked (image url unresolved): image_request_id=%s audit_type=%s",
+            image_ref.request_id,
+            audit_type.value,
         )
         return {
             "status": "blocked_missing_image",
-            "request_id": envelope["request_id"],
+            "request_id": request_id,
+            "image_request_id": image_ref.request_id,
+            "audit_type": audit_type.value,
             "instruction": (
-                "An image exists but no downloadable image URL could be resolved for this request. "
-                "Do NOT call this tool again. Ask the user to upload the image again, then reply directly."
+                "Registered image URL could not be resolved. Ask the user to upload the image "
+                "again and call register_intake_image before enqueueing."
             ),
         }
 
-    context_text = _extract_prompt_context(merged_obj)
-    if not context_text:
-        context_text = "Provide a structured dermatological or Product review assessment of the provided image."
+    context_text = _build_audit_context_text(session, profile, audit_type, collected_context)
+    group_id, group_expected_count = _enqueue_group_params(session)
 
-    dedupe_key = f"{_AUDIT_ENQUEUED_KEY_PREFIX}:{envelope['request_id']}"
+    dedupe_key = _audit_enqueued_dedupe_key(image_ref.request_id)
     if _redis is not None and not _redis.set(dedupe_key, "1", nx=True, ex=_AUDIT_ENQUEUED_TTL_SEC):
-        logger.info("audit request already dispatched: request_id=%s", envelope["request_id"])
+        logger.info(
+            "audit request already dispatched: image_request_id=%s audit_type=%s",
+            image_ref.request_id,
+            audit_type.value,
+        )
+        instruction = _enqueue_audit_instruction(session, audit_type, "already_queued")
+        if _all_required_audits_enqueued(session):
+            _mark_intake_awaiting_audit(session, profile)
         return {
             "status": "already_queued",
-            "request_id": envelope["request_id"],
-            "instruction": (
-                "This image audit request was already dispatched. Do NOT call this tool again. "
-                "Tell the user their photo is already being reviewed."
+            "request_id": request_id,
+            "image_request_id": image_ref.request_id,
+            "audit_type": audit_type.value,
+            "instruction": instruction or (
+                "This image audit request was already dispatched. Do NOT call this tool again."
             ),
         }
 
     try:
         result = _dispatch_audit_image_ref(
-            request_id=envelope["request_id"],
-            case_id=envelope["case_id"],
-            client_id=envelope["client_id"],
-            message_id=envelope["message_id"],
-            channel=envelope["channel"],
+            request_id=image_ref.request_id,
+            case_id=str(image_envelope.get("case_id") or case_id),
+            client_id=str(image_envelope.get("client_id") or client_id),
+            message_id=str(image_envelope.get("message_id") or image_ref.request_id),
+            channel=str(image_envelope.get("channel") or ""),
             image_url=image_url,
             context=context_text,
+            group_id=group_id,
+            group_expected_count=group_expected_count,
         )
     except httpx.HTTPStatusError as exc:
         if _redis is not None:
@@ -762,7 +1960,9 @@ def enque_request_for_auditing_stream(request_id: str, collected_context: str = 
         status_code = exc.response.status_code if exc.response is not None else 0
         return {
             "status": "error",
-            "request_id": envelope["request_id"],
+            "request_id": request_id,
+            "image_request_id": image_ref.request_id,
+            "audit_type": audit_type.value,
             "detail": f"audit dispatch failed with HTTP {status_code}",
         }
     except httpx.HTTPError as exc:
@@ -770,46 +1970,52 @@ def enque_request_for_auditing_stream(request_id: str, collected_context: str = 
             _redis.delete(dedupe_key)
         return {
             "status": "error",
-            "request_id": envelope["request_id"],
+            "request_id": request_id,
+            "image_request_id": image_ref.request_id,
+            "audit_type": audit_type.value,
             "detail": f"audit dispatch failed: {exc}",
         }
 
-    # Backpressure is not a successful enqueue. Clear the dedupe guard so the
-    # request can be retried later, and do not emit a routed event.
     if result.get("status") == "under_pressure":
         if _redis is not None:
             try:
                 _redis.delete(dedupe_key)
             except Exception:
                 logger.exception(
-                    "failed to clear dedupe key after backpressure: request_id=%s",
-                    envelope["request_id"],
+                    "failed to clear dedupe key after backpressure: image_request_id=%s",
+                    image_ref.request_id,
                 )
+        result["request_id"] = request_id
+        result["image_request_id"] = image_ref.request_id
+        result["audit_type"] = audit_type.value
         return result
 
     _emit_orchestrator_event(
         {
-            "request_id": envelope["request_id"],
-            "case_id": envelope["case_id"],
-            "client_id": envelope["client_id"],
-            "message_id": envelope["message_id"],
-            "channel": envelope["channel"],
+            "request_id": image_ref.request_id,
+            "case_id": str(image_envelope.get("case_id") or case_id),
+            "client_id": str(image_envelope.get("client_id") or client_id),
+            "message_id": str(image_envelope.get("message_id") or image_ref.request_id),
+            "channel": str(image_envelope.get("channel") or ""),
             "agent": "orchestrator",
             "status": "routed_for_image_auditing",
             "target_endpoint": "/audit_image_ref",
             "medgemma_job_id": result.get("medgemma_job_id", ""),
             "enqueue_source": "orchestrator_tool",
+            "audit_type": audit_type.value,
+            "group_id": group_id,
         }
     )
 
-    # Make every terminal outcome explicit so the model stops calling the tool
-    # and proceeds to compose the final user-facing reply.
-    if result.get("status") in {"queued", "already_queued"}:
-        result["instruction"] = (
-            "The image audit request is now in the queue. Do NOT call this tool again. "
-            "Tell the user their photo was received and is being reviewed by the specialist team, "
-            "and that results will follow shortly."
-        )
+    if _all_required_audits_enqueued(session):
+        _mark_intake_awaiting_audit(session, profile)
+
+    result["request_id"] = request_id
+    result["image_request_id"] = image_ref.request_id
+    result["audit_type"] = audit_type.value
+    instruction = _enqueue_audit_instruction(session, audit_type, str(result.get("status") or ""))
+    if instruction:
+        result["instruction"] = instruction
     return result
 
 
@@ -996,6 +2202,162 @@ def read_soul_md() -> str:
     )
 
 
+
+@tool
+def skin_profile_is_available(client_id: OrchestratorClientIdArg) -> bool:
+    """
+    Check whether a skin profile already exists for this client.
+
+    Arguments:
+        client_id (string, required): Exact client_id from the orchestrator input.
+
+    Returns:
+        true if a profile exists in cache or Firestore, false otherwise.
+    """
+    cid = _normalize_client_id(client_id)
+    if not cid:
+        return False
+
+    cache_key = _skin_profile_cache_key(cid)
+    if _redis is not None:
+        try:
+            cached_profile = run_with_redis_retries(
+                lambda: _redis.get(cache_key),
+                operation_name="skin_profile_get",
+            )
+            if _deserialize_skin_profile(cached_profile):
+                return True
+        except Exception:
+            logger.exception("failed to read skin profile cache: client_id=%s", cid)
+
+    firestore_client = _get_firestore_client()
+    if firestore_client is None:
+        return False
+
+    try:
+        client_skin_profile = firestore_client.collection("skin_profiles").document(cid).get()
+    except Exception:
+        logger.exception("failed to read skin profile from firestore: client_id=%s", cid)
+        return False
+
+    if not client_skin_profile.exists:
+        return False
+
+    profile_dict = client_skin_profile.to_dict() or {}
+    if _redis is not None and isinstance(profile_dict, dict) and profile_dict:
+        try:
+            run_with_redis_retries(
+                lambda: _redis.setex(
+                    cache_key,
+                    _SKIN_PROFILE_CACHE_TTL_SEC,
+                    _serialize_skin_profile(profile_dict),
+                ),
+                operation_name="skin_profile_set",
+            )
+        except Exception:
+            logger.exception("failed to cache skin profile from firestore: client_id=%s", cid)
+    return True
+
+
+@tool(args_schema=UpdateSkinProfileInput)
+def update_skin_profile(
+    client_id: str,
+    age: Optional[int] = None,
+    gender: Optional[str] = None,
+    location: Optional[str] = None,
+    skin_type: Optional[str] = None,
+    current_products: Optional[list[str]] = None,
+    current_medications: Optional[list[str]] = None,
+    current_conditions: Optional[list[str]] = None,
+    current_goals: Optional[list[str]] = None,
+    allergies: Optional[list[str]] = None,
+    pregnancy: Optional[bool] = None,
+    breastfeeding: Optional[bool] = None,
+    notes: Optional[str] = None,
+) -> dict:
+    """
+    Create or update the client's long-lived skin profile (merge partial updates).
+
+    Arguments:
+        client_id (string, required): Exact client_id from the orchestrator input.
+        age, gender, location, skin_type, current_products, current_medications,
+        current_conditions, current_goals, allergies, pregnancy, breastfeeding, notes:
+            Optional profile fields; include only what the user provided.
+
+    Returns:
+        Full profile dict on success, or {status: error, detail: ...} on failure.
+
+    Call get_skin_profile first if a profile may exist. Pass at least one profile field.
+    """
+    skin_profile = SkinProfileUpdate(
+        age=age,
+        gender=gender,
+        location=location,
+        skin_type=skin_type,
+        current_products=current_products,
+        current_medications=current_medications,
+        current_conditions=current_conditions,
+        current_goals=current_goals,
+        allergies=allergies,
+        pregnancy=pregnancy,
+        breastfeeding=breastfeeding,
+        notes=notes,
+    )
+    cid = _normalize_client_id(client_id)
+    if not cid:
+        return {"status": "error", "detail": "client_id is required"}
+
+    if not skin_profile.model_dump(exclude_none=True):
+        return {"status": "error", "detail": "skin_profile must include at least one field to update"}
+
+    try:
+        existing = _fetch_skin_profile_dict(cid)
+        validated_profile = _merge_skin_profile(existing, skin_profile)
+    except Exception as exc:
+        return {"status": "error", "detail": f"invalid skin_profile payload: {exc}"}
+
+    firestore_client = _get_firestore_client()
+    if firestore_client is None:
+        return {"status": "error", "detail": "firestore is unavailable"}
+
+    try:
+        firestore_client.collection("skin_profiles").document(cid).set(validated_profile)
+    except Exception:
+        logger.exception("failed to write skin profile to firestore: client_id=%s", cid)
+        return {"status": "error", "detail": "failed to persist skin profile"}
+
+    if _redis is not None:
+        try:
+            run_with_redis_retries(
+                lambda: _redis.setex(
+                    _skin_profile_cache_key(cid),
+                    _SKIN_PROFILE_CACHE_TTL_SEC,
+                    _serialize_skin_profile(validated_profile),
+                ),
+                operation_name="skin_profile_set",
+            )
+        except Exception:
+            logger.exception("failed to cache updated skin profile: client_id=%s", cid)
+
+    return validated_profile
+
+@tool
+def get_skin_profile(client_id: OrchestratorClientIdArg) -> Dict[str, Any]:
+    """
+    Load the client's stored skin profile.
+
+    Arguments:
+        client_id (string, required): Exact client_id from the orchestrator input.
+
+    Returns:
+        Profile dict with keys: age, gender, location, skin_type, current_products,
+        current_medications, current_conditions, current_goals, allergies,
+        pregnancy, breastfeeding, notes. Empty dict if none exists.
+    """
+    cid = _normalize_client_id(client_id)
+    if not cid:
+        return {}
+    return _fetch_skin_profile_dict(cid)
 
 
 def _get_tavily_client() -> TavilyClient | None:
@@ -1257,8 +2619,15 @@ def check_medgemma_health() -> dict[str, str]:
 
 orchestrator_tools: list = [
     get_time,
-    save_latest_image_request_id,
-    get_latest_image_request_id,
+    skin_profile_is_available,
+    get_skin_profile,
+    update_skin_profile,
+    get_intake_status,
+    set_service_intent,
+    register_intake_image,
+    set_primary_concern,
+    append_intake_note,
+    confirm_reproductive_status,
     enque_request_for_auditing_stream,
     read_status_of_a_case,
     check_medgemma_health,
