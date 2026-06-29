@@ -497,6 +497,7 @@ def _append_conversation_log(
     text: str,
     request_id: str,
     case_id: str,
+    has_image: bool = False,
 ) -> None:
     """
     Append one conversational turn to the client's conversation snapshot log.
@@ -516,7 +517,7 @@ def _append_conversation_log(
     """
     # Get body from text
     body = text.strip()
-    if not body:
+    if not body and not has_image:
         return
 
     # Create Key for the conversational Log
@@ -529,6 +530,7 @@ def _append_conversation_log(
         "text": body,
         "request_id": request_id,
         "case_id": case_id,
+        "has_image": has_image,
     }
     try:
         # Create a payload from the entry
@@ -554,6 +556,7 @@ def _enqueue_outbound(
     kind: str,
     must_deliver: bool,
     reply_to_message_id: Optional[str] = None,
+    dedupe_discriminator: str = "",
 ) -> None:
     """
     Enqueue one outbound user-facing message for ordered channel delivery.
@@ -590,7 +593,7 @@ def _enqueue_outbound(
             "created_at_ms": str(int(time.time() * 1000)),
             "seq": str(sequence),
             "text": body,
-            "dedupe_key": f"{kind}:{request_id}:{case_id}",
+            "dedupe_key": f"{kind}:{dedupe_discriminator}:{request_id}:{case_id}",
             "reply_to_message_id": str(reply_to_message_id or ""),
         },
         maxlen=WORKERS_STREAM_MAXLEN,
@@ -1374,6 +1377,11 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         except Exception:
             payload_obj = {}
         user_text = str(((payload_obj.get("content") or {}).get("text") or "")).strip()
+        attachments = (payload_obj.get("content") or {}).get("attachments") or []
+        user_has_image = any(
+            isinstance(item, dict) and str(item.get("type") or "") == "image"
+            for item in attachments
+        )
 
         # Append to conversational Log
         _append_conversation_log(
@@ -1382,6 +1390,7 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             text=user_text,
             request_id=request_id,
             case_id=case_id,
+            has_image=user_has_image,
         )
         _append_conversation_log(
             client_id,
@@ -1823,6 +1832,7 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             kind="signal_update",
             must_deliver=True,
             reply_to_message_id=reply_to_message_id,
+            dedupe_discriminator=signal_type,
         )
 
         # Persist a compact record of the proactive message so the next user

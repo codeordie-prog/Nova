@@ -231,6 +231,7 @@ def _cache_signal_payload(job: EscalationJobPayload, payload: dict[str, Any]) ->
             IMAGE_PATH_TTL_SEC,
             job.image_blob_path,
         )
+    _redis.delete(f"escalation:closed:{job.case_id}")
     return enriched
 
 
@@ -254,6 +255,7 @@ def _build_handoff_packet(job: EscalationJobPayload, context: list[dict[str, Any
                 "role": entry.get("role", ""),
                 "text": entry.get("text", ""),
                 "ts_ms": entry.get("ts_ms", 0),
+                "has_image": bool(entry.get("has_image", False)),
             }
             for entry in chronological
         ],
@@ -376,6 +378,11 @@ def _process_escalation_job(msg_id: str, fields: dict[str, Any]) -> None:
     try:
         relay_key = f"escalation:relayed:{job.case_id}"
         if not _redis.set(relay_key, "1", nx=True, ex=RELAY_IDEMPOTENCY_TTL_SEC):
+            logger.warning(
+                "escalation relay skipped (already relayed): case_id=%s msg_id=%s",
+                job.case_id,
+                msg_id,
+            )
             _ack_and_delete(msg_id)
             reclaim_logic.mark_processed(ESCALATION_STREAM, msg_id)
             return
@@ -390,6 +397,11 @@ def _process_escalation_job(msg_id: str, fields: dict[str, Any]) -> None:
         except Exception as relay_exc:
             # Relay failed: clear the idempotency guard so a future re-escalation of
             # this case can retry (it was set NX before relay, not after success).
+            logger.warning(
+                "escalation relay failed → DLQ + deferred: case_id=%s err=%s",
+                job.case_id,
+                relay_exc,
+            )
             _redis.delete(relay_key)
             _write_dlq(job, msg_id, fields, str(relay_exc))
             _emit_event(

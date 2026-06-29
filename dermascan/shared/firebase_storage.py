@@ -87,6 +87,13 @@ def initialize_firebase_app() -> App:
             app = firebase_admin.initialize_app(cred, options=options)
             logger.info("Firebase initialized with service account from %s", cred_path)
             return app
+        except ValueError:
+            # Lost a race with another thread that initialized the default app
+            # between the guard above and here; reuse the existing app.
+            if firebase_admin._apps:
+                return firebase_admin.get_app()
+            logger.exception("Could not initialize Firebase with service account: %s", cred_path)
+            raise
         except Exception:
             logger.exception("Could not initialize Firebase with service account: %s", cred_path)
             raise
