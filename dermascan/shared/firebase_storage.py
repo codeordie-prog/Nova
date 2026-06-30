@@ -35,26 +35,16 @@ _SIGNED_URL_TTL_S: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"))
 
 def _resolve_credentials_path() -> str | None:
     """
-    Resolve the credentials path from the environment variable or fallback paths.
+    Resolve the service-account credentials path from CONFIG_FILE_PATH.
 
     Returns:
-        The credentials path if found, otherwise None.
-    
-    Raises:
-        FileNotFoundError: If the credentials file is not found.
+        The resolved path if CONFIG_FILE_PATH is set and the file exists,
+        otherwise None (the caller falls back to Application Default
+        Credentials). No credential filenames are hardcoded.
     """
     config_path = resolve_env_path(os.environ.get("CONFIG_FILE_PATH", ""))
     if config_path and os.path.exists(config_path):
         return config_path
-
-    repo_relative_candidates = [
-        "dermascan/backend/services/agents/configurations/dawagpn-1c9b72f24ea8.json",
-        "configs/dawagpn-1c9b72f24ea8.json",
-    ]
-    for candidate in repo_relative_candidates:
-        resolved = resolve_env_path(candidate)
-        if resolved and os.path.exists(resolved):
-            return resolved
     return None
 
 

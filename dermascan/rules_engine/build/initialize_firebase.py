@@ -111,14 +111,6 @@ def _resolve_cred_path() -> str | None:
     config_path = resolve_env_path(os.environ.get("CONFIG_FILE_PATH", ""))
     if config_path and os.path.exists(config_path):
         return config_path
-
-    for candidate in (
-        "dermascan/backend/services/agents/configurations/dawagpn-1c9b72f24ea8.json",
-        "configs/dawagpn-1c9b72f24ea8.json",
-    ):
-        resolved = resolve_env_path(candidate)
-        if resolved and os.path.exists(resolved):
-            return resolved
     return None
 
 
