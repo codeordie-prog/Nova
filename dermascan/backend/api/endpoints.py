@@ -40,6 +40,10 @@ from dermascan.shared.global_rate_limiter import _enforce_global_rate_limit
 from dermascan.shared.hmac_auth import SIGNATURE_HEADER, TIMESTAMP_HEADER, verify as verify_hmac
 from dermascan.shared.logger import get_logger
 from dermascan.shared.queue_depth_manager import _wait_for_queue_capacity
+from dermascan.shared.stream_pipeline_tracing import (
+    enrich_stream_fields,
+    record_stream_produce,
+)
 
 router = APIRouter(prefix="/v1", tags=["orchestrator"])
 
@@ -670,8 +674,7 @@ def _enqueue_orchestrator_row(
     if _redis is None:
         raise HTTPException(status_code=500, detail="REDIS_URL is not configured")
     payload_json = payload_override if payload_override is not None else _payload_content_json(normalized)
-    _redis.xadd(
-        _ORCHESTRATOR_JOB_STREAM,
+    stream_fields = enrich_stream_fields(
         {
             "request_id": normalized.request_id,
             "case_id": normalized.case_id,
@@ -680,9 +683,21 @@ def _enqueue_orchestrator_row(
             "channel": normalized.channel,
             "username": normalized.username or "",
             "payload": payload_json,
-        },
-        maxlen=_WORKERS_STREAM_MAXLEN,
-        approximate=True,
+        }
+    )
+    msg_id = str(
+        _redis.xadd(
+            _ORCHESTRATOR_JOB_STREAM,
+            stream_fields,
+            maxlen=_WORKERS_STREAM_MAXLEN,
+            approximate=True,
+        )
+    )
+    record_stream_produce(
+        stream=_ORCHESTRATOR_JOB_STREAM,
+        msg_id=msg_id,
+        fields=stream_fields,
+        extra_metadata={"worker": "ingress"},
     )
 
 
@@ -724,8 +739,7 @@ async def _flush_telegram_media_group_after_window(*, channel: str, group_id: st
         if not row:
             continue
         try:
-            _redis.xadd(
-                _ORCHESTRATOR_JOB_STREAM,
+            stream_fields = enrich_stream_fields(
                 {
                     "request_id": str(row.get("request_id") or ""),
                     "case_id": str(row.get("case_id") or ""),
@@ -734,9 +748,21 @@ async def _flush_telegram_media_group_after_window(*, channel: str, group_id: st
                     "channel": str(row.get("channel") or "telegram"),
                     "username": str(row.get("username") or ""),
                     "payload": enriched_payload,
-                },
-                maxlen=_WORKERS_STREAM_MAXLEN,
-                approximate=True,
+                }
+            )
+            msg_id = str(
+                _redis.xadd(
+                    _ORCHESTRATOR_JOB_STREAM,
+                    stream_fields,
+                    maxlen=_WORKERS_STREAM_MAXLEN,
+                    approximate=True,
+                )
+            )
+            record_stream_produce(
+                stream=_ORCHESTRATOR_JOB_STREAM,
+                msg_id=msg_id,
+                fields=stream_fields,
+                extra_metadata={"worker": "ingress", "flow": "telegram_media_group"},
             )
         except redis.RedisError:
             logger.exception("failed enqueue for telegram media group member: group_id=%s", group_id)
@@ -846,8 +872,7 @@ async def whatsapp_webhook(
     request_ids: list[str] = []
     try:
         for normalized in normalized_messages:
-            _redis.xadd(
-                _ORCHESTRATOR_JOB_STREAM,
+            stream_fields = enrich_stream_fields(
                 {
                     "request_id": normalized.request_id,
                     "case_id": normalized.case_id,
@@ -855,9 +880,21 @@ async def whatsapp_webhook(
                     "message_id": normalized.message_id,
                     "channel": normalized.channel,
                     "payload": _payload_content_json(normalized),
-                },
-                maxlen=_WORKERS_STREAM_MAXLEN,
-                approximate=True,
+                }
+            )
+            msg_id = str(
+                _redis.xadd(
+                    _ORCHESTRATOR_JOB_STREAM,
+                    stream_fields,
+                    maxlen=_WORKERS_STREAM_MAXLEN,
+                    approximate=True,
+                )
+            )
+            record_stream_produce(
+                stream=_ORCHESTRATOR_JOB_STREAM,
+                msg_id=msg_id,
+                fields=stream_fields,
+                extra_metadata={"worker": "ingress", "flow": "whatsapp_batch"},
             )
             request_ids.append(normalized.request_id)
     except redis.RedisError as exc:

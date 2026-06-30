@@ -1,0 +1,25 @@
+timestamp,suite,test_name,status,concurrency,job_count,success_count,success_rate,p50_ms,p95_ms,p99_ms,min_ms,max_ms,avg_ms,sample_reply,notes
+2026-06-20T19:39:30.866193+00:00,orchestrator,test_parallel_text_jobs_return_outbound_replies[20],passed,20,20,20,1,10000,14354.65,15246.13,6687,15469,10770.9,Hello! How can I assist you with your dermatological queries today?,parallel text-only orchestrator replies
+2026-06-20T19:40:37.463743+00:00,orchestrator,test_parallel_text_jobs_return_outbound_replies[40],passed,40,40,40,1,11554.5,16402.15,25794.17,7063,28250,12184.32,"Hello, I am Qutis, your dermatological assistant; please let me know how I can help you today by choosing from these options: 1. Skin review, 2. Product review, 3. Skin and product review, or 4. Gener",parallel text-only orchestrator replies
+2026-06-20T19:41:07.373319+00:00,concurrency,test_parallel_text_jobs_complete,passed,5,5,5,1,14797,24127.8,25775.16,14250,26187,17106.2,,lightweight parallel text probe
+2026-06-20T19:41:56.873159+00:00,latency,test_text_pipeline_latency_percentiles,passed,1,3,3,1,13812,16231.2,16446.24,9734,16500,13348.67,,sequential rounds=3
+2026-06-20T19:42:13.099946+00:00,smoke,test_text_job_completes,passed,1,1,1,1,12719,12719,12719,12719,12719,12719,"Hello! I am Qutis, your dermatological assistant. I am here to help you with your skin and product concerns. Please let me know how I can assist you today by choosing from the following options:
+
+1. S",
+2026-06-20T19:42:28.929049+00:00,smoke,test_duplicate_webhook_replay_completes_without_5xx,passed,1,2,2,1,4890.5,5635.25,5701.45,4063,5718,4890.5,,duplicate message_id; ingress dedup not implemented
+2026-06-20T20:00:03.467909+00:00,orchestrator,test_parallel_text_jobs_return_outbound_replies[20],passed,20,20,20,1,35500.5,44049.55,44559.51,21453,44687,34179.7,"Hello! How can I assist you with your dermatological queries today? Please choose from the options below:
+1. Skin review
+2. Product review
+3. Skin and product review
+4. General enquiry",parallel text-only orchestrator replies
+2026-06-20T20:01:44.235270+00:00,orchestrator,test_parallel_text_jobs_return_outbound_replies[40],passed,40,40,40,1,37937.5,57798.55,59210.26,12422,60094,37940.28,"Hello, I am Qutis, your dermatological assistant; please let me know how I can help you today by choosing from these options: 1. Skin review, 2. Product review, 3. Skin and product review, or 4. Gener",parallel text-only orchestrator replies
+2026-06-20T20:06:53.309925+00:00,orchestrator,test_parallel_text_jobs_return_outbound_replies[60],passed,60,60,60,1,81836,119251.35,199363.43,14203,305813,80645.1,"Hello, I am Qutis, your dermatological assistant; please let me know how I can help you today by choosing from these options: 1. Skin review, 2. Product review, 3. Skin and product review, or 4. Gener",parallel text-only orchestrator replies
+2026-06-20T20:10:23.661088+00:00,orchestrator,test_parallel_text_jobs_return_outbound_replies[80],passed,80,80,80,1,87546.5,139928.8,161550.36,45719,191188,95609.75,Hello! How can I assist you with your dermatological queries today?,parallel text-only orchestrator replies
+2026-06-20T20:11:07.314402+00:00,concurrency,test_parallel_text_jobs_complete,passed,5,5,5,1,21140,38181.6,38824.32,17562,38985,26187.4,,lightweight parallel text probe
+2026-06-20T20:13:25.433886+00:00,latency,test_text_pipeline_latency_percentiles,passed,1,3,3,1,35297,58077.8,60102.76,31938,60609,42614.67,,sequential rounds=3
+2026-06-20T20:13:41.691805+00:00,smoke,test_text_job_completes,passed,1,1,1,1,12938,12938,12938,12938,12938,12938,"Hello there! I am Qutis, here to assist you with your dermatological queries. Please let me know how I can assist you by choosing one of the services below:
+
+1. Skin review
+2. Product review
+3. Skin a",
+2026-06-20T20:13:59.318739+00:00,smoke,test_duplicate_webhook_replay_completes_without_5xx,passed,1,2,2,1,5797,7470.1,7618.82,3938,7656,5797,,duplicate message_id; ingress dedup not implemented

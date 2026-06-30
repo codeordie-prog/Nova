@@ -35,7 +35,9 @@ from dermascan.backend.services.tools.orchestrator.orchestrator_tools import (
 from dermascan.backend.services.agents.loader import load_agent_configurations
 from dermascan.backend.services.agents.build import (
     open_checkpointer_url,
-    build_google_credentials,
+    build_gemini_chat_model,
+    build_summarization_gemini_model,
+    compute_summarization_trigger_tokens,
 )
 from dermascan.backend.services.agents.product_rules_signal_helper import (
     run_product_signal_rules_flow,
@@ -45,82 +47,91 @@ from dermascan.backend.services.agents.group_report_aggregator import (
     collect_and_compile_if_ready,
 )
 from dermascan.shared.logger import get_logger
+from dermascan.shared.ingress_payload import resolve_image_urls_from_payload
+from dermascan.shared.delivery_context import (
+    format_delivery_context_for_prompt,
+    load_delivery_context,
+)
+from dermascan.shared.intake_session_store import (
+    IntakeSessionStoreError,
+    archive_intake_session,
+    load_archived_intake_session,
+    load_intake_session,
+)
 from dermascan.shared.redis_stability import (
     check_redis_connectivity,
     get_redis_client,
     run_with_redis_retries,
 )
+from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langchain.agents import create_agent
-from langchain.agents.middleware import SummarizationMiddleware, wrap_model_call, ModelRequest, ModelResponse
+from langchain.agents.middleware import SummarizationMiddleware, ToolCallLimitMiddleware, wrap_model_call, ModelRequest, ModelResponse
 from langchain_openai import ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
 from dermascan.backend.services.agents.prompts.orchestrator_prompt import system_prompt
 from dermascan.backend.services.agents import reclaim_logic
 from dermascan.backend.services.agents.provider_circuit_breaker import (
     CircuitBreaker,
-    load_qwen_circuit_breaker,
+    load_gemini_circuit_breaker,
+    load_openai_circuit_breaker,
 )
 from dermascan.backend.services.agents.memory.redis_checkpointer import (
     delete_thread as delete_checkpoint_thread,
 )
 from dermascan.shared import agent_call_tracer
+from dermascan.shared.langsmith_observability import (
+    build_invoke_config,
+    configure_worker_project,
+    log_tracing_status,
+)
+from dermascan.shared.stream_pipeline_tracing import (
+    enrich_stream_fields,
+    extract_confidence_from_fields,
+    extract_threshold_from_fields,
+    log_pipeline_tracing_status,
+    record_stream_produce,
+    run_traced_stream_handler,
+)
 
 
 # Load environment variables
 load_dotenv()
+configure_worker_project("orchestrator")
 
 # Get env variables
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY_QUTIS", "")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY_QUTIS", "")
 CRED_PATH: str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_QUTIS", "")
 PROJECT_ID: str = os.getenv("GOOGLE_CLOUD_PROJECT_QUTIS", "qutisai")
-LOCATION: str = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+# Gemini 3.x models require the global Vertex endpoint on this project.
+LOCATION: str = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
+ORCHESTRATOR_GEMINI_MODEL: str = os.getenv(
+    "ORCHESTRATOR_GEMINI_MODEL", "gemini-3.5-flash"
+)
+ORCHESTRATOR_GEMINI_THINKING_LEVEL: str = os.getenv(
+    "ORCHESTRATOR_GEMINI_THINKING_LEVEL", "minimal"
+)
 REDIS_URL: str = os.getenv("REDIS_URL", "")
 BASE_DIR: str = os.path.dirname(__file__)
 CONFIG_PATH: str = os.path.join(BASE_DIR, "configurations", "agents_config.json")
 
-# Self-hosted Qwen primary model (Modal vLLM OpenAI-compatible endpoint).
-# Supports both the newer concise names and the existing .env names used by
-# earlier Qwen experiments.
-QWEN_BASE_URL: str = (
-    os.getenv("QWEN_BASE_URL")
-    or os.getenv("QWEN_OPENAI_BASE_URL")
-    or ""
-).strip()
-QWEN_SERVED_MODEL_NAME: str = (
-    os.getenv("QWEN_SERVED_MODEL_NAME")
-    or os.getenv("QWEN_MODEL_NAME")
-    or "qwen-3-8b"
-).strip()
-QWEN_API_KEY: str = (
-    os.getenv("QWEN_API_KEY")
-    or os.getenv("QWEN_OPENAI_API_KEY")
-    or "EMPTY"
+# Orchestrator LLM chain: OpenAI GPT-4o (primary, tool calling) -> Gemini (fallback).
+ORCHESTRATOR_MAX_MODEL_LEN: int = int(os.getenv("ORCHESTRATOR_MAX_MODEL_LEN", "128000"))
+ORCHESTRATOR_MAX_TOKENS: int = int(os.getenv("ORCHESTRATOR_MAX_TOKENS", "2048"))
+# Cap summarization trigger so OpenAI primary stays under typical TPM / context limits.
+ORCHESTRATOR_OPENAI_SUMMARIZATION_TRIGGER_TOKENS: int = max(
+    1500,
+    int(os.getenv("ORCHESTRATOR_OPENAI_SUMMARIZATION_TRIGGER_TOKENS", "24000")),
 )
-QWEN_TEMPERATURE: float = float(os.getenv("QWEN_TEMPERATURE", "0.0"))
-QWEN_MAX_TOKENS: int = int(os.getenv("QWEN_MAX_TOKENS", "512"))
-QWEN_REQUEST_TIMEOUT_S: float = float(os.getenv("QWEN_REQUEST_TIMEOUT_S", "45"))
-
-# Hard ceiling on SDK-level retries before the fallback middleware moves to the
-# next provider. Clamped to [0, 3] so a single slow/cold Qwen call can never
-# burn more than 3 retries (4 total attempts) before failing over to OpenAI.
 _PROVIDER_MAX_RETRIES_HARD_CAP: int = 3
-QWEN_MAX_RETRIES: int = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("QWEN_MAX_RETRIES", "2"))))
-# Mirror the serving-side max_model_len so memory middleware can reserve
-# enough budget for system prompt + tools + output tokens before summarizing.
-QWEN_MAX_MODEL_LEN: int = int(os.getenv("QWEN_MAX_MODEL_LEN", "16384"))
-# Qwen3 emits <think> blocks by default; disable so the orchestrator receives
-# clean, tool-callable completions. vLLM honors this chat-template kwarg.
-QWEN_ENABLE_THINKING: bool = os.getenv("QWEN_ENABLE_THINKING", "false").strip().lower() in {
-    "1", "true", "yes", "on",
-}
 OPENAI_REQUEST_TIMEOUT_S: float = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"))
 OPENAI_MAX_RETRIES: int = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("OPENAI_MAX_RETRIES", "2"))))
-# Hard ceiling on agent reasoning/tool-call steps per turn. Bounds the number of
-# model calls a single message can issue so a runaway tool loop cannot spin up
-# to the LangChain default of 25 calls.
+# Hard ceiling on agent reasoning/tool-call steps per turn.
 AGENT_RECURSION_LIMIT: int = max(1, int(os.getenv("ORCHESTRATOR_AGENT_RECURSION_LIMIT", "12")))
+ORCHESTRATOR_TOOL_RUN_LIMIT: int = max(3, int(os.getenv("ORCHESTRATOR_TOOL_RUN_LIMIT", "8")))
+ORCHESTRATOR_GET_INTAKE_STATUS_RUN_LIMIT: int = max(
+    1, int(os.getenv("ORCHESTRATOR_GET_INTAKE_STATUS_RUN_LIMIT", "1"))
+)
 # User-facing reply sent when a turn fails (e.g. recursion limit / provider
 # error) so the client is never left without a response.
 ORCHESTRATOR_FAILURE_REPLY: str = os.getenv(
@@ -138,7 +149,7 @@ ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION: bool = os.getenv(
 DEFAULT_CONFIG: List[Dict[str, Any]] = [{
         "name": "orchestrator-google",
         "description": "Conversational Agent for orchestrating the diagnosis process",
-        "model":"gemini-2.5-flash",
+        "model":"gemini-3.5-flash",
         "temperature": 0.0,
         "max_tokens": 1000,
         "top_p": 0.95,
@@ -416,29 +427,6 @@ def _should_fallback(exc: Exception) -> bool:
     return any(marker in text for marker in transient_markers)
 
 
-def _is_qwen_unavailable_error(exc: Exception) -> bool:
-    """
-    Detect provider-unavailable patterns specific to the self-hosted Qwen endpoint.
-
-    Args:
-        exc: Raised exception from provider invocation.
-
-    Returns:
-        bool: True when Qwen should be skipped and the next provider tried.
-    """
-    for current in _iter_exception_chain(exc):
-        class_name: str = current.__class__.__name__.lower()
-        text: str = str(current).lower()
-        if "notfounderror" in class_name and (
-            "invalid function call" in text
-            or "modal-http" in text
-            or "404" in text
-            or "not found" in text
-        ):
-            return True
-    return False
-
-
 def _proactive_log_key(client_id: str) -> str:
     """
     Build the Redis key that stores a client's proactive-message log.
@@ -488,6 +476,31 @@ def _append_proactive_log(client_id: str, entry: dict[str, Any]) -> None:
         pipe.execute()
     except Exception:
         logger.exception("failed to append proactive log: client_id=%s", client_id)
+
+
+def _finalize_intake_after_delivery(case_id: str, client_id: str) -> None:
+    """
+    Mark intake delivered and clear the active worksheet after outbound report.
+
+    Args:
+        case_id: Case identifier from the signal envelope.
+        client_id: Client identifier from the signal envelope.
+    """
+    cid = str(client_id or "anonymous").strip() or "anonymous"
+    case = str(case_id or "").strip()
+    session = load_archived_intake_session(case, redis_client=_redis)
+    if session is None:
+        session = load_intake_session(cid, redis_client=_redis)
+    if session is None:
+        return
+    try:
+        archive_intake_session(session, redis_client=_redis, delete_active=True)
+    except IntakeSessionStoreError:
+        logger.exception(
+            "failed to finalize intake after delivery: case_id=%s client_id=%s",
+            case,
+            cid,
+        )
 
 
 def _append_conversation_log(
@@ -557,6 +570,8 @@ def _enqueue_outbound(
     must_deliver: bool,
     reply_to_message_id: Optional[str] = None,
     dedupe_discriminator: str = "",
+    confidence: Optional[str] = None,
+    threshold: Optional[str] = None,
 ) -> None:
     """
     Enqueue one outbound user-facing message for ordered channel delivery.
@@ -580,24 +595,43 @@ def _enqueue_outbound(
 
     priority = 10 if kind == "signal_update" else 20
     sequence = _redis.incr(f"outbound:seq:{client_id}")
-    _redis.xadd(
-        OUTBOUND_STREAM,
-        {
-            "client_id": client_id,
-            "case_id": case_id,
-            "channel": channel,
-            "request_id": request_id,
+    outbound_fields: dict[str, str] = {
+        "client_id": client_id,
+        "case_id": case_id,
+        "channel": channel,
+        "request_id": request_id,
+        "kind": kind,
+        "must_deliver": "true" if must_deliver else "false",
+        "priority": str(priority),
+        "created_at_ms": str(int(time.time() * 1000)),
+        "seq": str(sequence),
+        "text": body,
+        "dedupe_key": f"{kind}:{dedupe_discriminator}:{request_id}:{case_id}",
+        "reply_to_message_id": str(reply_to_message_id or ""),
+    }
+    if confidence:
+        outbound_fields["confidence"] = confidence
+    if threshold:
+        outbound_fields["threshold"] = threshold
+    stream_fields = enrich_stream_fields(outbound_fields)
+    msg_id = str(
+        _redis.xadd(
+            OUTBOUND_STREAM,
+            stream_fields,
+            maxlen=WORKERS_STREAM_MAXLEN,
+            approximate=True,
+        )
+    )
+    record_stream_produce(
+        stream=OUTBOUND_STREAM,
+        msg_id=msg_id,
+        fields=stream_fields,
+        extra_metadata={
+            "worker": "orchestrator",
             "kind": kind,
-            "must_deliver": "true" if must_deliver else "false",
-            "priority": str(priority),
-            "created_at_ms": str(int(time.time() * 1000)),
-            "seq": str(sequence),
-            "text": body,
-            "dedupe_key": f"{kind}:{dedupe_discriminator}:{request_id}:{case_id}",
-            "reply_to_message_id": str(reply_to_message_id or ""),
+            **({"confidence": confidence} if confidence else {}),
+            **({"threshold": threshold} if threshold else {}),
         },
-        maxlen=WORKERS_STREAM_MAXLEN,
-        approximate=True,
     )
 
 
@@ -769,48 +803,40 @@ def _wait_for_inflight(
     return initial
 
 
-# Build the orchestrator input
-# TO BE REVISED WITH RESPECT TO THE SCHEMA OF THE PAYLOAD SEND FROM WHATSAPP WEBHOOK ENDPOINT
-# TODO: Add more fields to the input - This maybe change with respect to the SCHEMA of the payload
-def _build_orchestrator_input(
+# Build the orchestrator ingress context (text + optional multimodal image blocks)
+def _build_orchestrator_text_context(
+    *,
     request_id: str,
     case_id: str,
     client_id: str,
     message_id: str,
     channel: str,
     username: Optional[str],
-    payload_json: str,
+    payload: dict[str, Any],
+    resolved_images: list[Any],
 ) -> str:
-
     """
-    Builds the input for the orchestrator agent.
-    
+    Build the text portion of the orchestrator user message.
+
     Args:
-        request_id (str): Request ID
-        case_id (str): Case ID
-        client_id (str): Client ID
-        message_id (str): Message ID
-        channel (str): Channel
-        username (Optional[str]): Username
-        payload_json (str): JSON string containing the payload
-        
+        request_id: Ingress request id for this turn.
+        case_id: Case id.
+        client_id: Client id.
+        message_id: Source message id.
+        channel: Ingress channel.
+        username: Optional display name.
+        payload: Parsed ingress payload object.
+        resolved_images: Image attachments resolved for vision input.
+
     Returns:
-        str: The input for the orchestrator agent
+        str: Text context for the orchestrator agent.
     """
-    try:
-        # Parse the payload
-        payload: dict[str, Any] = json.loads(payload_json)
-    except Exception:
-        payload = {}
-
-    # Extract content
     content = payload.get("content") or {}
-
-    # Extract text and attachments
     text: str = str(content.get("text") or "").strip()
     attachments: list = content.get("attachments") or []
+    if not isinstance(attachments, list):
+        attachments = []
 
-    # Build summary lines
     summary_lines = [
         "You are handling one orchestrator ingress job.",
         "Use tool calls when routing is needed.",
@@ -822,11 +848,32 @@ def _build_orchestrator_input(
         f"username: {username}",
         f"text: {text or '<empty>'}",
         f"attachments_count: {len(attachments)}",
-        "full_payload_json:",
-        json.dumps(payload, default=str),
+        f"resolved_image_count: {len(resolved_images)}",
     ]
 
-    # Add routing hints
+    if resolved_images:
+        summary_lines.append(
+            "Vision hint: image block(s) are attached after this text. "
+            "Inspect each image before classifying it or deciding routing."
+        )
+        summary_lines.append(
+            "ingress_images_for_this_message: "
+            + json.dumps(
+                [
+                    {
+                        "attachment_id": image.attachment_id,
+                        "index": image.index,
+                        "mime_type": image.mime_type,
+                    }
+                    for image in resolved_images
+                ],
+                default=str,
+            )
+        )
+    else:
+        summary_lines.append("full_payload_json:")
+        summary_lines.append(json.dumps(payload, default=str))
+
     if text and attachments:
         summary_lines.append(
             "Routing hint: user provided both text and attachment(s). You may need to forward for diagnosis."
@@ -838,9 +885,11 @@ def _build_orchestrator_input(
     if not text and not attachments:
         summary_lines.append("Routing hint: missing content; ask clarification.")
 
-    # Inject the recent proactive-message log so the orchestrator is aware of
-    # what the system has already proactively sent to this client. This is a
-    # read-only snapshot from the signal flow; the job flow never writes here.
+    intake_session = load_intake_session(client_id, redis_client=_redis)
+    if intake_session is not None:
+        summary_lines.append("intake_session_snapshot:")
+        summary_lines.append(json.dumps(intake_session.model_dump(mode="json"), default=str))
+
     proactive_entries = _read_proactive_log(client_id, PROACTIVE_LOG_INCLUDE_N)
     if proactive_entries:
         summary_lines.append("proactive_messages_recently_sent_to_client:")
@@ -850,6 +899,58 @@ def _build_orchestrator_input(
         )
 
     return "\n".join(summary_lines)
+
+
+def _build_orchestrator_user_content(
+    request_id: str,
+    case_id: str,
+    client_id: str,
+    message_id: str,
+    channel: str,
+    username: Optional[str],
+    payload_json: str,
+) -> list[dict[str, Any]]:
+    """
+    Build multimodal user message content for the orchestrator agent.
+
+    Args:
+        request_id: Ingress request id.
+        case_id: Case id.
+        client_id: Client id.
+        message_id: Message id.
+        channel: Channel name.
+        username: Optional username.
+        payload_json: Raw ingress payload JSON string.
+
+    Returns:
+        list[dict[str, Any]]: LangChain/OpenAI-style content blocks (text + image_url).
+    """
+    try:
+        payload: dict[str, Any] = json.loads(payload_json)
+    except Exception:
+        payload = {}
+
+    resolved_images = resolve_image_urls_from_payload(payload, redis_client=_redis)
+    text_context = _build_orchestrator_text_context(
+        request_id=request_id,
+        case_id=case_id,
+        client_id=client_id,
+        message_id=message_id,
+        channel=channel,
+        username=username,
+        payload=payload,
+        resolved_images=resolved_images,
+    )
+
+    blocks: list[dict[str, Any]] = [{"type": "text", "text": text_context}]
+    for image in resolved_images:
+        blocks.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": image.image_url},
+            }
+        )
+    return blocks
 
 # Create/ensure a consumer group for the job stream exists
 def _ensure_consumer_group(stream: str = "orchestrator_job") -> None:
@@ -872,59 +973,13 @@ def _ensure_consumer_group(stream: str = "orchestrator_job") -> None:
         raise
 
 
-def _build_qwen_model() -> Optional[ChatOpenAI]:
-    """
-    Build the self-hosted Qwen primary model client, if configured.
-
-    The Modal vLLM service exposes an OpenAI-compatible API, so a standard
-    ``ChatOpenAI`` client targets it via ``base_url``. Qwen3 "thinking" is
-    disabled through the vLLM chat-template kwarg for clean tool-calling output.
-
-    Returns:
-        Optional[ChatOpenAI]: Configured Qwen client, or None when
-        ``QWEN_BASE_URL`` is not set.
-    """
-    if not QWEN_BASE_URL:
-        logger.warning(
-            "Qwen primary DISABLED: QWEN_BASE_URL is not set; OpenAI Provider will act as "
-            "primary. Set QWEN_BASE_URL to the Modal vLLM endpoint to make Qwen primary."
-        )
-        return None
-
-    # Normalize to the OpenAI v1 base path expected by the client.
-    base_url: str = QWEN_BASE_URL.rstrip("/")
-    if not base_url.endswith("/v1"):
-        base_url = f"{base_url}/v1"
-
-    logger.info(
-        "Qwen primary ENABLED: base_url=%s, model=%s, max_tokens=%s, timeout=%ss, max_retries=%s, enable_thinking=%s",
-        base_url,
-        QWEN_SERVED_MODEL_NAME,
-        QWEN_MAX_TOKENS,
-        QWEN_REQUEST_TIMEOUT_S,
-        QWEN_MAX_RETRIES,
-        QWEN_ENABLE_THINKING,
-    )
-    return ChatOpenAI(
-        model=QWEN_SERVED_MODEL_NAME,
-        base_url=base_url,
-        api_key=QWEN_API_KEY,
-        timeout=QWEN_REQUEST_TIMEOUT_S,
-        max_retries=QWEN_MAX_RETRIES,
-        temperature=QWEN_TEMPERATURE,
-        max_tokens=QWEN_MAX_TOKENS,
-        extra_body={"chat_template_kwargs": {"enable_thinking": QWEN_ENABLE_THINKING}}
-    )
-
-
 def _build_dynamic_agent(*, checkpointer: Any) -> Any:
     """
     Build a dynamic agent with an ordered model fallback chain.
 
-    The chain is, in priority order: self-hosted Qwen (primary, when
-    ``QWEN_BASE_URL`` is set) -> OpenAI -> Google Gemini. A middleware tries each
-    provider in turn, falling through on rate-limit/availability failures so a
-    single overloaded or cold provider never breaks a turn.
+    Priority: OpenAI GPT-4o (primary, including tool calls) -> Google Gemini.
+    Each provider is guarded by a circuit breaker so repeated failures skip
+    straight to the next provider during the cooldown window.
 
     Args:
         checkpointer: The conversation checkpointer to attach to the agent.
@@ -933,86 +988,66 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         Any: A LangChain agent backed by the fallback chain.
 
     Raises:
-        RuntimeError: If neither Qwen nor OpenAI is configured (no usable
-            primary provider).
+        RuntimeError: If OpenAI is not configured.
     """
-    # Get config files
     google_cfg = get_config_file(CONFIG_PATH, "google")
     openai_cfg = get_config_file(CONFIG_PATH, "openai")
 
-    # Get Google service account access credentials
-    creds = build_google_credentials(path=CRED_PATH)
-
-    # Define Gemini provider (final fallback)
-    gemini_model = ChatGoogleGenerativeAI(
-        model=google_cfg["model"],
-        credentials=creds,
-        temperature=google_cfg["temperature"],
-        max_tokens=google_cfg["max_tokens"],
-        top_p=google_cfg["top_p"],
-        location=LOCATION,
-        project=PROJECT_ID,
-        api_key=GEMINI_API_KEY,
-    )
-
-    # Define OpenAI provider (secondary)
-    openai_model: Optional[ChatOpenAI] = (
-        ChatOpenAI(
-            model=openai_cfg["model"],
-            temperature=openai_cfg["temperature"],
-            max_tokens=openai_cfg["max_tokens"],
-            api_key=OPENAI_API_KEY,
-            timeout=OPENAI_REQUEST_TIMEOUT_S,
-            max_retries=OPENAI_MAX_RETRIES,
-        )
-        if OPENAI_API_KEY
-        else None
-    )
-
-    # Define Qwen provider (primary, when configured)
-    qwen_model: Optional[ChatOpenAI] = _build_qwen_model()
-
-    # Assemble the ordered fallback chain: Qwen -> OpenAI -> Gemini. Each entry
-    # is paired with a human-readable name for logging. Unconfigured providers
-    # are skipped so the chain only contains usable models.
-    model_chain: List[tuple[str, Any]] = []
-    if qwen_model is not None:
-        model_chain.append((f"qwen:{QWEN_SERVED_MODEL_NAME}", qwen_model))
-    if openai_model is not None:
-        model_chain.append((f"openai:{openai_cfg['model']}", openai_model))
-    model_chain.append((f"gemini:{google_cfg['model']}", gemini_model))
-
-    if model_chain[0][1] is gemini_model:
-        # Only Gemini is available; Qwen/OpenAI both unconfigured. This is almost
-        # certainly a misconfiguration for a "Qwen-primary" deployment.
+    if not OPENAI_API_KEY:
         raise RuntimeError(
-            "No primary provider configured: set QWEN_BASE_URL or OPENAI_API_KEY_QUTIS"
+            "OpenAI primary provider required: set OPENAI_API_KEY_QUTIS"
         )
 
-    # The first model in the chain is the default bound to the agent; the
-    # middleware overrides it per call to implement the fallback ordering.
-    primary_model: Any = model_chain[0][1]
-    logger.info(
-        "orchestrator model chain: %s",
-        " -> ".join(name for name, _ in model_chain),
+    gemini_model_name: str = ORCHESTRATOR_GEMINI_MODEL or str(google_cfg["model"])
+
+    gemini_model = build_gemini_chat_model(
+        model=gemini_model_name,
+        temperature=google_cfg["temperature"],
+        max_tokens=ORCHESTRATOR_MAX_TOKENS,
+        top_p=google_cfg["top_p"],
+        thinking_level=ORCHESTRATOR_GEMINI_THINKING_LEVEL,
+        google_credentials_path=CRED_PATH,
+        google_project=PROJECT_ID,
+        google_location=LOCATION,
+        gemini_api_key=GEMINI_API_KEY,
     )
 
-    # Circuit breaker guarding the self-hosted Qwen provider. When Qwen is
-    # repeatedly failing (cold start / down), the breaker opens and the
-    # middleware skips Qwen entirely for a cooldown window, failing over to
-    # OpenAI immediately instead of retrying an unhealthy endpoint.
-    qwen_breaker: CircuitBreaker = load_qwen_circuit_breaker()
+    openai_model = ChatOpenAI(
+        model=openai_cfg["model"],
+        temperature=openai_cfg["temperature"],
+        max_tokens=ORCHESTRATOR_MAX_TOKENS,
+        api_key=OPENAI_API_KEY,
+        timeout=OPENAI_REQUEST_TIMEOUT_S,
+        # Avoid SDK-level 429 retries; middleware fails over to Gemini immediately.
+        max_retries=0,
+    )
 
-    # Define dynamic model selection MIDDLEWARE
+    model_chain: List[tuple[str, Any]] = [
+        (f"openai:{openai_cfg['model']}", openai_model),
+        (f"gemini:{gemini_model_name}", gemini_model),
+    ]
+    primary_model: Any = openai_model
+
+    logger.info(
+        "orchestrator model chain: %s (gemini fallback thinking_level=%s, max_tokens=%s)",
+        " -> ".join(name for name, _ in model_chain),
+        ORCHESTRATOR_GEMINI_THINKING_LEVEL,
+        ORCHESTRATOR_MAX_TOKENS,
+    )
+
+    provider_breakers: dict[str, CircuitBreaker] = {
+        "openai": load_openai_circuit_breaker(),
+        "gemini": load_gemini_circuit_breaker(),
+    }
+
     @wrap_model_call
     def dynamic_model_selection(request: ModelRequest, handler) -> ModelResponse:
         """
-        Try each provider in the fallback chain until one succeeds.
+        Try OpenAI first, then Gemini on transient failures.
 
-        Iterates ``model_chain`` in priority order. On a rate-limit/availability
-        failure it falls through to the next provider; on a non-transient error
-        (or after the last provider) it re-raises so real bugs are not masked.
-        A circuit breaker short-circuits the Qwen provider while it is unhealthy.
+        Each provider has a circuit breaker. While a circuit is open the
+        middleware skips that provider (when a fallback exists) instead of
+        retrying an unhealthy endpoint.
 
         Args:
             request: The model request.
@@ -1024,14 +1059,15 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         last_exc: Optional[Exception] = None
         for index, (name, model) in enumerate(model_chain):
             role: str = "primary" if index == 0 else f"fallback#{index}"
-            is_qwen: bool = name.startswith("qwen:")
             is_last: bool = index == len(model_chain) - 1
+            provider_key: str = name.split(":", 1)[0]
+            breaker: Optional[CircuitBreaker] = provider_breakers.get(provider_key)
 
-            # Skip Qwen while its circuit is open (unless it is the only option).
-            if is_qwen and not is_last and not qwen_breaker.allow():
+            if breaker is not None and not is_last and not breaker.allow():
                 logger.warning(
-                    "qwen circuit OPEN (state=%s); skipping to next provider",
-                    qwen_breaker.state,
+                    "%s circuit OPEN (state=%s); skipping to next provider",
+                    provider_key,
+                    breaker.state,
                 )
                 agent_call_tracer.record_model_attempt(provider=name, success=False)
                 continue
@@ -1040,59 +1076,38 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
                 logger.info("invoking model: %s (%s)", name, role)
                 response: ModelResponse = handler(request.override(model=model))
                 logger.info("model replied: %s (%s)", name, role)
-                if is_qwen:
-                    # Reset the circuit breaker on success
-                    qwen_breaker.record_success()
-
+                if breaker is not None:
+                    breaker.record_success()
                 agent_call_tracer.record_model_attempt(provider=name, success=True)
                 return response
 
             except Exception as exc:
                 last_exc = exc
-                if is_qwen:
-                    # Record failure and open the circuit breaker
-                    qwen_breaker.record_failure()
-
+                if breaker is not None:
+                    breaker.record_failure()
                 agent_call_tracer.record_model_attempt(provider=name, success=False)
 
-                should_fallback: bool = _should_fallback(exc) or (
-                    is_qwen and _is_qwen_unavailable_error(exc)
-                )
-                
-                if is_last or not should_fallback:
+                if is_last or not _should_fallback(exc):
                     raise
 
-                # Log the failure Warning and fall back to the next provider
                 logger.warning(
                     "model %s failed (%s); falling back to next provider",
                     name,
                     exc,
                 )
-        # Defensive: the loop always returns or raises, but satisfy type-checkers.
         raise last_exc if last_exc is not None else RuntimeError("model chain empty")
 
-    # Dynamic summarization trigger:
-    # Uses Qwen3's max_model_len to calculate the summarization trigger tokens.
-    # - Reserve explicit output budget.
-    # - Reserve extra context for system prompt, tool schemas/results, and
-    #   serialization overhead.
-    # - Trigger summarization only when conversational history exceeds this
-    #   remaining budget.
-    reserved_output_tokens: int = max(128, QWEN_MAX_TOKENS)
-    reserved_overhead_tokens: int = max(
-        2048,
-        int(QWEN_MAX_MODEL_LEN * 0.20),
+    summarization_trigger_tokens: int = compute_summarization_trigger_tokens(
+        max_model_len=ORCHESTRATOR_MAX_MODEL_LEN,
+        max_output_tokens=ORCHESTRATOR_MAX_TOKENS,
+        max_trigger_tokens=ORCHESTRATOR_OPENAI_SUMMARIZATION_TRIGGER_TOKENS,
     )
-    summarization_trigger_tokens: int = max(
-        1500,
-        QWEN_MAX_MODEL_LEN - reserved_output_tokens - reserved_overhead_tokens,
-    )
-    logger.info(
-        "summarization budget: model_len=%s output_reserve=%s overhead_reserve=%s trigger_tokens=%s",
-        QWEN_MAX_MODEL_LEN,
-        reserved_output_tokens,
-        reserved_overhead_tokens,
-        summarization_trigger_tokens,
+
+    summarization_model = build_summarization_gemini_model(
+        google_credentials_path=CRED_PATH,
+        google_project=PROJECT_ID,
+        google_location=LOCATION,
+        gemini_api_key=GEMINI_API_KEY,
     )
 
     return create_agent(
@@ -1101,8 +1116,17 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         system_prompt=system_prompt,
         middleware=[
             dynamic_model_selection,
+            ToolCallLimitMiddleware(
+                tool_name="get_intake_status",
+                run_limit=ORCHESTRATOR_GET_INTAKE_STATUS_RUN_LIMIT,
+                exit_behavior="continue",
+            ),
+            ToolCallLimitMiddleware(
+                run_limit=ORCHESTRATOR_TOOL_RUN_LIMIT,
+                exit_behavior="continue",
+            ),
             SummarizationMiddleware(
-                model=primary_model,
+                model=summarization_model,
                 trigger=("tokens", summarization_trigger_tokens),
                 keep=("messages", 6),
             ),
@@ -1199,7 +1223,14 @@ def _reader_loop(
         for msg_id, fields in messages:
             def _run(_mid: str = str(msg_id), _fields: dict[str, Any] = fields) -> None:
                 try:
-                    handler(agent, _mid, _fields)
+                    run_traced_stream_handler(
+                        stream=stream,
+                        group=group,
+                        consumer=consumer,
+                        msg_id=_mid,
+                        fields=_fields,
+                        handler=lambda: handler(agent, _mid, _fields),
+                    )
                 except Exception:
                     # Handlers are expected to handle their own errors (DLQ + ack).
                     # This is a last-resort guard so a bug cannot leak a slot.
@@ -1310,8 +1341,6 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                 client_id, observed_signal.get("signal_type") or "unknown",
             )
 
-        # Mark our own flow as in-flight so a concurrently arriving signal can
-        # decide (today: does not wait; future: may read for context).
         _set_inflight(
             "job",
             client_id,
@@ -1324,7 +1353,7 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             },
         )
 
-        user_prompt = _build_orchestrator_input(
+        user_content = _build_orchestrator_user_content(
             request_id=request_id,
             case_id=case_id,
             client_id=client_id,
@@ -1333,13 +1362,18 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             username=username,
             payload_json=payload_json,
         )
-        config: RunnableConfig = {
-            "configurable": {
-                "thread_id": client_id,
-                "checkpoint_ns": "orchestrator",
-            },
-            "recursion_limit": AGENT_RECURSION_LIMIT,
-        }
+        config: RunnableConfig = build_invoke_config(
+            thread_id=client_id,
+            checkpoint_ns="orchestrator",
+            run_name="orchestrator:job",
+            channel=channel,
+            flow="job",
+            client_id=client_id,
+            request_id=request_id,
+            case_id=case_id,
+            message_id=message_id,
+            recursion_limit=AGENT_RECURSION_LIMIT,
+        )
         cache_ingress_payload(
             request_id=request_id,
             case_id=case_id,
@@ -1357,7 +1391,7 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             flow="job",
         )
         res = agent.invoke(
-            {"messages": [{"role": "user", "content": user_prompt}]},
+            {"messages": [HumanMessage(content=user_content)]},
             config=config,
         )
         agent_call_tracer.set_tool_names(agent_call_tracer.extract_tool_names(res))
@@ -1383,7 +1417,6 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             for item in attachments
         )
 
-        # Append to conversational Log
         _append_conversation_log(
             client_id,
             role="user",
@@ -1400,7 +1433,6 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             case_id=case_id,
         )
 
-        # Add to outbound stream
         _enqueue_outbound(
             client_id=client_id,
             case_id=case_id,
@@ -1412,24 +1444,18 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             reply_to_message_id=message_id,
         )
 
-        # Acknowledge the job stream message and delete it from the stream
         _redis.xack(ORCHESTRATOR_JOB_STREAM, ORCHESTRATOR_CONSUMER_GROUP, msg_id)
         _redis.xdel(ORCHESTRATOR_JOB_STREAM, msg_id)
 
-        # Mark as processed for idempotency
         reclaim_logic.mark_processed(ORCHESTRATOR_JOB_STREAM, msg_id)
 
     except Exception as exc:
 
-        # Finalize the trace for this turn (no-op if already ended on success).
         agent_call_tracer.end_turn(status="failed", error=str(exc))
 
-        # If the turn failed due to a recursion/loop, the persisted thread state
-        # is likely poisoned. Reset it so subsequent messages start clean.
         if ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION and _is_recursion_error(exc):
             _reset_client_checkpoint(client_id)
 
-        # Always send the client a graceful reply so a failure is never silent.
         try:
             _enqueue_outbound(
                 client_id=client_id,
@@ -1444,7 +1470,6 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         except Exception:
             logger.exception("failed to enqueue fallback reply: request_id=%s", request_id)
 
-        # Add the failed job to the dead letter queue
         _redis.xadd(
             ORCHESTRATOR_DLQ_STREAM,
             {
@@ -1457,14 +1482,11 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             maxlen=WORKERS_STREAM_MAXLEN,
             approximate=True,
         )
-        # Acknowledge the job stream message and delete it from the job stream
         _redis.xack(ORCHESTRATOR_JOB_STREAM, ORCHESTRATOR_CONSUMER_GROUP, msg_id)
         _redis.xdel(ORCHESTRATOR_JOB_STREAM, msg_id)
         logger.exception("orchestrator job failed: request_id=%s client_id=%s", request_id, client_id)
 
     finally:
-        # Always clear the job in-flight marker so a queued peer flow can proceed
-        # without waiting for the TTL to expire.
         _del_inflight("job", client_id)
 
 
@@ -1688,6 +1710,8 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         extras_obj = extras_obj if isinstance(extras_obj, dict) else {}
         group_id = str(extras_obj.get("group_id") or "").strip()
         group_expected_count = int(str(extras_obj.get("group_expected_count") or "1"))
+        signal_confidence = extract_confidence_from_fields(fields)
+        signal_threshold = extract_threshold_from_fields(fields)
 
         # Mark signal-in-flight so a concurrent job flow knows to wait briefly
         # for this signal's proactive_log write before composing its reply.
@@ -1767,15 +1791,24 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                 conversation_entries=conversation_entries,
                 research_context=research_context,
             )
-            config: RunnableConfig = {
-                "configurable": {
-                    "thread_id": client_id,
-                    # Separate namespace prevents races with concurrent job-flow
-                    # invokes on the same client_id (jobs use ns="orchestrator").
-                    "checkpoint_ns": "orchestrator:signal",
+            config: RunnableConfig = build_invoke_config(
+                thread_id=client_id,
+                checkpoint_ns="orchestrator:signal",
+                run_name=f"orchestrator:signal",
+                channel=channel,
+                flow="signal",
+                client_id=client_id,
+                request_id=request_id,
+                case_id=case_id,
+                message_id=str(fields.get("message_id") or request_id),
+                recursion_limit=AGENT_RECURSION_LIMIT,
+                extra_metadata={
+                    "signal_type": str(fields.get("signal_type") or ""),
+                    "signal_id": str(fields.get("signal_id") or ""),
+                    **({"confidence": signal_confidence} if signal_confidence else {}),
+                    **({"threshold": signal_threshold} if signal_threshold else {}),
                 },
-                "recursion_limit": AGENT_RECURSION_LIMIT,
-            }
+            )
             agent_call_tracer.start_turn(
                 request_id=request_id,
                 case_id=case_id,
@@ -1800,6 +1833,10 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         print(reply)
         logger.info("Orchestrator proactive reply: %s", reply)
 
+        delivery_prompt = format_delivery_context_for_prompt(
+            load_delivery_context(case_id, client_id, redis_client=_redis)
+        )
+
         # If the signal is part of a group, aggregate the replies
         if group_id and group_expected_count > 1:
             logger.info("___-------------------_______")
@@ -1816,6 +1853,7 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                     "fields": fields,
                     "reply": reply,
                 },
+                delivery_context_prompt=delivery_prompt,
             )
             if not aggregate_result.should_send:
                 _redis.xack(ORCHESTRATOR_SIGNAL_STREAM, ORCHESTRATOR_SIGNAL_CONSUMER_GROUP, msg_id)
@@ -1834,7 +1872,11 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             must_deliver=True,
             reply_to_message_id=reply_to_message_id,
             dedupe_discriminator=signal_type,
+            confidence=signal_confidence or None,
+            threshold=signal_threshold or None,
         )
+
+        _finalize_intake_after_delivery(case_id, client_id)
 
         # Persist a compact record of the proactive message so the next user
         # turn (job flow) can see what was already sent. Best-effort.
@@ -1907,6 +1949,9 @@ def run_worker_forever() -> None:
     # Expose the checkpointer for poisoned-thread resets on recursion failures.
     global _checkpointer
     _checkpointer = checkpointer
+
+    log_tracing_status("orchestrator")
+    log_pipeline_tracing_status("orchestrator")
 
     # Initialize the dynamic agent (shared by both readers; safe because the
     # agent is invoked via thread-safe checkpointer state per thread_id).

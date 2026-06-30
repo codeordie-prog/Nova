@@ -18,6 +18,13 @@ coverage.xml
 .env.*
 !.env.example
 
+# Google / Firebase service account keys (never commit)
+dermascan/backend/services/agents/configurations/*-*.json
+configs/
+*-firebase-adminsdk-*.json
+**/service-account*.json
+**/service_account*.json
+
 # IDE / Editor
 .vscode/
 .idea/
@@ -43,4 +50,7 @@ llms.md
 claude_review.md
 audit.md
 test.py
+test2.py
 subagents.md
+behaviour.md
+

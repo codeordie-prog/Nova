@@ -1,8 +1,9 @@
 {
-  "base_url": "http://localhost:8080",
+  "base_url": "http://localhost:8088",
   "ingress_endpoint": "whatsapp",
   "http_timeout": 30,
   "p95_concurrency": 20,
+  "p95_concurrency_levels": [20, 40, 60, 80],
   "p95_rounds": 3,
   "p95_warmup_rounds": 1,
   "ingress_p95_slo_ms": 300,

@@ -6,7 +6,7 @@ Documented ramp, spike, and soak scenarios for Locust/k6 runs against a live Der
 
 - Live FastAPI gateway + Redis + workers (or mock inference layer)
 - `DERMASCAN_INTERNAL_SECRET` set for webhook auth
-- Base URL: `http://localhost:8080` (override via `--host`)
+- Base URL: `http://localhost:8088` (override via `--host` or `DERMASCAN_API_URL`)
 
 ## Profiles
 
@@ -45,7 +45,7 @@ Documented ramp, spike, and soak scenarios for Locust/k6 runs against a live Der
 
 ```bash
 # Ramp profile (manual stages via Locust UI or headless)
-locust -f dermascan/tests/load/locustfile.py --host http://localhost:8080
+locust -f dermascan/tests/load/locustfile.py --host http://localhost:8088
 
 # Scenario modules (when implemented)
 # python -m dermascan.tests.load.scenarios.ingress_only

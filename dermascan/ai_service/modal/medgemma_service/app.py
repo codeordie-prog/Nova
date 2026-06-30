@@ -87,18 +87,18 @@ _STRUCTURED_SYSTEM_PROMPT: str = (
     "- Dermatological primary concern identification\n"
     "- Cosmetic and skincare product reviews\n\n"
 
-    "Your primary task is to identify the MOST LIKELY skin condition visible in an image "
+    "Your primary task is to identify skin condition visible in an image "
     "based on observed dermatological patterns, morphology, lesion appearance, distribution, "
     "texture, pigmentation, inflammation, scaling, pustules, nodules, redness, or other visible features.\n\n"
 
     "IMPORTANT DIAGNOSIS RULES:\n"
-    "- For ANY skin-related image, ALWAYS provide a best-effort diagnosis.\n"
-    "- NEVER leave diagnosis empty for visible skin conditions.\n"
-    "- Even if uncertain, provide one most likely primary diagnosis.\n"
-    "- Use probabilistic medical reasoning based on visual evidence.\n"
-    "- Only leave diagnosis empty if the image is clearly NOT skin-related.\n"
-    "- Do NOT say you cannot diagnose.\n"
-    "- Do NOT refuse unless the image is unrelated to skin or impossible to interpret.\n\n"
+    "- Use observed visual evidence only.\n"
+    "- Prioritize accuracy over completeness and avoid unsupported conclusions.\n"
+    "- If visual evidence is insufficient due to quality, lighting, framing, occlusion, or ambiguity, set diagnosis to 'uncertain'.\n"
+    "- Never invent a diagnosis to satisfy output requirements.\n"
+    "- For non-skin images, keep diagnosis empty and classify review_type accordingly.\n"
+    "- If skin is visible and features are interpretable, provide one best-supported primary diagnosis.\n"
+    "- Diagnosis must reflect the strongest supported pattern, not speculation.\n\n"
 
     "The input may contain:\n"
     "- A skin condition image\n"
@@ -122,8 +122,8 @@ _STRUCTURED_SYSTEM_PROMPT: str = (
 
     "FIELD RULES:\n"
     "- diagnosis:\n"
-    "  - Required for all skin-related images.\n"
-    "  - Must contain exactly one primary concern diagnosis only.\n"
+    "  - For skin/hybrid reviews, set to either one primary concern diagnosis OR 'uncertain' when evidence is limited.\n"
+    "  - Must contain exactly one primary concern diagnosis only when not 'uncertain'.\n"
     "  - Use concise medical terminology.\n"
     "  - Do not include differential diagnoses or comma-separated alternatives.\n\n"
 
@@ -163,7 +163,8 @@ _STRUCTURED_SYSTEM_PROMPT: str = (
     "- For general unrelated images:\n"
     "  - Leave all fields empty except review_type.\n\n"
 
-    "- If a specific field truly cannot be determined, return an empty string.\n"
+    "- If a specific non-required field truly cannot be determined, return an empty string.\n"
+    "- For skin/hybrid reviews with insufficient evidence, use diagnosis='uncertain' instead of forcing a label.\n"
     "- Keep all values concise.\n"
 )
 # Create class for MedGemma service, runs on A10G/L4 GPU with specified image and secrets

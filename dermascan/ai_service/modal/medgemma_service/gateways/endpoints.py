@@ -27,6 +27,7 @@ from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFil
 import redis
 
 from dermascan.shared.logger import get_logger
+from dermascan.shared.stream_pipeline_tracing import record_stream_produce
 from dermascan.ai_service.modal.medgemma_service.schemas import (
     BatchEnqueueResponse,
     DiagnoseBase64Request,
@@ -199,7 +200,22 @@ def _enqueue_job(
                     maxlen=_STREAM_MAXLEN,
                     approximate=True,
                 )
-                pipe.execute()
+                results = pipe.execute()
+                stream_msg_id = str(results[-1])
+                record_stream_produce(
+                    stream=_JOB_STREAM,
+                    msg_id=stream_msg_id,
+                    fields={
+                        "job_id": job_id,
+                        "request_id": request_id,
+                        "case_id": case_id,
+                        "client_id": client_id,
+                        "message_id": message_id,
+                        "channel": channel,
+                        "group_id": group_id,
+                    },
+                    extra_metadata={"worker": "medgemma_gateway"},
+                )
                 return job_id
         except redis.WatchError:
             continue
@@ -289,7 +305,22 @@ def _enqueue_ref_job(
                     maxlen=_STREAM_MAXLEN,
                     approximate=True,
                 )
-                pipe.execute()
+                results = pipe.execute()
+                stream_msg_id = str(results[-1])
+                record_stream_produce(
+                    stream=_JOB_STREAM,
+                    msg_id=stream_msg_id,
+                    fields={
+                        "job_id": job_id,
+                        "request_id": request_id,
+                        "case_id": case_id,
+                        "client_id": client_id,
+                        "message_id": message_id,
+                        "channel": channel,
+                        "group_id": group_id,
+                    },
+                    extra_metadata={"worker": "medgemma_gateway", "flow": "image_ref"},
+                )
                 return job_id
         except redis.WatchError:
             continue
@@ -354,7 +385,15 @@ def _enqueue_jobs_batch(jobs: list[tuple[bytes, str]]) -> list[str]:
                         maxlen=_STREAM_MAXLEN,
                         approximate=True,
                     )
-                pipe.execute()
+                results = pipe.execute()
+                for idx, (job_id, _, _) in enumerate(encoded_jobs):
+                    stream_msg_id = str(results[idx * 3 + 2])
+                    record_stream_produce(
+                        stream=_JOB_STREAM,
+                        msg_id=stream_msg_id,
+                        fields={"job_id": job_id},
+                        extra_metadata={"worker": "medgemma_gateway", "flow": "batch"},
+                    )
                 return job_ids
         except redis.WatchError:
             continue

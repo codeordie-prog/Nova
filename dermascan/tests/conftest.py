@@ -72,6 +72,16 @@ def reset_redis_client_cache() -> Generator[None, None, None]:
 
 
 @pytest.fixture
+def reclaim_env(real_redis) -> Generator[None, None, None]:
+    """Wire reclaim_logic to the session Redis client."""
+    from dermascan.backend.services.agents import reclaim_logic
+
+    reclaim_logic.set_redis_client(real_redis)
+    yield
+    reclaim_logic.set_redis_client(None)
+
+
+@pytest.fixture
 def sample_images() -> dict[str, bytes]:
     """Valid jpeg/png/webp + corrupt + oversized byte payloads."""
     from dermascan.tests.fixtures.images import build_sample_images

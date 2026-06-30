@@ -35,6 +35,44 @@ def whatsapp_text_webhook(
     }
 
 
+def whatsapp_image_webhook(
+    *,
+    from_id: str = "254700000001",
+    message_id: str = "wamid.e2e-image",
+    media_ref: str,
+    text: str = "Please diagnose this rash",
+    attachment_id: str = "img-e2e-1",
+) -> dict[str, Any]:
+    """WhatsApp webhook with a blob_ref attachment for /v1/webhooks/whatsapp."""
+    return {
+        "entry": [
+            {
+                "changes": [
+                    {
+                        "value": {
+                            "message": {
+                                "from": from_id,
+                                "id": message_id,
+                                "type": "text",
+                                "text": {"body": text},
+                                "attachments": [
+                                    {
+                                        "id": attachment_id,
+                                        "type": "image",
+                                        "media_ref": media_ref,
+                                        "mime_type": "image/jpeg",
+                                        "caption": text,
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+
 def whatsapp_valid_envelope() -> dict[str, Any]:
     """Default valid WhatsApp webhook payload."""
     return whatsapp_text_webhook()

@@ -26,9 +26,16 @@ from pydantic import BaseModel, Field
 import redis
 
 from dermascan.shared.logger import get_logger
+from dermascan.shared.langsmith_observability import (
+    build_invoke_config,
+    configure_worker_project,
+    log_tracing_status,
+)
 from dermascan.backend.services.agents.build import (
     open_checkpointer_url,
     build_google_credentials,
+    build_summarization_gemini_model,
+    compute_summarization_trigger_tokens,
 )
 from dermascan.backend.services.agents.loader import load_agent_configurations
 from dermascan.backend.services.agents.prompts.knowledge_prompt import system_prompt
@@ -41,6 +48,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 # Load env variables
 load_dotenv()
+configure_worker_project("knowledge")
 
 # Initialize logger
 logger: Logger = get_logger(__name__)
@@ -140,7 +148,7 @@ def _default_cfg(provider: str) -> dict[str, Any]:
         return {
             "name": "knowledge_google",
             "description": "Agent for retrieving medical knowledge base information",
-            "model": "gemini-2.5-flash",
+            "model": "gemini-3.5-flash",
             "temperature": 0.0,
             "max_tokens": 1000,
             "top_p": 0.95,
@@ -247,6 +255,17 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
             fallback_request = request.override(model=fallback_model)
             return handler(fallback_request)
 
+    summarization_model = build_summarization_gemini_model(
+        google_credentials_path=GOOGLE_CREDENTIALS_PATH,
+        google_project=GOOGLE_PROJECT,
+        google_location=GOOGLE_LOCATION,
+        gemini_api_key=GEMINI_API_KEY,
+    )
+    primary_cfg = google_cfg if primary_provider == "google" else openai_cfg
+    summarization_trigger_tokens = compute_summarization_trigger_tokens(
+        max_output_tokens=int(primary_cfg["max_tokens"]),
+    )
+
     # Create the agent
     return create_agent(
         model=primary_model,
@@ -255,8 +274,8 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         middleware=[
             dynamic_model_selection,
             SummarizationMiddleware(
-                model=primary_model,
-                trigger=("tokens", 1000),
+                model=summarization_model,
+                trigger=("tokens", summarization_trigger_tokens),
                 keep=("messages", 10),
             ),
         ],
@@ -498,12 +517,22 @@ def _process_knowledge_job(agent: Any, msg_id: str, fields: dict[str, Any]) -> N
         )
 
         knowledge_input = _build_knowledge_input(payload)
-        config: RunnableConfig = {
-            "configurable": {
-                "thread_id": payload.client_id,
-                "checkpoint_ns": "knowledge",
-            }
-        }
+        config: RunnableConfig = build_invoke_config(
+            thread_id=payload.client_id,
+            checkpoint_ns="knowledge",
+            run_name=f"knowledge:{payload.mode or 'research'}",
+            channel=payload.channel,
+            flow=str(payload.mode or "research"),
+            client_id=payload.client_id,
+            request_id=payload.request_id,
+            case_id=payload.case_id,
+            message_id=payload.message_id,
+            extra_metadata={
+                "source_agent": payload.source_agent,
+                "escalated": payload.escalated,
+            },
+            extra_tags=[payload.source_agent] if payload.source_agent else None,
+        )
         degraded = False
         degraded_reason = ""
         reply = ""
@@ -627,6 +656,7 @@ def run() -> None:
     Step-3 scope: robust ingestion loop only.
     """
     _ensure_consumer_group()
+    log_tracing_status("knowledge")
     checkpointer, checkpointer_ctx = open_checkpointer_url(REDIS_URL)
     agent = _build_dynamic_agent(checkpointer=checkpointer)
     logger.info(
