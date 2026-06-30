@@ -184,6 +184,36 @@ def _parse_json_obj(raw: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _humanize_diagnosis(raw: Any) -> str:
+    """Return clean, human-readable diagnosis prose — never a JSON blob.
+
+    MedGemma's ``diagnosis_text`` is sometimes the whole structured JSON (when the
+    inner ``diagnosis`` field is empty, e.g. at a 100% escalation threshold). Surface
+    only the inner prose; if there is none, return "" so the UI/outbound shows a clean
+    placeholder instead of raw JSON.
+    """
+    if not raw:
+        return ""
+    obj: Any = raw
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return ""
+        if s[0] not in "{[":
+            return s  # already plain prose
+        try:
+            obj = json.loads(s)
+        except Exception:
+            return ""  # looked like JSON but unparseable → drop, never leak
+    if isinstance(obj, dict):
+        for key in ("diagnosis", "rationale"):
+            value = str(obj.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+    return ""
+
+
 def _build_escalated_signal_payload(job: EscalationJobPayload) -> dict[str, Any]:
     """Build the full-fidelity ``{mode}_escalated`` payload from job fields alone.
 
@@ -193,8 +223,8 @@ def _build_escalated_signal_payload(job: EscalationJobPayload) -> dict[str, Any]
     """
     return {
         "review_type": job.review_type,
-        "diagnosis": job.diagnosis_text,
-        "diagnosis_text": job.diagnosis_text,
+        "diagnosis": _humanize_diagnosis(job.diagnosis_text),
+        "diagnosis_text": _humanize_diagnosis(job.diagnosis_text),
         "rationale": job.rationale,
         "summary": _parse_json_obj(job.summary),
         "treatment": _parse_json_obj(job.treatment),
@@ -246,7 +276,7 @@ def _build_handoff_packet(job: EscalationJobPayload, context: list[dict[str, Any
             "mode": job.mode,
             "confidence": job.confidence,
             "threshold": job.threshold,
-            "diagnosis_text": job.diagnosis_text,
+            "diagnosis_text": _humanize_diagnosis(job.diagnosis_text),
             "product_name": job.product_name,
             "description": job.description,
         },

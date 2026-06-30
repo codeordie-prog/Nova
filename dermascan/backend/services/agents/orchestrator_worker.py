@@ -1634,7 +1634,8 @@ def _compose_physician_reviewed_reply(payload: dict[str, Any]) -> str:
 
     diagnosis = str(payload.get("diagnosis") or payload.get("diagnosis_text") or "").strip()
     product_name = str(payload.get("product_name") or "").strip()
-    if diagnosis:
+    # Never surface a raw JSON blob to the user; only clean prose.
+    if diagnosis and diagnosis[0] not in "{[":
         parts.append(f"Original AI finding: {diagnosis}")
     elif product_name:
         parts.append(f"Original product reviewed: {product_name}")
