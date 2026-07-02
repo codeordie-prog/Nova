@@ -300,6 +300,8 @@ def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | 
             }
         )
 
+        
+
     _push_signal(
         entry=entry,
         text=text,

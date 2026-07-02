@@ -75,7 +75,7 @@ redis_secret: modal.Secret = modal.Secret.from_name("redis")
 
 
 # Modal app definition
-app: modal.App = modal.App("dermascan-medgemma")
+app: modal.App = modal.App("medgemma-service")
 
 # Logger initialization
 log: logging.Logger = get_logger(__name__)
@@ -169,12 +169,16 @@ _STRUCTURED_SYSTEM_PROMPT: str = (
 )
 # Create class for MedGemma service, runs on A10G/L4 GPU with specified image and secrets
 @app.cls(
-    gpu="A10",
+    gpu="L4",
     image=image,
     secrets=[hf_secret],
     max_containers=2,
     min_containers=2,
     scaledown_window=600,
+    # Image already mounts dermascan via add_local_python_source (.py only).
+    # Default include_source=True would auto-mount the whole package tree,
+    # including frontend node_modules (~40k+ files) and block startup for hours.
+    include_source=False,
 )
 @modal.concurrent(max_inputs=16)
 class MedGemmaService:

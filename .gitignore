@@ -37,6 +37,8 @@ frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 dermascan/frontend/whatsapp/
+dermascan/frontend/derma-dashboard/
+        
 
 # OS
 .DS_Store
