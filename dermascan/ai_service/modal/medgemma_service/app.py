@@ -169,11 +169,11 @@ _STRUCTURED_SYSTEM_PROMPT: str = (
 )
 # Create class for MedGemma service, runs on A10G/L4 GPU with specified image and secrets
 @app.cls(
-    gpu="L4",
+    gpu="A10G",
     image=image,
     secrets=[hf_secret],
-    max_containers=2,
-    min_containers=2,
+    max_containers=1,
+    min_containers=1,
     scaledown_window=600,
     # Image already mounts dermascan via add_local_python_source (.py only).
     # Default include_source=True would auto-mount the whole package tree,

@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from dermascan.backend.services.agents import reclaim_logic
+from dermascan.ai_service.postprocessing.escalation import ESCALATION_DEFERRED_CLIENT_MESSAGE
 from dermascan.shared.hmac_auth import SIGNATURE_HEADER, TIMESTAMP_HEADER, signature_header
 from dermascan.shared.logger import get_logger
 from dermascan.shared.redis_stability import (
@@ -359,6 +360,8 @@ def _enqueue_escalation_deferred(cached_payload: dict[str, Any], job: Escalation
             "source_event_id": "",
             "payload": json.dumps(cached_payload, default=str),
             "notes": "Escalation relay deferred; specialist review pending.",
+            "client_message": ESCALATION_DEFERRED_CLIENT_MESSAGE,
+            "suppress_model_output": "true",
         },
         maxlen=WORKERS_STREAM_MAXLEN,
         approximate=True,

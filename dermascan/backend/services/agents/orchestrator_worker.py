@@ -43,6 +43,7 @@ from dermascan.backend.services.agents.product_rules_signal_helper import (
     run_product_signal_rules_flow,
     run_skin_signal_rules_flow,
 )
+from dermascan.ai_service.postprocessing.escalation import resolve_client_message_for_signal
 from dermascan.backend.services.agents.group_report_aggregator import (
     collect_and_compile_if_ready,
 )
@@ -222,6 +223,16 @@ INFLIGHT_KEY_PREFIX: str = os.getenv("ORCHESTRATOR_INFLIGHT_KEY_PREFIX", "orches
 INFLIGHT_TTL_SEC: int = max(5, int(os.getenv("ORCHESTRATOR_INFLIGHT_TTL_SEC", "30")))
 INFLIGHT_WAIT_TIMEOUT_MS: int = max(0, int(os.getenv("ORCHESTRATOR_INFLIGHT_WAIT_TIMEOUT_MS", "3000")))
 INFLIGHT_WAIT_POLL_MS: int = max(50, int(os.getenv("ORCHESTRATOR_INFLIGHT_WAIT_POLL_MS", "200")))
+
+# Per-client job serialization. Job turns share one checkpoint keyed on
+# client_id, so two workers running for the same client concurrently corrupt
+# that state (surfacing as OpenAI tool_call mismatches or recursion loops).
+# A short-lived Redis lock guarantees one job turn per client at a time while
+# preserving full parallelism across different clients. The lease must exceed
+# the longest expected turn; it auto-expires so a crashed worker cannot deadlock.
+CLIENT_LOCK_KEY_PREFIX: str = os.getenv("ORCHESTRATOR_CLIENT_LOCK_KEY_PREFIX", "orchestrator:client_lock")
+CLIENT_LOCK_LEASE_SEC: int = max(30, int(os.getenv("ORCHESTRATOR_CLIENT_LOCK_LEASE_SEC", "180")))
+CLIENT_LOCK_WAIT_SEC: float = max(1.0, float(os.getenv("ORCHESTRATOR_CLIENT_LOCK_WAIT_SEC", "60")))
 
 # Initialize REDIS client
 _redis: redis.Redis = get_redis_client(decode_responses=True)
@@ -803,6 +814,56 @@ def _wait_for_inflight(
     return initial
 
 
+def _acquire_client_lock(client_id: str, request_id: str) -> Optional[Any]:
+    """
+    Acquire the per-client job lock, serializing turns for a single client.
+
+    Blocks up to ``CLIENT_LOCK_WAIT_SEC`` for an in-flight turn to finish so
+    queued messages for the same client are processed in order rather than
+    concurrently (which would corrupt the shared conversation checkpoint).
+
+    Args:
+        client_id: Conversation thread identifier to serialize on.
+        request_id: Current request id, for logging.
+
+    Returns:
+        The held lock handle, or None if the wait timed out or acquisition
+        failed. On None the caller must leave the stream message pending so the
+        reclaim loop retries it later.
+    """
+    lock = _redis.lock(
+        f"{CLIENT_LOCK_KEY_PREFIX}:{client_id}",
+        timeout=CLIENT_LOCK_LEASE_SEC,
+        blocking=True,
+        blocking_timeout=CLIENT_LOCK_WAIT_SEC,
+    )
+    try:
+        if lock.acquire():
+            return lock
+    except Exception:
+        logger.exception("client lock acquire failed: client_id=%s", client_id)
+        return None
+    logger.warning(
+        "client lock busy; deferring job for reclaim: client_id=%s request_id=%s",
+        client_id, request_id,
+    )
+    return None
+
+
+def _release_client_lock(lock: Any, client_id: str) -> None:
+    """
+    Release a held per-client job lock. Best-effort.
+
+    Args:
+        lock: Lock handle returned by ``_acquire_client_lock``.
+        client_id: Client identifier, for logging.
+    """
+    try:
+        lock.release()
+    except Exception:
+        logger.exception("client lock release failed: client_id=%s", client_id)
+
+
 # Build the orchestrator ingress context (text + optional multimodal image blocks)
 def _build_orchestrator_text_context(
     *,
@@ -1328,6 +1389,13 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
     username = str(fields.get("username") or "").strip()
     payload_json = str(fields.get("payload") or "{}")
 
+    # Serialize per client so concurrent workers cannot corrupt the shared
+    # conversation checkpoint. On lock timeout, leave the message pending for
+    # the reclaim loop instead of racing another in-flight turn.
+    client_lock = _acquire_client_lock(client_id, request_id)
+    if client_lock is None:
+        return
+
     try:
         # If a signal flow is currently processing a proactive update for this
         # client, wait briefly so the proactive_log is refreshed before we
@@ -1488,6 +1556,7 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
 
     finally:
         _del_inflight("job", client_id)
+        _release_client_lock(client_lock, client_id)
 
 
 def _build_signal_input(
@@ -1624,12 +1693,6 @@ def _perform_signal_research(fields: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-_ESCALATION_DEFERRED_MESSAGE = (
-    "Thanks for your patience. A skin specialist is reviewing your case and "
-    "will follow up shortly with their assessment."
-)
-
-
 def _compose_physician_reviewed_reply(payload: dict[str, Any]) -> str:
     derma_notes = payload.get("derma_notes") or {}
     if not isinstance(derma_notes, dict):
@@ -1696,9 +1759,6 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
     reply_to_message_id = (source_message_id if signal_type.startswith("diagnose_")
     or signal_type.startswith("product_review_") else "")
 
-    logger.info("___-------------------_______")
-    logger.info(f"THIS IS THE SIGNAL TYPE: {signal_type}")
-    logger.info("___-------------------_______")
     try:
         payload_obj: dict[str, Any] = {}
         try:
@@ -1737,14 +1797,14 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                 signal_type,
             )
             reply = _compose_physician_reviewed_reply(payload_obj)
-        elif signal_type.endswith("_escalation_deferred"):
+        elif (escalation_reply := resolve_client_message_for_signal(fields)):
             logger.info(
-                "processing escalation-deferred signal: request_id=%s case_id=%s signal_type=%s",
+                "processing escalation signal (client-safe): request_id=%s case_id=%s signal_type=%s",
                 request_id,
                 case_id,
                 signal_type,
             )
-            reply = _ESCALATION_DEFERRED_MESSAGE
+            reply = escalation_reply
         elif signal_type.startswith("product_review_"):
             logger.info(
                 "processing product-review signal through rules flow: request_id=%s case_id=%s client_id=%s signal_type=%s",
@@ -1830,7 +1890,6 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
 
         reply = _strip_markdown_formatting(reply)
 
-        print(reply)
         logger.info("Orchestrator proactive reply: %s", reply)
 
         delivery_prompt = format_delivery_context_for_prompt(
@@ -1839,10 +1898,6 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
 
         # If the signal is part of a group, aggregate the replies
         if group_id and group_expected_count > 1:
-            logger.info("___-------------------_______")
-            logger.info(f"THIS IS THE GROUP ID: {group_id}")
-            logger.info(f"THIS IS THE GROUP EXPECTED COUNT: {group_expected_count}")
-            logger.info("___-------------------_______")
             aggregate_result = collect_and_compile_if_ready(
                 group_id=group_id,
                 expected_count=group_expected_count,

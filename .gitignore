@@ -56,3 +56,7 @@ test2.py
 subagents.md
 behaviour.md
 
+copy_cir_pdfs_local_to_cloud.py
+copy_cir_pdfs_pg_dump.ps1
+
+cir_pdfs_backup.sql

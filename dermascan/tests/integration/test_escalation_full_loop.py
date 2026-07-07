@@ -277,6 +277,33 @@ class TestEscalationFullLoop:
         enqueue.assert_called_once()
         assert DERMA_NOTES["summary"] in enqueue.call_args.kwargs["text"]
 
+    def test_orchestrator_escalated_signal_uses_client_message_not_rules(
+        self,
+        escalation_env: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        enqueue = MagicMock()
+        rules = MagicMock()
+        monkeypatch.setattr(orchestrator_module, "_enqueue_outbound", enqueue)
+        monkeypatch.setattr(orchestrator_module, "run_skin_signal_rules_flow", rules)
+        monkeypatch.setattr(orchestrator_module, "_set_inflight", lambda *args, **kwargs: None)
+        monkeypatch.setattr(orchestrator_module, "_del_inflight", lambda *args, **kwargs: None)
+        monkeypatch.setattr(orchestrator_module, "_append_proactive_log", lambda *args, **kwargs: None)
+        monkeypatch.setattr(orchestrator_module, "_redis", escalation_env["redis"])
+        monkeypatch.setattr(orchestrator_module, "reclaim_logic", worker_module.reclaim_logic)
+
+        entry = _JobEntry()
+        escalation_module.route_case_after_inference(entry, LOW_CONFIDENCE_JSON, 0.42)
+        signals = [fields for _, fields in escalation_env["redis"].xrange(escalation_module._ORCHESTRATOR_SIGNAL_STREAM)]
+        escalated = next(row for row in signals if row["signal_type"] == "diagnose_escalated")
+
+        orchestrator_module._process_signal_message(MagicMock(), "1-0", escalated)
+        enqueue.assert_called_once()
+        rules.assert_not_called()
+        assert enqueue.call_args.kwargs["text"] == escalation_module.ESCALATION_CLIENT_MESSAGE
+        payload = json.loads(escalated["payload"])
+        assert "diagnosis" not in payload
+
     def test_relay_failure_enqueues_deferred_signal(
         self,
         escalation_env: dict[str, Any],

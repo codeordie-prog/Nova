@@ -40,6 +40,18 @@ _PRODUCT_REVIEW_CONFIDENCE_THRESHOLD: float = float(os.environ.get("PRODUCT_REVI
 _ESCALATION_DLQ_STREAM: str = os.environ.get("ESCALATION_DLQ_STREAM", "escalation:dlq")
 _EVENTS_DLQ_STREAM: str = os.environ.get("EVENTS_DLQ_STREAM","events:dlq")
 
+# Client-facing copy when inference is below threshold (orchestrator must not surface model output).
+ESCALATION_CLIENT_MESSAGE: str = os.environ.get(
+    "ESCALATION_CLIENT_MESSAGE",
+    "Your case requires a detailed review by a skin specialist. "
+    "We have contacted them for you, please wait for their response.",
+)
+ESCALATION_DEFERRED_CLIENT_MESSAGE: str = os.environ.get(
+    "ESCALATION_DEFERRED_CLIENT_MESSAGE",
+    "Thanks for your patience. A skin specialist is reviewing your case and "
+    "will follow up shortly with their assessment.",
+)
+
 
 # Initialize REDIS client
 _redis: Redis = Redis.from_url(_REDIS_URL)
@@ -83,6 +95,90 @@ def _stream_json(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value)
     return _to_str(value)
+
+
+def is_escalated_signal_type(signal_type: str) -> bool:
+    """
+    Return True for low-confidence ``{mode}_escalated`` orchestrator signals.
+
+    Excludes physician-reviewed and relay-deferred variants.
+    """
+    normalized = str(signal_type or "").strip().lower()
+    if not normalized.endswith("_escalated"):
+        return False
+    return not normalized.endswith("_physician_reviewed")
+
+
+def is_escalation_deferred_signal_type(signal_type: str) -> bool:
+    """Return True when escalation relay failed and a deferred client notice is pending."""
+    return str(signal_type or "").strip().lower().endswith("_escalation_deferred")
+
+
+def resolve_client_message_for_signal(fields: dict[str, Any]) -> str | None:
+    """
+    Resolve a fixed client-safe reply for escalation-related orchestrator signals.
+
+    Returns None when the signal should follow the normal rules/LLM composition path.
+    """
+    signal_type = str(fields.get("signal_type") or "")
+    if is_escalation_deferred_signal_type(signal_type):
+        return ESCALATION_DEFERRED_CLIENT_MESSAGE
+    if is_escalated_signal_type(signal_type):
+        custom = str(fields.get("client_message") or "").strip()
+        return custom or ESCALATION_CLIENT_MESSAGE
+    return None
+
+
+def _build_orchestrator_signal_payload(
+    *,
+    escalated: bool,
+    mode: str,
+    confidence: float | None,
+    threshold_used: float,
+    base_fields: dict[str, str],
+    text: str,
+    entry: _JobEntry,
+) -> dict[str, Any]:
+    """
+    Build orchestrator signal payload.
+
+    Escalated payloads omit model findings so downstream flows cannot leak them to the client.
+    Full findings remain on ``escalation:jobs`` and ``events:stream`` for physician review.
+    """
+    metadata: dict[str, Any] = {
+        "extras": {
+            "group_id": entry.group_id,
+            "group_expected_count": str(entry.group_expected_count),
+        }
+    }
+    if escalated:
+        return {
+            "mode": mode,
+            "escalation": True,
+            "confidence": confidence,
+            "threshold": threshold_used,
+            "metadata": metadata,
+        }
+    return {
+        "review_type": base_fields.get("review_type", ""),
+        "diagnosis": base_fields.get("diagnosis") or "",
+        "diagnosis_text": base_fields.get("diagnosis") or text,
+        "rationale": base_fields.get("rationale", ""),
+        "summary": base_fields.get("summary", {}),
+        "treatment": base_fields.get("treatment", {}),
+        "confidence": confidence,
+        "threshold": threshold_used,
+        "escalation": False,
+        "mode": mode,
+        "product_name": base_fields.get("product_name", ""),
+        "description": base_fields.get("description", ""),
+        "indications": base_fields.get("indications", ""),
+        "safety_in_pregnancy": base_fields.get("safety_in_pregnancy", ""),
+        "contraindications": base_fields.get("contraindications", ""),
+        "how_to_use": base_fields.get("how_to_use", ""),
+        "special_instructions": base_fields.get("special_instructions", ""),
+        "metadata": metadata,
+    }
 
 
 def _extract_structured_fields(text: str) -> tuple[dict[str, Any], bool]:
@@ -397,48 +493,35 @@ def _push_signal(
     else:
         notes = f"The {mode} inference completed above threshold"
 
-    signal_fields = enrich_stream_fields(
-        {
-            "signal_type": signal_type,
-            "signal_id": entry.msg_id,
-            "request_id": entry.request_id,
-            "case_id": entry.case_id,
-            "client_id": entry.client_id,
-            "message_id": entry.message_id,
-            "channel": entry.channel,
-            "source_event_id": "",
-            "payload": json.dumps(
-                {
-                    "review_type": base_fields.get("review_type", ""),
-                    "diagnosis": base_fields.get("diagnosis") or "",
-                    "diagnosis_text": base_fields.get("diagnosis") or text,
-                    "rationale": base_fields.get("rationale", ""),
-                    "summary": base_fields.get("summary", {}),
-                    "treatment": base_fields.get("treatment", {}),
-                    "confidence": confidence,
-                    "threshold": threshold_used,
-                    "escalation": escalated,
-                    "mode": mode,
-                    "product_name": base_fields.get("product_name", ""),
-                    "description": base_fields.get("description", ""),
-                    "indications": base_fields.get("indications", ""),
-                    "safety_in_pregnancy": base_fields.get("safety_in_pregnancy", ""),
-                    "contraindications": base_fields.get("contraindications", ""),
-                    "how_to_use": base_fields.get("how_to_use", ""),
-                    "special_instructions": base_fields.get("special_instructions", ""),
-                    "metadata": {
-                        "extras": {
-                            "group_id": entry.group_id,
-                            "group_expected_count": str(entry.group_expected_count),
-                        }
-                    },
-                }
-            ),
-            "notes": notes,
-            "confidence": "" if confidence is None else str(confidence),
-            "threshold": str(threshold_used),
-        }
-    )
+    signal_envelope: dict[str, Any] = {
+        "signal_type": signal_type,
+        "signal_id": entry.msg_id,
+        "request_id": entry.request_id,
+        "case_id": entry.case_id,
+        "client_id": entry.client_id,
+        "message_id": entry.message_id,
+        "channel": entry.channel,
+        "source_event_id": "",
+        "payload": json.dumps(
+            _build_orchestrator_signal_payload(
+                escalated=escalated,
+                mode=mode,
+                confidence=confidence,
+                threshold_used=threshold_used,
+                base_fields=base_fields,
+                text=text,
+                entry=entry,
+            )
+        ),
+        "notes": notes,
+        "confidence": "" if confidence is None else str(confidence),
+        "threshold": str(threshold_used),
+    }
+    if escalated:
+        signal_envelope["client_message"] = ESCALATION_CLIENT_MESSAGE
+        signal_envelope["suppress_model_output"] = "true"
+
+    signal_fields = enrich_stream_fields(signal_envelope)
     msg_id = str(
         _redis.xadd(
             _ORCHESTRATOR_SIGNAL_STREAM,
