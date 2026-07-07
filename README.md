@@ -11,10 +11,13 @@ user (Telegram / WhatsApp)
   Backend API (FastAPI, :8088)
          │ XADD orchestrator:jobs
          ▼
-  Orchestrator worker ──► OpenAI GPT-4o (primary LLM, tool calling)
-         │                  └── fallback: Gemini 3.5 Flash
+  Orchestrator worker ──► model chain (see §1)
+         │                  OpenAI: gpt-4o → gpt-4o-mini → gpt-5-mini → gpt-5
+         │                  then Gemini: gemini-3.5-flash → gemini-3.1-flash-lite
+         │                  per-model circuit breakers + full-chain retries
          ├──► MedGemma gateway (vision, via orchestrator tools)
          ├──► rules engine (PostgreSQL) via signal enrichment
+         │         report subagents: Gemini-first chain (REPORT_MODEL_CHAIN)
          └──► outbound:messages ──► Telegram / WhatsApp
 ```
 
@@ -36,28 +39,66 @@ poetry install
 cp .env_example .env   # fill in values — see sections below
 ```
 
-## 1. Orchestrator LLM (OpenAI → Gemini)
+## 1. LLM model chains
 
-The orchestrator uses **OpenAI GPT-4o** as the primary model (including tool calling) and **Gemini 3.5 Flash** as the fallback when OpenAI is rate-limited, unavailable, or its circuit breaker is open.
+The orchestrator and report subagents no longer use a single primary/fallback pair. Each flow runs an **ordered model chain** implemented in `dermascan/backend/services/agents/model_fallback_chain.py`.
 
-Skin and product **report subagents** (`product_rules_signal_helper`) use the opposite chain: **Gemini primary** via `REPORT_AGENT_MODEL`, OpenAI fallback.
+On each model call the worker walks the chain left to right. If a model returns 429, times out, hits a length limit, or its **per-model circuit breaker** is open, the next entry is tried. When every model in the chain fails, the worker waits (`MODEL_CHAIN_RETRY_DELAY_S`) and re-walks the full chain up to `MODEL_CHAIN_MAX_RETRIES` times.
 
-Required variables (see `.env_example`):
+### Orchestrator (OpenAI first, then Gemini)
+
+Used for conversational tool calling in `orchestrator_worker.py`:
+
+```
+openai:gpt-4o → openai:gpt-4o-mini → openai:gpt-5-mini → openai:gpt-5
+    → gemini:gemini-3.5-flash → gemini:gemini-3.1-flash-lite
+```
+
+Configure with `ORCHESTRATOR_MODEL_CHAIN` (comma-separated `provider:model_id` entries).
+
+Additional orchestrator resilience:
+
+- **Recursion retries** — on `GraphRecursionError`, reset the client checkpoint and retry the turn (`ORCHESTRATOR_RECURSION_MAX_RETRIES`).
+- **Tool-call caps** — limit polling tools such as `get_time` and `read_status_of_a_case`.
+- **Summarization** — checkpoint compression uses `SUMMARIZATION_MODEL_CHAIN` (Gemini-first by default).
+
+### Report subagents (Gemini first, then OpenAI)
+
+Skin/product reports and ingredient extraction in `product_rules_signal_helper.py` use a **cost-optimized** chain:
+
+```
+gemini:gemini-3.5-flash → gemini:gemini-3.1-flash-lite
+    → openai:gpt-4o-mini → openai:gpt-4o
+```
+
+Configure with `REPORT_MODEL_CHAIN`. Subagents also have per-tool limits and invoke retries (`REPORT_AGENT_*`).
+
+### Reasoning models (gpt-5 / o-series)
+
+OpenAI reasoning models consume output tokens for hidden reasoning. Set a higher budget so tool calls still fit:
 
 | Variable | Purpose |
 |---|---|
-| `OPENAI_API_KEY_QUTIS` | OpenAI API key for orchestrator primary |
-| `ORCHESTRATOR_OPENAI_MODEL` | Primary model (default `gpt-4o`) |
-| `ORCHESTRATOR_GEMINI_MODEL` | Orchestrator fallback (default `gemini-3.5-flash`) |
-| `REPORT_AGENT_MODEL` | Gemini model for skin/product report subagents (default `gemini-3.5-flash`) |
-| `ORCHESTRATOR_GEMINI_THINKING_LEVEL` | Gemini reasoning depth for fallback/report paths |
+| `OPENAI_REASONING_MAX_TOKENS` | Max completion tokens for gpt-5 / o-series (default `8192`) |
+| `OPENAI_REASONING_EFFORT` | Reasoning depth (default `minimal`) |
+
+### Required credentials & tuning
+
+| Variable | Purpose |
+|---|---|
+| `OPENAI_API_KEY_QUTIS` | OpenAI API key |
+| `GEMINI_API_KEY_QUTIS` or Vertex | Gemini / Google AI |
 | `GOOGLE_APPLICATION_CREDENTIALS_QUTIS` | Service account JSON for Vertex AI |
 | `GOOGLE_CLOUD_PROJECT_QUTIS` | GCP project ID |
 | `GOOGLE_CLOUD_LOCATION` | Vertex region (use `global` for Gemini 3.x) |
+| `ORCHESTRATOR_GEMINI_THINKING_LEVEL` | Gemini thinking depth on non-lite models |
+| `ORCHESTRATOR_MAX_TOKENS` | Default max output tokens per call (non-reasoning OpenAI) |
+| `MODEL_CB_FAILURE_THRESHOLD` / `MODEL_CB_COOLDOWN_S` | Per-model circuit breaker |
+| `MODEL_CHAIN_MAX_RETRIES` / `MODEL_CHAIN_RETRY_DELAY_S` | Full-chain retry when all models fail |
 
-Circuit-breaker tuning: `OPENAI_CB_*` and `GEMINI_CB_*` env vars control failover thresholds and cooldowns.
+Legacy `ORCHESTRATOR_OPENAI_MODEL`, `ORCHESTRATOR_GEMINI_MODEL`, and `REPORT_AGENT_MODEL` are ignored when the corresponding `*_MODEL_CHAIN` env vars are set.
 
-Model defaults and temperature/token limits live in `dermascan/backend/services/agents/configurations/agents_config.json`.
+Model temperature and token defaults also live in `dermascan/backend/services/agents/configurations/agents_config.json`.
 
 ## 2. PostgreSQL & rules engine
 
@@ -109,7 +150,7 @@ This script runs:
 
 | Worker | Role |
 |---|---|
-| `orchestrator_worker` | Consumes jobs + signals; drives OpenAI → Gemini conversation |
+| `orchestrator_worker` | Consumes jobs + signals; walks `ORCHESTRATOR_MODEL_CHAIN` with per-model breakers |
 | `outbound_sender_worker` | Compacts and delivers replies to Telegram / WhatsApp |
 
 **Not included:** `knowledge_worker` (optional, start manually) and **MedGemma** (separate AI-service stack below).
@@ -156,6 +197,7 @@ See `dermascan/ai_service/modal/medgemma_service/README.md` for gateway config.
 | Directory | Purpose |
 |---|---|
 | `dermascan/backend` | API server, agent workers, orchestrator tools |
+| `dermascan/backend/services/agents` | Workers, `model_fallback_chain.py`, circuit breakers |
 | `dermascan/ai_service` | MedGemma Modal app, inference postprocessing |
 | `dermascan/rules_engine` | PostgreSQL-backed ingredient safety engine |
 | `dermascan/scripts` | Worker supervisor (`do_work.py`) and utility scripts |
