@@ -111,6 +111,40 @@ _registry: dict[str, CircuitBreaker] = {}
 _registry_lock: threading.Lock = threading.Lock()
 
 
+def _env_int(name: str, default: int) -> int:
+    """
+    Read an integer environment variable, tolerating float strings.
+
+    Args:
+        name: Environment variable name.
+        default: Value when unset or empty.
+
+    Returns:
+        int: Parsed value clamped to at least 1.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return max(1, default)
+    return max(1, int(float(raw.strip())))
+
+
+def _env_float(name: str, default: float) -> float:
+    """
+    Read a float environment variable.
+
+    Args:
+        name: Environment variable name.
+        default: Value when unset or empty.
+
+    Returns:
+        float: Parsed value clamped to at least 1.0.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return max(1.0, default)
+    return max(1.0, float(raw.strip()))
+
+
 def get_circuit_breaker(name: str, config: CircuitBreakerConfig) -> CircuitBreaker:
     """
     Return a process-wide circuit breaker for ``name`` (created on first use).
@@ -151,17 +185,30 @@ def load_provider_circuit_breaker(
     Returns:
         CircuitBreaker: Breaker guarding the named provider.
     """
-    threshold: int = max(
-        1,
-        int(float(os.getenv(threshold_env, str(default_threshold)))),
-    )
-    cooldown_s: float = max(
-        1.0,
-        float(os.getenv(cooldown_env, str(default_cooldown_s))),
-    )
+    threshold: int = _env_int(threshold_env, default_threshold)
+    cooldown_s: float = _env_float(cooldown_env, default_cooldown_s)
     return get_circuit_breaker(
         provider,
         CircuitBreakerConfig(failure_threshold=threshold, cooldown_s=cooldown_s),
+    )
+
+
+def load_model_circuit_breaker(model_key: str) -> CircuitBreaker:
+    """
+    Build a per-model circuit breaker from environment configuration.
+
+    Args:
+        model_key: Registry key, e.g. ``openai:gpt-4o`` or ``gemini:gemini-3.5-flash``.
+
+    Returns:
+        CircuitBreaker: Breaker guarding the named model.
+    """
+    return load_provider_circuit_breaker(
+        model_key,
+        threshold_env="MODEL_CB_FAILURE_THRESHOLD",
+        cooldown_env="MODEL_CB_COOLDOWN_S",
+        default_threshold=_env_int("OPENAI_CB_FAILURE_THRESHOLD", 3),
+        default_cooldown_s=_env_float("OPENAI_CB_COOLDOWN_S", 60.0),
     )
 
 
@@ -212,6 +259,7 @@ __all__ = [
     "CircuitBreakerConfig",
     "get_circuit_breaker",
     "load_provider_circuit_breaker",
+    "load_model_circuit_breaker",
     "load_openai_circuit_breaker",
     "load_gemini_circuit_breaker",
     "load_qwen_circuit_breaker",

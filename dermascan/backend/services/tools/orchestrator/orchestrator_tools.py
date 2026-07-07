@@ -1418,9 +1418,11 @@ def _dispatch_audit_image_ref(
 @tool
 def get_time() -> str:
     """
-    Useful when you need to know the current time
+    Return the current UTC time once when needed for timestamps or scheduling.
+
+    Do not call repeatedly in the same turn; one call is sufficient.
     """
-    logger.info(f"TOOL CALL: get_time")
+    logger.info("TOOL CALL: get_time")
     return datetime.now(timezone.utc).isoformat()
 
 

@@ -14,16 +14,19 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
+from langchain.agents.middleware import ToolCallLimitMiddleware
 from langchain.tools import tool
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 from tavily import TavilyClient
 
-from dermascan.backend.services.agents.build import build_gemini_chat_model
-from dermascan.backend.services.agents.provider_circuit_breaker import (
-    CircuitBreaker,
-    load_gemini_circuit_breaker,
-    load_openai_circuit_breaker,
+from dermascan.backend.services.agents.model_fallback_chain import (
+    AGENT_INVOKE_MAX_RETRIES,
+    AGENT_INVOKE_RETRY_DELAY_S,
+    MODEL_CHAIN_MAX_RETRIES,
+    MODEL_CHAIN_RETRY_DELAY_S,
+    ModelChainRunner,
+    build_model_chain_from_spec,
+    report_model_chain_spec,
 )
 from dermascan.rules_engine.engine.engine import RulesEngineRequest, SkinContext
 from dermascan.rules_engine.engine.rules_engine import RulesEngine
@@ -56,12 +59,8 @@ configure_worker_project("signal_rules")
 logger = get_logger(__name__)
 
 TAVILY_API_KEY = str(os.getenv("TAVILY_API_KEY_QUTIS", ""))
-_PROVIDER_MAX_RETRIES_HARD_CAP = 3
 OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY_QUTIS", ""))
-OPENAI_MODEL_NAME = str(os.getenv("ORCHESTRATOR_OPENAI_MODEL") or os.getenv("OPENAI_MODEL_NAME") or "gpt-4o")
 OPENAI_REQUEST_TIMEOUT_S = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"))
-OPENAI_MAX_RETRIES = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("OPENAI_MAX_RETRIES", "2"))))
-GEMINI_MODEL_NAME = str(os.getenv("REPORT_AGENT_MODEL", "gemini-3.5-flash"))
 GEMINI_THINKING_LEVEL = str(os.getenv("ORCHESTRATOR_GEMINI_THINKING_LEVEL", "minimal"))
 ORCHESTRATOR_MAX_TOKENS = max(256, int(os.getenv("ORCHESTRATOR_MAX_TOKENS", "2048")))
 GEMINI_API_KEY = str(os.getenv("GEMINI_API_KEY_QUTIS", ""))
@@ -73,6 +72,27 @@ GOOGLE_PROJECT_ID = str(
 GOOGLE_LOCATION = str(os.getenv("GOOGLE_CLOUD_LOCATION", "global"))
 _SKIN_AUDIT_KEY_TEMPLATE = "skin_profile:{client_id}"
 _REPORT_MAX_SOURCES = max(1, int(os.getenv("SIGNAL_RULES_MAX_SOURCES", "2")))
+_FINAL_REPORT_MAX_SENTENCES = max(3, int(os.getenv("SIGNAL_RULES_MAX_SENTENCES", "5")))
+REPORT_AGENT_RECURSION_LIMIT: int = max(
+    4, int(os.getenv("REPORT_AGENT_RECURSION_LIMIT", "8"))
+)
+REPORT_AGENT_INVOKE_MAX_RETRIES: int = max(
+    0,
+    int(os.getenv("REPORT_AGENT_INVOKE_MAX_RETRIES", str(AGENT_INVOKE_MAX_RETRIES))),
+)
+REPORT_AGENT_INVOKE_RETRY_DELAY_S: float = max(
+    0.0,
+    float(os.getenv("REPORT_AGENT_INVOKE_RETRY_DELAY_S", str(AGENT_INVOKE_RETRY_DELAY_S))),
+)
+REPORT_AGENT_TOOL_RUN_LIMIT: int = max(
+    2, int(os.getenv("REPORT_AGENT_TOOL_RUN_LIMIT", "6"))
+)
+REPORT_AGENT_INCI_SEARCH_RUN_LIMIT: int = max(
+    1, int(os.getenv("REPORT_AGENT_INCI_SEARCH_RUN_LIMIT", "2"))
+)
+REPORT_AGENT_INTERNET_SEARCH_RUN_LIMIT: int = max(
+    1, int(os.getenv("REPORT_AGENT_INTERNET_SEARCH_RUN_LIMIT", "2"))
+)
 
 # Define response models
 class IngredientExtractionResponse(BaseModel):
@@ -94,222 +114,182 @@ class SkinReviewResponse(BaseModel):
 
     report_text: str = ""
 
-# Global rules engine instance + provider circuit breakers (shared with orchestrator).
+# Global rules engine instance.
 _rules_engine_singleton: RulesEngine | None = None
-_openai_breaker: CircuitBreaker = load_openai_circuit_breaker()
-_gemini_breaker: CircuitBreaker = load_gemini_circuit_breaker()
+_report_chain_runner: ModelChainRunner | None = None
 
 
-def _build_openai_model() -> ChatOpenAI:
+def _get_report_chain_runner() -> ModelChainRunner:
     """
-    Build the OpenAI fallback client for rules-flow subagents (tool calling).
+    Return the shared report/ingredient model chain runner.
 
     Returns:
-        ChatOpenAI: Configured OpenAI client.
-
-    Raises:
-        RuntimeError: If ``OPENAI_API_KEY_QUTIS`` is not set.
+        ModelChainRunner: Cached runner with per-model circuit breakers.
     """
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY_QUTIS is required for rules-flow subagents")
+    global _report_chain_runner
+    if _report_chain_runner is None:
+        model_chain = build_model_chain_from_spec(
+            chain_spec=report_model_chain_spec(),
+            openai_api_key=OPENAI_API_KEY,
+            openai_temperature=0.0,
+            openai_timeout_s=OPENAI_REQUEST_TIMEOUT_S,
+            gemini_temperature=0.0,
+            gemini_max_tokens=ORCHESTRATOR_MAX_TOKENS,
+            gemini_top_p=0.95,
+            gemini_thinking_level=GEMINI_THINKING_LEVEL,
+            google_credentials_path=GOOGLE_CREDENTIALS_PATH,
+            google_project=GOOGLE_PROJECT_ID,
+            google_location=GOOGLE_LOCATION,
+            gemini_api_key=GEMINI_API_KEY,
+        )
+        _report_chain_runner = ModelChainRunner(
+            model_chain,
+            max_retries=MODEL_CHAIN_MAX_RETRIES,
+            retry_delay_s=MODEL_CHAIN_RETRY_DELAY_S,
+            agent_max_retries=REPORT_AGENT_INVOKE_MAX_RETRIES,
+            agent_retry_delay_s=REPORT_AGENT_INVOKE_RETRY_DELAY_S,
+        )
+        logger.info(
+            "report model chain: %s (chain_retries=%s, retry_delay_s=%s, "
+            "agent_retries=%s, agent_retry_delay_s=%s, recursion_limit=%s)",
+            " -> ".join(name for name, _ in model_chain),
+            MODEL_CHAIN_MAX_RETRIES,
+            MODEL_CHAIN_RETRY_DELAY_S,
+            REPORT_AGENT_INVOKE_MAX_RETRIES,
+            REPORT_AGENT_INVOKE_RETRY_DELAY_S,
+            REPORT_AGENT_RECURSION_LIMIT,
+        )
+    return _report_chain_runner
 
-    return ChatOpenAI(
-        model=OPENAI_MODEL_NAME,
-        api_key=OPENAI_API_KEY,
-        timeout=OPENAI_REQUEST_TIMEOUT_S,
-        max_retries=0,
-        temperature=0,
-        max_tokens=ORCHESTRATOR_MAX_TOKENS,
+
+def _tool_names(tools: list[Any]) -> set[str]:
+    """
+    Extract registered tool names from LangChain tool objects.
+
+    Args:
+        tools: Tool list passed to a report subagent.
+
+    Returns:
+        set[str]: Tool name slugs.
+    """
+    names: set[str] = set()
+    for tool_obj in tools:
+        name = getattr(tool_obj, "name", None) or getattr(tool_obj, "__name__", "")
+        if name:
+            names.add(str(name))
+    return names
+
+
+def _build_report_agent_middleware(tools: list[Any]) -> list[Any]:
+    """
+    Build per-tool and global tool-call limits for report subagents.
+
+    Args:
+        tools: Tools attached to the subagent.
+
+    Returns:
+        list[Any]: Middleware stack for ``create_agent``.
+    """
+    names = _tool_names(tools)
+    middleware: list[Any] = []
+    if "inci_decoder_search" in names:
+        middleware.append(
+            ToolCallLimitMiddleware(
+                tool_name="inci_decoder_search",
+                run_limit=REPORT_AGENT_INCI_SEARCH_RUN_LIMIT,
+                exit_behavior="continue",
+            )
+        )
+    if "report_internet_search" in names:
+        middleware.append(
+            ToolCallLimitMiddleware(
+                tool_name="report_internet_search",
+                run_limit=REPORT_AGENT_INTERNET_SEARCH_RUN_LIMIT,
+                exit_behavior="continue",
+            )
+        )
+    if "skin_review_search" in names:
+        middleware.append(
+            ToolCallLimitMiddleware(
+                tool_name="skin_review_search",
+                run_limit=REPORT_AGENT_INTERNET_SEARCH_RUN_LIMIT,
+                exit_behavior="continue",
+            )
+        )
+    middleware.append(
+        ToolCallLimitMiddleware(
+            run_limit=REPORT_AGENT_TOOL_RUN_LIMIT,
+            exit_behavior="continue",
+        )
     )
+    return middleware
 
 
-def _build_gemini_model() -> Any:
-    """
-    Build the Gemini primary client for rules-flow subagents.
-
-    Returns:
-        Any: Configured Gemini chat model.
-    """
-    return build_gemini_chat_model(
-        model=GEMINI_MODEL_NAME,
-        temperature=0,
-        max_tokens=ORCHESTRATOR_MAX_TOKENS,
-        thinking_level=GEMINI_THINKING_LEVEL,
-        google_credentials_path=GOOGLE_CREDENTIALS_PATH,
-        google_project=GOOGLE_PROJECT_ID,
-        google_location=GOOGLE_LOCATION,
-        gemini_api_key=GEMINI_API_KEY,
-    )
-
-
-def _should_failover_to_openai(exc: Exception) -> bool:
-    """
-    Return True when Gemini failure should trigger OpenAI fallback.
-
-    Args:
-        exc: Raised exception from the primary provider.
-
-    Returns:
-        bool: True when OpenAI should be attempted next.
-    """
-    return _should_retry_provider_error(exc)
-
-
-def _should_retry_provider_error(exc: Exception) -> bool:
-    """
-    Return True for transient provider errors that are safe to retry.
-    
-    Args:
-        exc (Exception): The exception.
-
-
-    Returns:
-        bool - True if should be retried else false.
-    """
-    text = str(exc).lower()
-    markers = (
-        "429",
-        "rate limit",
-        "resource exhausted",
-        "timeout",
-        "timed out",
-        "connection",
-        "connect error",
-        "service unavailable",
-        "temporarily unavailable",
-        "bad gateway",
-        "gateway timeout",
-        "502",
-        "503",
-        "504",
-    )
-    return any(marker in text for marker in markers)
-
-
-def _invoke_agent_once(
+def _merge_invoke_config(
+    invoke_config: Optional[RunnableConfig],
     *,
-    agent: Any,
-    prompt: str,
-    invoke_config: Optional[RunnableConfig] = None,
-) -> dict[str, Any]:
+    recursion_limit: int,
+) -> RunnableConfig:
     """
-    Invoke an agent once and normalize the response shape.
+    Merge recursion limit into an invoke config for subagent calls.
 
     Args:
-        agent: Agent instance.
-        prompt: User prompt.
-        invoke_config: Optional LangSmith/checkpointer invoke config.
+        invoke_config: Optional base RunnableConfig (e.g. LangSmith trace).
+        recursion_limit: LangGraph step cap for this invoke.
 
     Returns:
-        dict[str, Any]: Agent invoke response.
+        RunnableConfig: Config with recursion_limit applied.
     """
-    if invoke_config is not None:
-        response = agent.invoke(
-            {"messages": [{"role": "user", "content": prompt}]},
-            config=invoke_config,
-        )
-    else:
-        response = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
-    return response if isinstance(response, dict) else {}
+    merged: dict[str, Any] = dict(invoke_config) if invoke_config else {}
+    merged["recursion_limit"] = recursion_limit
+    return merged
 
 
-def _invoke_with_retry(
+def _invoke_with_model_chain(
     *,
-    primary_agent: Any,
-    fallback_agent: Any,
-    prompt: str,
-    operation: str,
-    invoke_config: Optional[RunnableConfig] = None,
-) -> dict[str, Any]:
-    """
-    Invoke Gemini first, then OpenAI on rate limits or circuit-open state.
-
-    Args:
-        primary_agent: Gemini-backed agent.
-        fallback_agent: OpenAI-backed fallback agent.
-        prompt: The prompt for the agent.
-        operation: The operation carried out (skin or product review research).
-
-    Returns:
-        dict[str, Any]: Agent invoke response.
-
-    Raises:
-        RuntimeError: When both providers fail or circuits are open.
-    """
-    if not _gemini_breaker.allow():
-        logger.warning(
-            "gemini circuit open (state=%s); using openai for %s",
-            _gemini_breaker.state,
-            operation,
-        )
-        return _invoke_openai_once(
-            agent=fallback_agent,
-            prompt=prompt,
-            operation=operation,
-            invoke_config=invoke_config,
-        )
-
-    try:
-        response = _invoke_agent_once(
-            agent=primary_agent,
-            prompt=prompt,
-            invoke_config=invoke_config,
-        )
-        _gemini_breaker.record_success()
-        return response
-    except Exception as exc:
-        _gemini_breaker.record_failure()
-        if not _should_failover_to_openai(exc):
-            raise
-        logger.warning(
-            "%s gemini failed (%s); failing over to openai",
-            operation,
-            exc,
-        )
-        return _invoke_openai_once(
-            agent=fallback_agent,
-            prompt=prompt,
-            operation=operation,
-            invoke_config=invoke_config,
-        )
-
-
-def _invoke_openai_once(
-    *,
-    agent: Any,
+    system_prompt: str,
+    tools: list[Any],
+    response_format: type[BaseModel],
     prompt: str,
     operation: str,
     invoke_config: Optional[RunnableConfig] = None,
 ) -> dict[str, Any]:
     """
-    Invoke the OpenAI fallback agent with circuit-breaker guarding.
+    Invoke a LangChain agent across the ordered model chain.
 
     Args:
-        agent: OpenAI-backed agent.
+        system_prompt: Agent system prompt.
+        tools: Tool list for the agent.
+        response_format: Structured output schema.
         prompt: User prompt.
-        operation: Operation name for logging/errors.
+        operation: Operation label for logs.
+        invoke_config: Optional RunnableConfig.
 
     Returns:
         dict[str, Any]: Agent invoke response.
-
-    Raises:
-        RuntimeError: When the OpenAI circuit is open or the call fails.
     """
-    if not _openai_breaker.allow():
-        raise RuntimeError(
-            f"openai circuit open (state={_openai_breaker.state}); skipping {operation}"
+    runner = _get_report_chain_runner()
+    config = _merge_invoke_config(
+        invoke_config,
+        recursion_limit=REPORT_AGENT_RECURSION_LIMIT,
+    )
+    middleware = _build_report_agent_middleware(tools)
+
+    def build_agent(model: Any) -> Any:
+        return create_agent(
+            model=model,
+            tools=tools,
+            response_format=response_format,
+            system_prompt=system_prompt,
+            middleware=middleware,
         )
-    try:
-        response = _invoke_agent_once(
-            agent=agent,
-            prompt=prompt,
-            invoke_config=invoke_config,
-        )
-        _openai_breaker.record_success()
-        return response
-    except Exception as exc:
-        _openai_breaker.record_failure()
-        raise
+
+    return runner.invoke_langchain_model(
+        prompt=prompt,
+        build_agent=build_agent,
+        invoke_config=config,
+        operation=operation,
+    )
 
 
 def _normalize_inci_name(raw_name: str) -> str:
@@ -470,6 +450,27 @@ def _strip_markdown_formatting(text: str) -> str:
     return cleaned.strip()
 
 
+def _enforce_max_sentences(text: str, max_sentences: int = _FINAL_REPORT_MAX_SENTENCES) -> str:
+    """
+    Trim a report to at most ``max_sentences`` complete sentences.
+
+    Args:
+        text: Report body to trim.
+        max_sentences: Maximum number of sentences to keep.
+
+    Returns:
+        str: Trimmed report text.
+    """
+    cleaned = _strip_markdown_formatting(text)
+    if not cleaned:
+        return cleaned
+
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
+    if len(sentences) <= max_sentences:
+        return cleaned
+    return " ".join(sentences[:max_sentences])
+
+
 def _limit_sources(sources: list[str], limit: int = _REPORT_MAX_SOURCES) -> list[str]:
     """
     Return up to ``limit`` unique source URLs for outbound messages.
@@ -546,14 +547,14 @@ def skin_review_search(query: str, max_results: int = 2) -> str:
         return f"Skin review search failed: {exc}"
 
 
-def _build_ingredient_agents() -> tuple[Any, Any]:
+def _ingredient_extraction_system_prompt() -> str:
     """
-    Build Gemini-primary and OpenAI-fallback ingredient extraction agents.
+    Build the system prompt for ingredient extraction agents.
 
     Returns:
-        tuple[Any, Any]: Primary and fallback agent instances.
+        str: System prompt text.
     """
-    system_prompt = (
+    return (
         "You extract cosmetic product ingredient names in strict INCI-style naming. "
         "Always use the inci_decoder_search tool before finalizing when product identity is available. "
         "Return only ingredient names without concentration or percentages. "
@@ -562,19 +563,6 @@ def _build_ingredient_agents() -> tuple[Any, Any]:
         "Return at-most the first 10 main ingredients."
         "Avoid formatting your responses, reply with a clean well structured response, No bold or italics."
     )
-    primary = create_agent(
-        model=_build_gemini_model(),
-        tools=[inci_decoder_search],
-        response_format=IngredientExtractionResponse,
-        system_prompt=system_prompt,
-    )
-    fallback = create_agent(
-        model=_build_openai_model(),
-        tools=[inci_decoder_search],
-        response_format=IngredientExtractionResponse,
-        system_prompt=system_prompt,
-    )
-    return primary, fallback
 
 
 def extract_product_ingredients(
@@ -592,7 +580,7 @@ def extract_product_ingredients(
     Returns:
         IngredientExtractionResponse: The extracted ingredients
     """
-    primary_agent, fallback_agent = _build_ingredient_agents()
+    system_prompt = _ingredient_extraction_system_prompt()
     prompt = (
         "Extract the ingredient list for this cosmetic product.\n"
         "Use INCI names only and remove concentration values.\n"
@@ -600,9 +588,10 @@ def extract_product_ingredients(
         f"description: {description}\n"
     )
     try:
-        response = _invoke_with_retry(
-            primary_agent=primary_agent,
-            fallback_agent=fallback_agent,
+        response = _invoke_with_model_chain(
+            system_prompt=system_prompt,
+            tools=[inci_decoder_search],
+            response_format=IngredientExtractionResponse,
             prompt=prompt,
             operation="ingredient_extraction",
             invoke_config=invoke_config,
@@ -659,101 +648,77 @@ def report_internet_search(query: str, max_results: int = 2) -> str:
     except Exception as exc:
         return f"Report internet search failed: {exc}" 
 
-def _build_report_agents(
+def _product_report_system_prompt(
     context: list[dict[str, Any]],
     delivery_prompt: str = "",
-) -> tuple[Any, Any]:
+) -> str:
     """
-    Build Gemini-primary and OpenAI-fallback product report agents.
+    Build the system prompt for product report agents.
+
+    Args:
+        context: Recent conversation entries for personalization.
+        delivery_prompt: Optional delivery-channel formatting hints.
 
     Returns:
-        tuple[Any, Any]: Primary and fallback agent instances.
+        str: System prompt text.
     """
-    system_prompt = (
+    return (
         "You are a dermatology-focused product-audit assistant. "
-        "Convert structured product safety evidence into a short, readable audit for a non-technical user. "
+        "Convert structured product safety evidence into a brief audit for a non-technical user. "
         "Do not claim medical diagnosis and do not prescribe treatment. "
         "Use report_internet_search only when it meaningfully strengthens unclear or missing safety points. "
-        "Target 100-180 words total. Use 1-2 short sentences per section; no bullet laundry lists. "
-        "Do NOT report ingredient-by-ingredient. Synthesize across the formula into safety themes "
-        "(e.g. pregnancy/lactation cautions, contraindications or drug interactions, irritation or "
-        "sensitization risk, photosensitivity, actives to introduce slowly). "
-        "For a retinol serum, emphasize pregnancy avoidance, irritation potential, and sun protection "
-        "rather than listing every INCI name. "
-        "Output must use these section labels in order (plain text, no markdown): "
-        "Overview; Key safety themes; Contraindications and interaction cautions; "
-        "Pregnancy and lactation considerations; What to do next; Safety disclaimer. "
-        "Overview must include the product name when known. "
-        "Safety disclaimer must state the review is educational, not medical advice, and not a substitute "
-        "for a healthcare professional. "
+        "Write at most 5 sentences total as one plain-text paragraph. "
+        "Do NOT use section labels, headings, bullet lists, or markdown. "
+        "Prioritize findings that matter for THIS user (pregnancy, breastfeeding, allergies, goals, "
+        "primary concern). Lead with the highest-risk mismatch first — e.g. if the user is pregnant "
+        "and the formula contains retinol, say that clearly in sentence 1. "
+        "Do NOT mention filler or low-risk ingredients (water, aqua, glycerin, basic emollients, "
+        "common preservatives) unless they are the main safety issue. "
+        "Synthesize across the formula into a few safety themes only (contraindications, pregnancy/lactation, "
+        "irritation/sensitization, photosensitivity, actives to introduce slowly). "
+        "Include the product name in sentence 1 when known. "
+        "End with one short educational disclaimer: not medical advice; consult a professional when unsure. "
         "Do not include URLs in the report body (sources are appended separately). "
-        "When client context includes pregnancy, breastfeeding, allergies, or goals, "
-        "address them explicitly in pregnancy/lactation and safety sections. "
         f"last_conversation_entries: {json.dumps(context, default=str)}\n"
         f"{delivery_prompt}\n"
     )
-    primary = create_agent(
-        model=_build_gemini_model(),
-        tools=[report_internet_search],
-        response_format=UserFriendlyReportResponse,
-        system_prompt=system_prompt,
-    )
-    fallback = create_agent(
-        model=_build_openai_model(),
-        tools=[report_internet_search],
-        response_format=UserFriendlyReportResponse,
-        system_prompt=system_prompt,
-    )
-    return primary, fallback
 
 
-def _build_skin_review_agents(
+def _skin_review_system_prompt(
     context: list[dict[str, Any]],
     delivery_prompt: str = "",
-) -> tuple[Any, Any]:
+) -> str:
     """
-    Build Gemini-primary and OpenAI-fallback skin review agents.
+    Build the system prompt for skin review report agents.
+
+    Args:
+        context: Recent conversation entries for personalization.
+        delivery_prompt: Optional delivery-channel formatting hints.
 
     Returns:
-        tuple[Any, Any]: Primary and fallback agent instances.
+        str: System prompt text.
     """
-    system_prompt = (
+    return (
         "You are a dermatology skin-audit assistant. "
-        "Produce a short image-based skin pattern review from the candidate pattern, condition summary, "
+        "Produce a brief image-based skin pattern review from the candidate pattern, condition summary, "
         "and needs/treatment context. "
         "Use skin_review_search only when it materially improves uncertain or thin evidence. "
-        "Target 80-150 words total. Use 1-2 short sentences per section. "
-        "Return plain text only; do not use markdown, bold, or italics. "
+        "Write at most 5 sentences total as one plain-text paragraph. "
+        "Do NOT use section labels, headings, bullet lists, or markdown. "
         "Do not prescribe medications, dosages, or definitive treatment plans. "
         "Treat the candidate pattern as an internal hypothesis, not a confirmed diagnosis. "
         "Use cautious language such as 'appears consistent with', 'may suggest', 'could reflect', "
         "and 'image-based review cannot confirm'. "
         "Avoid definitive phrasing such as 'has', 'is', 'diagnosis is', or 'confirms'. "
         "If evidence is limited, state uncertainty explicitly. "
-        "Use these section labels in order: "
-        "Observed pattern; What this may suggest; Care considerations (general, non-prescriptive); "
-        "When to seek in-person review; Safety disclaimer. "
-        "Safety disclaimer must state the review is educational, not a medical diagnosis or prescription, "
-        "and that image-based review cannot confirm a condition. "
+        "Suggested flow (still one paragraph, no labels): what the image may show; what that could mean; "
+        "one practical care consideration personalized to allergies, pregnancy/breastfeeding, skin type, "
+        "and primary concern when provided; when to seek in-person review; one short educational disclaimer "
+        "(not a diagnosis or prescription; image review cannot confirm a condition). "
         "Do not include URLs in the report body (sources are appended separately). "
-        "Personalize care considerations using allergies, pregnancy/breastfeeding status, "
-        "skin type, and the user's primary concern when provided in client context. "
         f"last_conversation_entries: {json.dumps(context, default=str)}\n"
         f"{delivery_prompt}\n"
     )
-    primary = create_agent(
-        model=_build_gemini_model(),
-        tools=[skin_review_search],
-        response_format=SkinReviewResponse,
-        system_prompt=system_prompt,
-    )
-    fallback = create_agent(
-        model=_build_openai_model(),
-        tools=[skin_review_search],
-        response_format=SkinReviewResponse,
-        system_prompt=system_prompt,
-    )
-    return primary, fallback
 
 
 def build_skin_review_report(
@@ -768,10 +733,10 @@ def build_skin_review_report(
 ) -> str:
     """Build a concise user-facing skin review report."""
     delivery_prompt = format_delivery_context_for_prompt(delivery) if delivery else ""
-    primary_agent, fallback_agent = _build_skin_review_agents(context, delivery_prompt)
+    system_prompt = _skin_review_system_prompt(context, delivery_prompt)
     prompt = (
         "Generate the final image-based skin pattern review using the inputs below.\n"
-        "Keep every required section label; be concise (1-2 sentences per section).\n"
+        f"Hard limit: at most {_FINAL_REPORT_MAX_SENTENCES} sentences in one paragraph; no section labels.\n"
         "If a field is missing, state 'unknown' briefly and continue.\n"
         "Personalize using client context when allergies, pregnancy, or goals are present.\n"
         f"candidate_pattern: {diagnosis}\n"
@@ -782,16 +747,17 @@ def build_skin_review_report(
     if delivery_prompt:
         prompt = f"{prompt}\n{delivery_prompt}\n"
     try:
-        response = _invoke_with_retry(
-            primary_agent=primary_agent,
-            fallback_agent=fallback_agent,
+        response = _invoke_with_model_chain(
+            system_prompt=system_prompt,
+            tools=[skin_review_search],
+            response_format=SkinReviewResponse,
             prompt=prompt,
             operation="skin_review_report",
             invoke_config=invoke_config,
         )
         structured = response.get("structured_response") if isinstance(response, dict) else None
         if isinstance(structured, SkinReviewResponse) and structured.report_text.strip():
-            return _strip_markdown_formatting(structured.report_text)
+            return _enforce_max_sentences(structured.report_text)
     except Exception:
         logger.exception("failed to build skin review report")
 
@@ -821,15 +787,15 @@ def build_user_friendly_report(
     Returns:
         User-friendly report as string
     """
-    primary_agent, fallback_agent = _build_report_agents(
-        context,
-        format_delivery_context_for_prompt(delivery) if delivery else "",
-    )
+    delivery_prompt = format_delivery_context_for_prompt(delivery) if delivery else ""
+    system_prompt = _product_report_system_prompt(context, delivery_prompt)
     limited_sources = _limit_sources(sources)
     prompt = (
         "Generate the final product audit using the inputs below.\n"
-        "Synthesize safety themes across ingredients; do not list each ingredient separately.\n"
-        "Include the product name in Overview when available.\n"
+        f"Hard limit: at most {_FINAL_REPORT_MAX_SENTENCES} sentences in one paragraph; no section labels.\n"
+        "Rank findings by patient relevance: contraindications that match the user's stated pregnancy, "
+        "breastfeeding, allergies, or goals come first; skip filler ingredients unless they are the main risk.\n"
+        "Include the product name in sentence 1 when available.\n"
         "If a field is missing, state 'unknown' briefly and continue.\n"
         "Personalize pregnancy/lactation and allergy guidance using client context when present.\n"
         f"product_name: {product_name}\n"
@@ -839,16 +805,17 @@ def build_user_friendly_report(
         f"reference_sources: {json.dumps(limited_sources, default=str)}\n"
     )
     try:
-        response = _invoke_with_retry(
-            primary_agent=primary_agent,
-            fallback_agent=fallback_agent,
+        response = _invoke_with_model_chain(
+            system_prompt=system_prompt,
+            tools=[report_internet_search],
+            response_format=UserFriendlyReportResponse,
             prompt=prompt,
             operation="product_user_friendly_report",
             invoke_config=invoke_config,
         )
         structured = response.get("structured_response") if isinstance(response, dict) else None
         if isinstance(structured, UserFriendlyReportResponse) and structured.report_text.strip():
-            return _strip_markdown_formatting(structured.report_text)
+            return _enforce_max_sentences(structured.report_text)
     except Exception:
         logger.exception("failed to build user-friendly product report")
 

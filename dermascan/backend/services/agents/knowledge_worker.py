@@ -34,8 +34,11 @@ from dermascan.shared.langsmith_observability import (
 from dermascan.backend.services.agents.build import (
     open_checkpointer_url,
     build_google_credentials,
-    build_summarization_gemini_model,
     compute_summarization_trigger_tokens,
+)
+from dermascan.backend.services.agents.model_fallback_chain import (
+    build_chained_chat_model,
+    summarization_model_chain_spec,
 )
 from dermascan.backend.services.agents.loader import load_agent_configurations
 from dermascan.backend.services.agents.prompts.knowledge_prompt import system_prompt
@@ -78,6 +81,10 @@ WORKERS_STREAM_MAXLEN: int = int(os.getenv("WORKERS_STREAM_MAXLEN", "5000"))
 WORKERS_STREAM_BLOCK_MS: int = int(os.getenv("WORKERS_STREAM_BLOCK_MS", "500"))
 WORKERS_STREAM_BATCH_SIZE: int = max(1, int(os.getenv("WORKERS_STREAM_BATCH_SIZE", "8")))
 WORKERS_MAX_INFLIGHT: int = max(1, int(os.getenv("WORKERS_MAX_INFLIGHT", "8")))
+SUMMARIZATION_MAX_TOKENS: int = max(
+    256, int(os.getenv("SUMMARIZATION_MAX_TOKENS", "1024"))
+)
+OPENAI_REQUEST_TIMEOUT_S: float = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"))
 KNOWLEDGE_RESEARCH_MAX_ATTEMPTS: int = max(1, int(os.getenv("KNOWLEDGE_RESEARCH_MAX_ATTEMPTS", "3")))
 KNOWLEDGE_RETRY_BASE_DELAY_SEC: float = max(0.0, float(os.getenv("KNOWLEDGE_RETRY_BASE_DELAY_SEC", "0.75")))
 
@@ -255,11 +262,20 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
             fallback_request = request.override(model=fallback_model)
             return handler(fallback_request)
 
-    summarization_model = build_summarization_gemini_model(
+    summarization_model = build_chained_chat_model(
+        chain_spec=summarization_model_chain_spec(),
+        openai_api_key=OPENAI_API_KEY,
+        openai_temperature=float(openai_cfg["temperature"]),
+        openai_timeout_s=OPENAI_REQUEST_TIMEOUT_S,
+        gemini_temperature=0.0,
+        gemini_max_tokens=SUMMARIZATION_MAX_TOKENS,
+        gemini_top_p=float(google_cfg["top_p"]),
+        gemini_thinking_level=str(os.getenv("ORCHESTRATOR_GEMINI_THINKING_LEVEL", "minimal")),
         google_credentials_path=GOOGLE_CREDENTIALS_PATH,
         google_project=GOOGLE_PROJECT,
         google_location=GOOGLE_LOCATION,
         gemini_api_key=GEMINI_API_KEY,
+        label="knowledge-summarization",
     )
     primary_cfg = google_cfg if primary_provider == "google" else openai_cfg
     summarization_trigger_tokens = compute_summarization_trigger_tokens(

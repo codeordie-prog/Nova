@@ -35,8 +35,6 @@ from dermascan.backend.services.tools.orchestrator.orchestrator_tools import (
 from dermascan.backend.services.agents.loader import load_agent_configurations
 from dermascan.backend.services.agents.build import (
     open_checkpointer_url,
-    build_gemini_chat_model,
-    build_summarization_gemini_model,
     compute_summarization_trigger_tokens,
 )
 from dermascan.backend.services.agents.product_rules_signal_helper import (
@@ -68,13 +66,17 @@ from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware, ToolCallLimitMiddleware, wrap_model_call, ModelRequest, ModelResponse
-from langchain_openai import ChatOpenAI
 from dermascan.backend.services.agents.prompts.orchestrator_prompt import system_prompt
 from dermascan.backend.services.agents import reclaim_logic
-from dermascan.backend.services.agents.provider_circuit_breaker import (
-    CircuitBreaker,
-    load_gemini_circuit_breaker,
-    load_openai_circuit_breaker,
+from dermascan.backend.services.agents.model_fallback_chain import (
+    ModelChainRunner,
+    MODEL_CHAIN_MAX_RETRIES,
+    MODEL_CHAIN_RETRY_DELAY_S,
+    build_chained_chat_model,
+    build_model_chain_from_spec,
+    is_recursion_error,
+    orchestrator_model_chain_spec,
+    summarization_model_chain_spec,
 )
 from dermascan.backend.services.agents.memory.redis_checkpointer import (
     delete_thread as delete_checkpoint_thread,
@@ -106,9 +108,6 @@ CRED_PATH: str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_QUTIS", "")
 PROJECT_ID: str = os.getenv("GOOGLE_CLOUD_PROJECT_QUTIS", "qutisai")
 # Gemini 3.x models require the global Vertex endpoint on this project.
 LOCATION: str = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
-ORCHESTRATOR_GEMINI_MODEL: str = os.getenv(
-    "ORCHESTRATOR_GEMINI_MODEL", "gemini-3.5-flash"
-)
 ORCHESTRATOR_GEMINI_THINKING_LEVEL: str = os.getenv(
     "ORCHESTRATOR_GEMINI_THINKING_LEVEL", "minimal"
 )
@@ -124,6 +123,9 @@ ORCHESTRATOR_OPENAI_SUMMARIZATION_TRIGGER_TOKENS: int = max(
     1500,
     int(os.getenv("ORCHESTRATOR_OPENAI_SUMMARIZATION_TRIGGER_TOKENS", "24000")),
 )
+SUMMARIZATION_MAX_TOKENS: int = max(
+    256, int(os.getenv("SUMMARIZATION_MAX_TOKENS", "1024"))
+)
 _PROVIDER_MAX_RETRIES_HARD_CAP: int = 3
 OPENAI_REQUEST_TIMEOUT_S: float = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"))
 OPENAI_MAX_RETRIES: int = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("OPENAI_MAX_RETRIES", "2"))))
@@ -132,6 +134,12 @@ AGENT_RECURSION_LIMIT: int = max(1, int(os.getenv("ORCHESTRATOR_AGENT_RECURSION_
 ORCHESTRATOR_TOOL_RUN_LIMIT: int = max(3, int(os.getenv("ORCHESTRATOR_TOOL_RUN_LIMIT", "8")))
 ORCHESTRATOR_GET_INTAKE_STATUS_RUN_LIMIT: int = max(
     1, int(os.getenv("ORCHESTRATOR_GET_INTAKE_STATUS_RUN_LIMIT", "1"))
+)
+ORCHESTRATOR_GET_TIME_RUN_LIMIT: int = max(
+    1, int(os.getenv("ORCHESTRATOR_GET_TIME_RUN_LIMIT", "1"))
+)
+ORCHESTRATOR_READ_STATUS_RUN_LIMIT: int = max(
+    1, int(os.getenv("ORCHESTRATOR_READ_STATUS_RUN_LIMIT", "2"))
 )
 # User-facing reply sent when a turn fails (e.g. recursion limit / provider
 # error) so the client is never left without a response.
@@ -145,6 +153,12 @@ ORCHESTRATOR_FAILURE_REPLY: str = os.getenv(
 ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION: bool = os.getenv(
     "ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
+ORCHESTRATOR_RECURSION_MAX_RETRIES: int = max(
+    0, int(os.getenv("ORCHESTRATOR_RECURSION_MAX_RETRIES", "5"))
+)
+ORCHESTRATOR_RECURSION_RETRY_DELAY_S: float = max(
+    0.0, float(os.getenv("ORCHESTRATOR_RECURSION_RETRY_DELAY_S", "2"))
+)
 
 # Define default configurations
 DEFAULT_CONFIG: List[Dict[str, Any]] = [{
@@ -271,7 +285,74 @@ def _is_recursion_error(exc: Exception) -> bool:
     Returns:
         bool: True when the failure is a recursion-limit error.
     """
-    return "recursion limit" in str(exc).lower() or exc.__class__.__name__ == "GraphRecursionError"
+    return is_recursion_error(exc)
+
+
+def _invoke_agent_with_recursion_retry(
+    *,
+    agent: Any,
+    payload: dict[str, Any],
+    config: RunnableConfig,
+    client_id: str,
+    request_id: str,
+    flow: str,
+) -> Any:
+    """
+    Invoke the orchestrator agent with automatic retries on recursion-limit failures.
+
+    Resets the client checkpoint between attempts when enabled so poisoned tool-loop
+    state does not carry into the next try.
+
+    Args:
+        agent: Orchestrator LangGraph agent.
+        payload: Invoke payload (messages dict).
+        config: RunnableConfig for this turn.
+        client_id: Conversation thread id.
+        request_id: Ingress request id for logging.
+        flow: ``job`` or ``signal`` label for logs.
+
+    Returns:
+        Any: Agent invoke result on success.
+
+    Raises:
+        Exception: The last failure when retries are exhausted or the error is not
+            recursion-related.
+    """
+    last_exc: Optional[Exception] = None
+    max_attempts = ORCHESTRATOR_RECURSION_MAX_RETRIES + 1
+
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            logger.warning(
+                "orchestrator recursion retry %s/%s: client_id=%s request_id=%s flow=%s",
+                attempt,
+                ORCHESTRATOR_RECURSION_MAX_RETRIES,
+                client_id,
+                request_id,
+                flow,
+            )
+            if ORCHESTRATOR_RECURSION_RETRY_DELAY_S > 0:
+                time.sleep(ORCHESTRATOR_RECURSION_RETRY_DELAY_S)
+            if ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION:
+                _reset_client_checkpoint(client_id)
+
+        try:
+            return agent.invoke(payload, config=config)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_recursion_error(exc):
+                raise
+            if attempt >= ORCHESTRATOR_RECURSION_MAX_RETRIES:
+                raise
+            logger.warning(
+                "orchestrator recursion limit hit (attempt %s/%s): client_id=%s request_id=%s",
+                attempt + 1,
+                max_attempts,
+                client_id,
+                request_id,
+            )
+
+    raise last_exc if last_exc is not None else RuntimeError("agent invoke failed")
 
 
 def _strip_markdown_formatting(text: str) -> str:
@@ -334,21 +415,6 @@ def get_config_file(path: str, provider: str) -> Dict[str, Any]:
         raise
 
 
-def _is_resource_exhaustion_error(exc: Exception) -> bool:
-    """
-    Checks if the exception is a resource exhaustion error.
-    This will be used to decide when to switch to a different model provider.
-    
-    Args:
-        exc (Exception): The exception to check
-        
-    Returns:
-        bool: True if the exception is a resource exhaustion error, False otherwise
-    """
-    text: str = str(exc).lower()
-    return "429" in text or "resource exhausted" in text or "rate limit" in text
-
-
 def _iter_exception_chain(exc: BaseException) -> list[BaseException]:
     """
     Flatten an exception and its ``__cause__`` / ``__context__`` chain.
@@ -392,50 +458,6 @@ def _is_timeout_error(exc: Exception) -> bool:
         if "timed out" in text or "timeout" in text or "deadline exceeded" in text:
             return True
     return False
-
-
-def _should_fallback(exc: Exception) -> bool:
-    """
-    Decide whether a model failure warrants trying the next provider.
-
-    Covers resource exhaustion (rate limits / quota) plus transient availability
-    failures that are common with a self-hosted endpoint (cold start, scaledown,
-    network blips, gateway errors). Logic/validation errors are NOT swallowed so
-    genuine bugs still surface.
-
-    Args:
-        exc (Exception): The exception raised by a model invocation.
-
-    Returns:
-        bool: True if the orchestrator should fall through to the next model.
-    """
-    # Check 429 status code
-    if _is_resource_exhaustion_error(exc):
-        return True
-    if _is_timeout_error(exc):
-        return True
-
-    text: str = str(exc).lower()
-    transient_markers: tuple[str, ...] = (
-        "maximum context length",
-        "context length",
-        "input_tokens",
-        "reduce the length",
-        "timeout",
-        "timed out",
-        "connection",
-        "connect error",
-        "service unavailable",
-        "temporarily unavailable",
-        "bad gateway",
-        "gateway timeout",
-        "see other",
-        "303",
-        "502",
-        "503",
-        "504",
-    )
-    return any(marker in text for marker in transient_markers)
 
 
 def _proactive_log_key(client_id: str) -> str:
@@ -1036,11 +1058,11 @@ def _ensure_consumer_group(stream: str = "orchestrator_job") -> None:
 
 def _build_dynamic_agent(*, checkpointer: Any) -> Any:
     """
-    Build a dynamic agent with an ordered model fallback chain.
+    Build a dynamic agent with an ordered per-model fallback chain.
 
-    Priority: OpenAI GPT-4o (primary, including tool calls) -> Google Gemini.
-    Each provider is guarded by a circuit breaker so repeated failures skip
-    straight to the next provider during the cooldown window.
+    OpenAI models are tried in order, then Gemini models. Each model has its
+    own circuit breaker. When every model fails, the full chain is retried
+    after a configurable delay.
 
     Args:
         checkpointer: The conversation checkpointer to attach to the agent.
@@ -1059,56 +1081,47 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
             "OpenAI primary provider required: set OPENAI_API_KEY_QUTIS"
         )
 
-    gemini_model_name: str = ORCHESTRATOR_GEMINI_MODEL or str(google_cfg["model"])
-
-    gemini_model = build_gemini_chat_model(
-        model=gemini_model_name,
-        temperature=google_cfg["temperature"],
-        max_tokens=ORCHESTRATOR_MAX_TOKENS,
-        top_p=google_cfg["top_p"],
-        thinking_level=ORCHESTRATOR_GEMINI_THINKING_LEVEL,
+    chain_spec = orchestrator_model_chain_spec()
+    model_chain = build_model_chain_from_spec(
+        chain_spec=chain_spec,
+        openai_api_key=OPENAI_API_KEY,
+        openai_temperature=float(openai_cfg["temperature"]),
+        openai_timeout_s=OPENAI_REQUEST_TIMEOUT_S,
+        gemini_temperature=float(google_cfg["temperature"]),
+        gemini_max_tokens=ORCHESTRATOR_MAX_TOKENS,
+        gemini_top_p=float(google_cfg["top_p"]),
+        gemini_thinking_level=ORCHESTRATOR_GEMINI_THINKING_LEVEL,
         google_credentials_path=CRED_PATH,
         google_project=PROJECT_ID,
         google_location=LOCATION,
         gemini_api_key=GEMINI_API_KEY,
     )
-
-    openai_model = ChatOpenAI(
-        model=openai_cfg["model"],
-        temperature=openai_cfg["temperature"],
-        max_tokens=ORCHESTRATOR_MAX_TOKENS,
-        api_key=OPENAI_API_KEY,
-        timeout=OPENAI_REQUEST_TIMEOUT_S,
-        # Avoid SDK-level 429 retries; middleware fails over to Gemini immediately.
-        max_retries=0,
-    )
-
-    model_chain: List[tuple[str, Any]] = [
-        (f"openai:{openai_cfg['model']}", openai_model),
-        (f"gemini:{gemini_model_name}", gemini_model),
-    ]
-    primary_model: Any = openai_model
+    primary_model: Any = model_chain[0][1]
 
     logger.info(
-        "orchestrator model chain: %s (gemini fallback thinking_level=%s, max_tokens=%s)",
+        "orchestrator model chain: %s (thinking_level=%s, max_tokens=%s, "
+        "chain_retries=%s, retry_delay_s=%s)",
         " -> ".join(name for name, _ in model_chain),
         ORCHESTRATOR_GEMINI_THINKING_LEVEL,
         ORCHESTRATOR_MAX_TOKENS,
+        MODEL_CHAIN_MAX_RETRIES,
+        MODEL_CHAIN_RETRY_DELAY_S,
     )
 
-    provider_breakers: dict[str, CircuitBreaker] = {
-        "openai": load_openai_circuit_breaker(),
-        "gemini": load_gemini_circuit_breaker(),
-    }
+    chain_runner = ModelChainRunner(
+        model_chain,
+        max_retries=MODEL_CHAIN_MAX_RETRIES,
+        retry_delay_s=MODEL_CHAIN_RETRY_DELAY_S,
+        record_attempt=lambda name, success: agent_call_tracer.record_model_attempt(
+            provider=name,
+            success=success,
+        ),
+    )
 
     @wrap_model_call
     def dynamic_model_selection(request: ModelRequest, handler) -> ModelResponse:
         """
-        Try OpenAI first, then Gemini on transient failures.
-
-        Each provider has a circuit breaker. While a circuit is open the
-        middleware skips that provider (when a fallback exists) instead of
-        retrying an unhealthy endpoint.
+        Walk the ordered model chain with per-model circuit breakers and retries.
 
         Args:
             request: The model request.
@@ -1117,46 +1130,7 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         Returns:
             ModelResponse: The first successful model response.
         """
-        last_exc: Optional[Exception] = None
-        for index, (name, model) in enumerate(model_chain):
-            role: str = "primary" if index == 0 else f"fallback#{index}"
-            is_last: bool = index == len(model_chain) - 1
-            provider_key: str = name.split(":", 1)[0]
-            breaker: Optional[CircuitBreaker] = provider_breakers.get(provider_key)
-
-            if breaker is not None and not is_last and not breaker.allow():
-                logger.warning(
-                    "%s circuit OPEN (state=%s); skipping to next provider",
-                    provider_key,
-                    breaker.state,
-                )
-                agent_call_tracer.record_model_attempt(provider=name, success=False)
-                continue
-
-            try:
-                logger.info("invoking model: %s (%s)", name, role)
-                response: ModelResponse = handler(request.override(model=model))
-                logger.info("model replied: %s (%s)", name, role)
-                if breaker is not None:
-                    breaker.record_success()
-                agent_call_tracer.record_model_attempt(provider=name, success=True)
-                return response
-
-            except Exception as exc:
-                last_exc = exc
-                if breaker is not None:
-                    breaker.record_failure()
-                agent_call_tracer.record_model_attempt(provider=name, success=False)
-
-                if is_last or not _should_fallback(exc):
-                    raise
-
-                logger.warning(
-                    "model %s failed (%s); falling back to next provider",
-                    name,
-                    exc,
-                )
-        raise last_exc if last_exc is not None else RuntimeError("model chain empty")
+        return chain_runner.invoke_middleware(request, handler)
 
     summarization_trigger_tokens: int = compute_summarization_trigger_tokens(
         max_model_len=ORCHESTRATOR_MAX_MODEL_LEN,
@@ -1164,11 +1138,20 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         max_trigger_tokens=ORCHESTRATOR_OPENAI_SUMMARIZATION_TRIGGER_TOKENS,
     )
 
-    summarization_model = build_summarization_gemini_model(
+    summarization_model = build_chained_chat_model(
+        chain_spec=summarization_model_chain_spec(),
+        openai_api_key=OPENAI_API_KEY,
+        openai_temperature=float(openai_cfg["temperature"]),
+        openai_timeout_s=OPENAI_REQUEST_TIMEOUT_S,
+        gemini_temperature=0.0,
+        gemini_max_tokens=SUMMARIZATION_MAX_TOKENS,
+        gemini_top_p=float(google_cfg.get("top_p", 0.95)),
+        gemini_thinking_level=ORCHESTRATOR_GEMINI_THINKING_LEVEL,
         google_credentials_path=CRED_PATH,
         google_project=PROJECT_ID,
         google_location=LOCATION,
         gemini_api_key=GEMINI_API_KEY,
+        label="summarization",
     )
 
     return create_agent(
@@ -1183,13 +1166,23 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
                 exit_behavior="continue",
             ),
             ToolCallLimitMiddleware(
+                tool_name="get_time",
+                run_limit=ORCHESTRATOR_GET_TIME_RUN_LIMIT,
+                exit_behavior="continue",
+            ),
+            ToolCallLimitMiddleware(
+                tool_name="read_status_of_a_case",
+                run_limit=ORCHESTRATOR_READ_STATUS_RUN_LIMIT,
+                exit_behavior="continue",
+            ),
+            ToolCallLimitMiddleware(
                 run_limit=ORCHESTRATOR_TOOL_RUN_LIMIT,
                 exit_behavior="continue",
             ),
             SummarizationMiddleware(
                 model=summarization_model,
                 trigger=("tokens", summarization_trigger_tokens),
-                keep=("messages", 6),
+                keep=("messages", 3),
             ),
         ],
         checkpointer=checkpointer,
@@ -1458,9 +1451,13 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             channel=channel,
             flow="job",
         )
-        res = agent.invoke(
-            {"messages": [HumanMessage(content=user_content)]},
+        res = _invoke_agent_with_recursion_retry(
+            agent=agent,
+            payload={"messages": [HumanMessage(content=user_content)]},
             config=config,
+            client_id=client_id,
+            request_id=request_id,
+            flow="job",
         )
         agent_call_tracer.set_tool_names(agent_call_tracer.extract_tool_names(res))
         agent_call_tracer.end_turn(status="ok")
@@ -1876,9 +1873,13 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                 channel=channel,
                 flow="signal",
             )
-            res = agent.invoke(
-                {"messages": [{"role": "user", "content": signal_prompt}]},
+            res = _invoke_agent_with_recursion_retry(
+                agent=agent,
+                payload={"messages": [{"role": "user", "content": signal_prompt}]},
                 config=config,
+                client_id=client_id,
+                request_id=request_id,
+                flow="signal",
             )
             agent_call_tracer.set_tool_names(agent_call_tracer.extract_tool_names(res))
             agent_call_tracer.end_turn(status="ok")
@@ -1957,6 +1958,8 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
     except Exception as exc:
         # Finalize the trace for this turn (no-op if already ended on success).
         agent_call_tracer.end_turn(status="failed", error=str(exc))
+        if ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION and _is_recursion_error(exc):
+            _reset_client_checkpoint(client_id)
         _redis.xadd(
             ORCHESTRATOR_SIGNAL_DLQ_STREAM,
             {
