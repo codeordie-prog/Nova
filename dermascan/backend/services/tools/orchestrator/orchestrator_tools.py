@@ -44,11 +44,13 @@ from dermascan.shared.intake_session import (
     ServiceIntent,
     build_collected_context_summary,
     is_ready_to_route,
+    recompute_session,
 )
 from dermascan.shared.intake_session_store import (
     IntakeSessionStoreError,
     archive_intake_session,
     get_or_create_intake_session,
+    load_intake_session,
     save_intake_session_recomputed,
 )
 from dermascan.shared.firebase_storage import initialize_firebase_app
@@ -149,7 +151,7 @@ class SkinProfile(BaseModel):
 
 class SkinProfileUpdate(BaseModel):
     """
-    Partial skin profile update payload for the update_skin_profile tool.
+    Partial skin profile update payload merged by the update_intake tool.
 
     Only include fields the user stated or you inferred during intake. Omitted fields
     are left unchanged on an existing profile.
@@ -202,78 +204,159 @@ class SkinProfileUpdate(BaseModel):
     )
 
 
-class UpdateSkinProfileInput(BaseModel):
-    """
-    Flat tool input for update_skin_profile (OpenAI strict function schemas).
+# Skin-profile field names shared by the consolidated update_intake tool. Any of
+# these, when provided, is merged into the client's long-lived skin profile.
+_SKIN_PROFILE_FIELD_NAMES: tuple[str, ...] = (
+    "age",
+    "gender",
+    "location",
+    "skin_type",
+    "current_products",
+    "current_medications",
+    "current_conditions",
+    "current_goals",
+    "allergies",
+    "pregnancy",
+    "breastfeeding",
+    "notes",
+)
 
-    Nested object parameters are rejected by OpenAI tool calling; all profile
-    fields are top-level optional arguments alongside client_id.
+
+class UpdateIntakeInput(BaseModel):
+    """
+    Flat tool input for the consolidated update_intake tool.
+
+    One call records any subset of intake facts in a single load-mutate-save cycle:
+    service intent, primary concern, consultation notes, and long-lived skin-profile
+    fields. Providing pregnancy or breastfeeding (or confirm_reproductive_status)
+    implicitly confirms reproductive status. All object parameters are flattened to
+    top-level optional fields because OpenAI strict tool schemas reject nested objects.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    client_id: str = Field(
+    request_id: str = Field(
         min_length=1,
         description=(
-            "Required. Exact client_id from the orchestrator input "
-            "(copy the value shown after 'client_id:'). "
-            "Do not use request_id or case_id."
+            "Required. Exact request_id from the current orchestrator input "
+            "(copy the value shown after 'request_id:'). "
+            "Do not use client_id, case_id, or message_id."
         ),
     )
-    age: Optional[int] = Field(default=None, ge=0, description="Client age in years.")
+    service_intent: Optional[ServiceIntent] = Field(
+        default=None,
+        description=(
+            "Optional. User's chosen service when they pick a menu option or state a goal: "
+            "skin_review, product_review, combined, or general."
+        ),
+    )
+    primary_concern: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional. User's main question or goal in one short sentence "
+            "(e.g. 'Is this serum safe during pregnancy?')."
+        ),
+    )
+    consultation_notes: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Optional. Short consultation facts to append (symptom, timeline, routine change), "
+            "e.g. ['itching for 2 weeks', 'started retinol 10 days ago']. "
+            "Do not put the main question here (use primary_concern) or profile data "
+            "like goals/allergies (use the profile fields)."
+        ),
+    )
+    age: Optional[int] = Field(default=None, ge=0, description="Profile: client age in years.")
     gender: Optional[str] = Field(
         default=None,
-        description="Gender or sex relevant to care (e.g. female, male, non-binary).",
+        description="Profile: gender or sex relevant to care (e.g. female, male, non-binary).",
     )
     location: Optional[str] = Field(
         default=None,
-        description="City, region, or climate context when relevant to skin care.",
+        description="Profile: city, region, or climate context when relevant to skin care.",
     )
     skin_type: Optional[str] = Field(
         default=None,
-        description="Self-reported skin type: oily, dry, combination, sensitive, or normal.",
+        description="Profile: self-reported skin type (oily, dry, combination, sensitive, normal).",
     )
     current_products: Optional[list[str]] = Field(
         default=None,
-        description="Skincare or cosmetic products currently in the client's routine.",
+        description="Profile: skincare or cosmetic products currently in the client's routine.",
     )
     current_medications: Optional[list[str]] = Field(
         default=None,
-        description="Current medications that may affect skin (topical or systemic).",
+        description="Profile: current medications that may affect skin (topical or systemic).",
     )
     current_conditions: Optional[list[str]] = Field(
         default=None,
-        description="Active or chronic skin or related health conditions.",
+        description="Profile: active or chronic skin or related health conditions.",
     )
     current_goals: Optional[list[str]] = Field(
         default=None,
-        description="Client skincare goals or concerns (e.g. acne, hyperpigmentation, anti-aging).",
+        description="Profile: client skincare goals or concerns (e.g. acne, hyperpigmentation).",
     )
     allergies: Optional[list[str]] = Field(
         default=None,
-        description="Known allergies or ingredient sensitivities.",
+        description="Profile: known allergies or ingredient sensitivities.",
     )
     pregnancy: Optional[bool] = Field(
         default=None,
-        description="Whether the client is currently pregnant.",
+        description=(
+            "Profile: whether the client is currently pregnant. "
+            "Providing this (true or false) confirms reproductive status."
+        ),
     )
     breastfeeding: Optional[bool] = Field(
         default=None,
-        description="Whether the client is currently breastfeeding.",
+        description=(
+            "Profile: whether the client is currently breastfeeding. "
+            "Providing this (true or false) confirms reproductive status."
+        ),
     )
     notes: Optional[str] = Field(
         default=None,
-        description="Free-text intake notes: onset, symptoms, spread, recent changes, or other context.",
+        description="Profile: free-text intake notes (onset, symptoms, spread, recent changes).",
+    )
+    confirm_reproductive_status: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Optional. Set true to confirm pregnancy/breastfeeding was discussed when you are "
+            "not changing those fields. Implied automatically when pregnancy or breastfeeding "
+            "is provided."
+        ),
     )
 
     def to_profile_update(self) -> SkinProfileUpdate:
         """
-        Build a partial SkinProfileUpdate from set fields only.
+        Build a partial SkinProfileUpdate from the profile fields provided.
 
         Returns:
-            SkinProfileUpdate: Fields explicitly provided on this input.
+            SkinProfileUpdate: Only the skin-profile fields explicitly set on this input.
         """
-        return SkinProfileUpdate(**self.model_dump(exclude={"client_id"}, exclude_none=True))
+        provided = self.model_dump(include=set(_SKIN_PROFILE_FIELD_NAMES), exclude_none=True)
+        return SkinProfileUpdate(**provided)
+
+    def has_profile_update(self) -> bool:
+        """
+        Return True when any skin-profile field was provided.
+
+        Returns:
+            bool: True when at least one profile field is set.
+        """
+        return bool(self.model_dump(include=set(_SKIN_PROFILE_FIELD_NAMES), exclude_none=True))
+
+    def implies_reproductive_confirmation(self) -> bool:
+        """
+        Return True when this update should confirm reproductive status.
+
+        Returns:
+            bool: True when confirm_reproductive_status is set or pregnancy/breastfeeding provided.
+        """
+        return (
+            self.confirm_reproductive_status is True
+            or self.pregnancy is not None
+            or self.breastfeeding is not None
+        )
 
 
 # Tool argument annotations (surfaced to the model in the JSON schema).
@@ -299,19 +382,6 @@ OrchestratorClientIdArg = Annotated[
     ),
 ]
 
-ServiceIntentArg = Annotated[
-    ServiceIntent,
-    Field(
-        description=(
-            "Required. User's chosen service. Exactly one of: "
-            "skin_review (skin photo review), "
-            "product_review (product label/packaging review), "
-            "combined (both skin and product), "
-            "general (no image audit routing)."
-        ),
-    ),
-]
-
 IntakeImageCategoryArg = Annotated[
     IntakeImageCategory,
     Field(
@@ -330,7 +400,7 @@ AuditTypeArg = Annotated[
             "Required. Which registered intake image to enqueue: "
             "skin = skin photo audit; product = product label audit. "
             "For combined intent, call enque_request_for_auditing_stream twice "
-            "(skin then product) using each slot's request_id from get_intake_status."
+            "(audit_type=skin then audit_type=product) on the current-turn request_id."
         ),
     ),
 ]
@@ -353,26 +423,6 @@ IntakeAttachmentIdArg = Annotated[
         description=(
             "Optional. attachment_id from ingress_images_for_this_message when the user "
             "sent multiple images in one message. Omit when only one image is present."
-        ),
-    ),
-]
-
-PrimaryConcernArg = Annotated[
-    str,
-    Field(
-        description=(
-            "Required. User's main question or goal in one short sentence "
-            "(e.g. 'Is this moisturizer safe during pregnancy?')."
-        ),
-    ),
-]
-
-IntakeNoteArg = Annotated[
-    str,
-    Field(
-        description=(
-            "Required. One short consultation fact from the user "
-            "(symptom, timeline, product change). Not the main question."
         ),
     ),
 ]
@@ -528,6 +578,55 @@ def _merge_skin_profile(
     patch = updates.model_dump(exclude_none=True)
     merged = {**base, **existing, **patch}
     return SkinProfile.model_validate(merged).model_dump()
+
+
+def _persist_skin_profile(
+    cid: str,
+    updates: SkinProfileUpdate,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """
+    Merge partial profile updates onto the stored profile and persist them.
+
+    Writes the validated profile to Firestore and refreshes the Redis cache.
+
+    Args:
+        cid: Normalized client id.
+        updates: Partial profile update to merge and persist.
+
+    Returns:
+        tuple[dict | None, dict | None]: ``(validated_profile, None)`` on success,
+        or ``(None, error_dict)`` when validation or persistence fails.
+    """
+    try:
+        existing = _fetch_skin_profile_dict(cid)
+        validated_profile = _merge_skin_profile(existing, updates)
+    except Exception as exc:
+        return None, {"status": "error", "detail": f"invalid skin_profile payload: {exc}"}
+
+    firestore_client = _get_firestore_client()
+    if firestore_client is None:
+        return None, {"status": "error", "detail": "firestore is unavailable"}
+
+    try:
+        firestore_client.collection("skin_profiles").document(cid).set(validated_profile)
+    except Exception:
+        logger.exception("failed to write skin profile to firestore: client_id=%s", cid)
+        return None, {"status": "error", "detail": "failed to persist skin profile"}
+
+    if _redis is not None:
+        try:
+            run_with_redis_retries(
+                lambda: _redis.setex(
+                    _skin_profile_cache_key(cid),
+                    _SKIN_PROFILE_CACHE_TTL_SEC,
+                    _serialize_skin_profile(validated_profile),
+                ),
+                operation_name="skin_profile_set",
+            )
+        except Exception:
+            logger.exception("failed to cache updated skin profile: client_id=%s", cid)
+
+    return validated_profile, None
 
 
 def _get_firestore_client() -> Any | None:
@@ -820,8 +919,9 @@ def _intake_stop_suffix() -> str:
     """
     return (
         " Then compose your final reply to the user in this turn. "
-        "Do NOT call get_intake_status again this turn. "
-        "Do NOT repeat a tool that already returned saved/registered/queued."
+        "The latest intake status is included in this tool result and in the turn context; "
+        "do NOT re-read it. "
+        "Do NOT repeat a tool that already returned saved/registered/queued/unchanged."
     )
 
 
@@ -840,16 +940,17 @@ def _derive_intake_next_action(session: IntakeSession, profile: dict[str, Any]) 
         return "enque_request_for_auditing_stream"
 
     missing = session.missing_for_routing
-    if MISSING_SERVICE_INTENT in missing:
-        return "set_service_intent"
     if MISSING_SKIN_IMAGE in missing or MISSING_PRODUCT_IMAGE in missing:
         return "register_intake_image"
-    if MISSING_PRIMARY_CONCERN in missing:
-        return "set_primary_concern"
-    if MISSING_PROFILE_MINIMUM in missing:
-        return "update_skin_profile"
-    if MISSING_REPRODUCTIVE_STATUS in missing:
-        return "confirm_reproductive_status"
+    # Every remaining gap (service intent, primary concern, profile minimums,
+    # reproductive status) is recorded through the consolidated update_intake tool.
+    if (
+        MISSING_SERVICE_INTENT in missing
+        or MISSING_PRIMARY_CONCERN in missing
+        or MISSING_PROFILE_MINIMUM in missing
+        or MISSING_REPRODUCTIVE_STATUS in missing
+    ):
+        return "update_intake"
     return "reply_only"
 
 
@@ -870,7 +971,7 @@ def _intake_instruction(session: IntakeSession, profile: dict[str, Any]) -> str:
     if session.phase == IntakePhase.AWAITING_AUDIT:
         return (
             "Audits are already queued. Tell the user their photo is being reviewed. "
-            "Do NOT call enque_request_for_auditing_stream or get_intake_status."
+            "Do NOT call enque_request_for_auditing_stream again."
         )
 
     if is_ready_to_route(session, profile):
@@ -890,14 +991,14 @@ def _intake_instruction(session: IntakeSession, profile: dict[str, Any]) -> str:
     if MISSING_PROFILE_MINIMUM in session.missing_for_routing:
         gaps = ", ".join(session.profile_gaps) or "profile fields from profile_gaps"
         return (
-            f"Call update_skin_profile with client_id and: {gaps}. "
+            f"Call update_intake with the profile fields: {gaps}. "
             f"Use values the user stated in their latest message.{stop}"
         )
 
     if MISSING_REPRODUCTIVE_STATUS in session.missing_for_routing:
         return (
-            "Set pregnancy/breastfeeding via update_skin_profile if the user answered, "
-            f"then call confirm_reproductive_status once.{stop}"
+            "Call update_intake with pregnancy and breastfeeding from the user's answer "
+            f"(providing them confirms reproductive status).{stop}"
         )
 
     if session.missing_for_routing:
@@ -953,6 +1054,40 @@ def _format_intake_status(
         "collected_context_summary": session.collected_context_summary,
         "next_recommended_tool": _derive_intake_next_action(session, profile),
         "instruction": _intake_instruction(session, profile),
+    }
+
+
+def compute_intake_guidance(client_id: str) -> dict[str, Any] | None:
+    """
+    Compute deterministic intake guidance for read-only prompt injection.
+
+    Recomputes derived fields in memory (no persistence, no session creation) so the
+    orchestrator prompt can carry the authoritative next step without the model calling
+    a status tool. Returns None when no active session exists for the client.
+
+    Args:
+        client_id: Client identifier.
+
+    Returns:
+        dict[str, Any] | None: Guidance with phase, missing_for_routing, ready_to_route,
+        next_recommended_tool, and instruction; None when there is no session yet.
+    """
+    cid = _normalize_client_id(client_id)
+    if not cid:
+        return None
+
+    session = load_intake_session(cid, redis_client=_redis)
+    if session is None:
+        return None
+
+    profile = _load_skin_profile_mapping(cid)
+    recomputed = recompute_session(session, profile)
+    return {
+        "phase": recomputed.phase.value,
+        "missing_for_routing": list(recomputed.missing_for_routing),
+        "ready_to_route": is_ready_to_route(recomputed, profile),
+        "next_recommended_tool": _derive_intake_next_action(recomputed, profile),
+        "instruction": _intake_instruction(recomputed, profile),
     }
 
 
@@ -1426,22 +1561,78 @@ def get_time() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-@tool
-def get_intake_status(request_id: OrchestratorRequestIdArg) -> dict[str, Any]:
+@tool(args_schema=UpdateIntakeInput)
+def update_intake(
+    request_id: str,
+    service_intent: Optional[ServiceIntent] = None,
+    primary_concern: Optional[str] = None,
+    consultation_notes: Optional[list[str]] = None,
+    age: Optional[int] = None,
+    gender: Optional[str] = None,
+    location: Optional[str] = None,
+    skin_type: Optional[str] = None,
+    current_products: Optional[list[str]] = None,
+    current_medications: Optional[list[str]] = None,
+    current_conditions: Optional[list[str]] = None,
+    current_goals: Optional[list[str]] = None,
+    allergies: Optional[list[str]] = None,
+    pregnancy: Optional[bool] = None,
+    breastfeeding: Optional[bool] = None,
+    notes: Optional[str] = None,
+    confirm_reproductive_status: Optional[bool] = None,
+) -> dict[str, Any]:
     """
-    Read the intake worksheet: phase, service intent, saved skin/product images,
-    profile gaps, missing items, and whether routing is allowed.
+    Record any subset of intake facts in ONE call (load, mutate, recompute, save).
+
+    Use this single tool for all structured intake instead of separate setters. Pass
+    only the fields the user actually provided this turn; omitted fields are unchanged.
 
     Arguments:
         request_id (string, required): Exact request_id from the current orchestrator input.
+        service_intent (enum, optional): skin_review, product_review, combined, or general.
+        primary_concern (string, optional): User's main question in one short sentence.
+        consultation_notes (list[str], optional): Short consultation facts to append
+            (symptoms, timeline, routine changes) — not the main question or profile data.
+        age, gender, location, skin_type, current_products, current_medications,
+        current_conditions, current_goals, allergies, pregnancy, breastfeeding, notes
+            (optional): Long-lived skin-profile fields; merged into the stored profile.
+        confirm_reproductive_status (bool, optional): Confirm pregnancy/breastfeeding was
+            discussed. Implied automatically when pregnancy or breastfeeding is provided.
 
     Returns:
-        JSON with status, phase, service_intent, images.skin/product (present + request_id),
-        profile_gaps, missing_for_routing, ready_to_route, collected_context_summary, instruction.
+        Intake status JSON (phase, service_intent, images, profile_gaps, missing_for_routing,
+        ready_to_route, collected_context_summary, next_recommended_tool, instruction) with a
+        status of saved when something changed or unchanged when nothing did, plus updated_fields.
 
-    Call after any intake change and always before enque_request_for_auditing_stream.
+    Register images with register_intake_image; enqueue with enque_request_for_auditing_stream.
     """
-    logger.info("TOOL CALL: get_intake_status: request_id=%s", request_id)
+    payload = UpdateIntakeInput(
+        request_id=request_id,
+        service_intent=service_intent,
+        primary_concern=primary_concern,
+        consultation_notes=consultation_notes,
+        age=age,
+        gender=gender,
+        location=location,
+        skin_type=skin_type,
+        current_products=current_products,
+        current_medications=current_medications,
+        current_conditions=current_conditions,
+        current_goals=current_goals,
+        allergies=allergies,
+        pregnancy=pregnancy,
+        breastfeeding=breastfeeding,
+        notes=notes,
+        confirm_reproductive_status=confirm_reproductive_status,
+    )
+
+    logger.info(
+        "TOOL CALL: update_intake: request_id=%s intent=%s profile_update=%s repro=%s",
+        request_id,
+        service_intent.value if service_intent else None,
+        payload.has_profile_update(),
+        payload.implies_reproductive_confirmation(),
+    )
 
     envelope, error = _require_ingress_envelope(request_id)
     if error:
@@ -1449,8 +1640,19 @@ def get_intake_status(request_id: OrchestratorRequestIdArg) -> dict[str, Any]:
 
     client_id = str(envelope.get("client_id") or "anonymous").strip()
     case_id = str(envelope.get("case_id") or envelope.get("request_id") or request_id).strip()
-    profile = _load_skin_profile_mapping(client_id)
 
+    # 1. Persist skin-profile fields first so the intake recomputation below sees
+    #    fresh profile gaps; fall back to the stored profile when nothing changed.
+    if payload.has_profile_update():
+        profile, profile_error = _persist_skin_profile(client_id, payload.to_profile_update())
+        if profile_error:
+            profile_error["request_id"] = request_id
+            return profile_error
+        assert profile is not None
+    else:
+        profile = _load_skin_profile_mapping(client_id)
+
+    # 2. Load the intake session.
     try:
         session = get_or_create_intake_session(client_id, case_id, redis_client=_redis)
     except IntakeSessionStoreError as exc:
@@ -1460,58 +1662,45 @@ def get_intake_status(request_id: OrchestratorRequestIdArg) -> dict[str, Any]:
             "request_id": request_id,
         }
 
-    updated, persist_error = _persist_intake_session(session, profile)
-    if persist_error:
-        return persist_error
-    assert updated is not None
+    # 3. Apply session-level mutations, tracking what actually changed.
+    updates: dict[str, Any] = {}
+    changed: list[str] = []
 
-    return _format_intake_status(updated, profile, request_id=request_id)
+    if service_intent is not None and session.service_intent != service_intent:
+        updates["service_intent"] = service_intent
+        changed.append("service_intent")
 
+    if primary_concern is not None:
+        concern_text = primary_concern.strip()
+        if concern_text and session.primary_concern.strip() != concern_text:
+            updates["primary_concern"] = concern_text
+            changed.append("primary_concern")
 
-@tool
-def set_service_intent(
-    request_id: OrchestratorRequestIdArg,
-    intent: ServiceIntentArg,
-) -> dict[str, Any]:
-    """
-    Record which review service the user wants.
+    if consultation_notes:
+        new_notes = [note.strip() for note in consultation_notes if str(note).strip()]
+        if new_notes:
+            updates["consultation_notes"] = list(session.consultation_notes) + new_notes
+            changed.append("consultation_notes")
 
-    Arguments:
-        request_id (string, required): Exact request_id from the current orchestrator input.
-        intent (enum, required): Exactly one of:
-            - skin_review: user wants a skin image reviewed.
-            - product_review: user wants a product label/packaging reviewed.
-            - combined: user wants both skin and product reviewed.
-            - general: general enquiry; no image audit routing.
+    if payload.implies_reproductive_confirmation() and not session.reproductive_status_confirmed:
+        updates["reproductive_status_confirmed"] = True
+        changed.append("reproductive_status_confirmed")
 
-    Returns:
-        Updated intake status JSON (same shape as get_intake_status) with status saved.
+    if payload.has_profile_update():
+        changed.append("skin_profile")
 
-    Call when the user picks a menu option or states their goal. Then call get_intake_status.
-    """
-    logger.info("TOOL CALL: set_service_intent: request_id=%s intent=%s", request_id, intent)
+    if updates:
+        session = session.model_copy(update=updates)
 
-    envelope, error = _require_ingress_envelope(request_id)
-    if error:
-        return error
-
-    client_id = str(envelope.get("client_id") or "anonymous").strip()
-    case_id = str(envelope.get("case_id") or envelope.get("request_id") or request_id).strip()
-    profile = _load_skin_profile_mapping(client_id)
-
-    try:
-        session = get_or_create_intake_session(client_id, case_id, redis_client=_redis)
-    except IntakeSessionStoreError as exc:
-        return {"status": "error", "detail": f"failed to load intake session: {exc}", "request_id": request_id}
-
-    session = session.model_copy(update={"service_intent": intent})
+    # 4. Recompute derived fields and persist once.
     updated, persist_error = _persist_intake_session(session, profile)
     if persist_error:
         return persist_error
     assert updated is not None
 
     result = _format_intake_status(updated, profile, request_id=request_id)
-    result["status"] = "saved"
+    result["status"] = "saved" if changed else "unchanged"
+    result["updated_fields"] = changed
     return result
 
 
@@ -1539,7 +1728,8 @@ def register_intake_image(
     Returns:
         Intake status JSON plus status registered, registered_category, registered_image_request_id.
 
-    Call once per image after visually classifying it. Then call get_intake_status.
+    Call once per image after visually classifying it. The returned status includes the
+    next_recommended_tool and instruction to follow.
     """
     logger.info(
         "TOOL CALL: register_intake_image: request_id=%s category=%s attachment_id=%s",
@@ -1611,179 +1801,6 @@ def register_intake_image(
 
 
 @tool
-def set_primary_concern(
-    request_id: OrchestratorRequestIdArg,
-    concern: PrimaryConcernArg,
-) -> dict[str, Any]:
-    """
-    Set the user's main question or goal for this review.
-
-    Arguments:
-        request_id (string, required): Exact request_id from the current orchestrator input.
-        concern (string, required): One short sentence with the user's primary question
-            (e.g. "Is this serum safe during pregnancy?", "Rash on my cheek for two weeks").
-
-    Returns:
-        Updated intake status JSON with status saved.
-
-    Use for the main ask only; use append_intake_note for extra facts. Then get_intake_status.
-    """
-    logger.info("TOOL CALL: set_primary_concern: request_id=%s", request_id)
-
-    concern_text = str(concern or "").strip()
-    if not concern_text:
-        return {
-            "status": "error",
-            "detail": "concern must be a non-empty string",
-            "request_id": request_id,
-        }
-
-    envelope, error = _require_ingress_envelope(request_id)
-    if error:
-        return error
-
-    client_id = str(envelope.get("client_id") or "anonymous").strip()
-    case_id = str(envelope.get("case_id") or envelope.get("request_id") or request_id).strip()
-    profile = _load_skin_profile_mapping(client_id)
-
-    try:
-        session = get_or_create_intake_session(client_id, case_id, redis_client=_redis)
-    except IntakeSessionStoreError as exc:
-        return {"status": "error", "detail": f"failed to load intake session: {exc}", "request_id": request_id}
-
-    if session.primary_concern.strip() == concern_text:
-        updated, persist_error = _persist_intake_session(session, profile)
-        if persist_error:
-            return persist_error
-        assert updated is not None
-        result = _format_intake_status(updated, profile, request_id=request_id)
-        result["status"] = "unchanged"
-        result["instruction"] = (
-            "primary_concern is already set. Follow next_recommended_tool. "
-            "Do NOT call set_primary_concern again this turn."
-        )
-        return result
-
-    session = session.model_copy(update={"primary_concern": concern_text})
-    updated, persist_error = _persist_intake_session(session, profile)
-    if persist_error:
-        return persist_error
-    assert updated is not None
-
-    result = _format_intake_status(updated, profile, request_id=request_id)
-    result["status"] = "saved"
-    return result
-
-
-@tool
-def append_intake_note(
-    request_id: OrchestratorRequestIdArg,
-    note: IntakeNoteArg,
-) -> dict[str, Any]:
-    """
-    Append one consultation detail gathered from the user.
-
-    Arguments:
-        request_id (string, required): Exact request_id from the current orchestrator input.
-        note (string, required): One short fact (symptom, duration, recent product change,
-            e.g. "itching for 2 weeks", "started retinol 10 days ago").
-
-    Returns:
-        Updated intake status JSON with status saved.
-
-    Do not repeat the primary concern (use set_primary_concern for that). Then get_intake_status.
-    """
-    logger.info("TOOL CALL: append_intake_note: request_id=%s", request_id)
-
-    note_text = str(note or "").strip()
-    if not note_text:
-        return {
-            "status": "error",
-            "detail": "note must be a non-empty string",
-            "request_id": request_id,
-        }
-
-    envelope, error = _require_ingress_envelope(request_id)
-    if error:
-        return error
-
-    client_id = str(envelope.get("client_id") or "anonymous").strip()
-    case_id = str(envelope.get("case_id") or envelope.get("request_id") or request_id).strip()
-    profile = _load_skin_profile_mapping(client_id)
-
-    try:
-        session = get_or_create_intake_session(client_id, case_id, redis_client=_redis)
-    except IntakeSessionStoreError as exc:
-        return {"status": "error", "detail": f"failed to load intake session: {exc}", "request_id": request_id}
-
-    notes = list(session.consultation_notes)
-    notes.append(note_text)
-    session = session.model_copy(update={"consultation_notes": notes})
-
-    updated, persist_error = _persist_intake_session(session, profile)
-    if persist_error:
-        return persist_error
-    assert updated is not None
-
-    result = _format_intake_status(updated, profile, request_id=request_id)
-    result["status"] = "saved"
-    return result
-
-
-@tool
-def confirm_reproductive_status(request_id: OrchestratorRequestIdArg) -> dict[str, Any]:
-    """
-    Confirm pregnancy and breastfeeding status was discussed and recorded.
-
-    Arguments:
-        request_id (string, required): Exact request_id from the current orchestrator input.
-
-    Returns:
-        Updated intake status JSON with status saved.
-
-    Call only after asking the user and setting pregnancy/breastfeeding via update_skin_profile
-    when applicable. Required for skin_review, product_review, and combined before routing.
-    """
-    logger.info("TOOL CALL: confirm_reproductive_status: request_id=%s", request_id)
-
-    envelope, error = _require_ingress_envelope(request_id)
-    if error:
-        return error
-
-    client_id = str(envelope.get("client_id") or "anonymous").strip()
-    case_id = str(envelope.get("case_id") or envelope.get("request_id") or request_id).strip()
-    profile = _load_skin_profile_mapping(client_id)
-
-    try:
-        session = get_or_create_intake_session(client_id, case_id, redis_client=_redis)
-    except IntakeSessionStoreError as exc:
-        return {"status": "error", "detail": f"failed to load intake session: {exc}", "request_id": request_id}
-
-    if session.reproductive_status_confirmed:
-        updated, persist_error = _persist_intake_session(session, profile)
-        if persist_error:
-            return persist_error
-        assert updated is not None
-        result = _format_intake_status(updated, profile, request_id=request_id)
-        result["status"] = "unchanged"
-        result["instruction"] = (
-            "Reproductive status already confirmed. Follow next_recommended_tool. "
-            "Do NOT call confirm_reproductive_status again this turn."
-        )
-        return result
-
-    session = session.model_copy(update={"reproductive_status_confirmed": True})
-    updated, persist_error = _persist_intake_session(session, profile)
-    if persist_error:
-        return persist_error
-    assert updated is not None
-
-    result = _format_intake_status(updated, profile, request_id=request_id)
-    result["status"] = "saved"
-    return result
-
-
-@tool
 def enque_request_for_auditing_stream(
     request_id: OrchestratorRequestIdArg,
     audit_type: AuditTypeArg,
@@ -1803,7 +1820,7 @@ def enque_request_for_auditing_stream(
         JSON with status (queued, already_queued, blocked_not_ready, blocked_wrong_audit_type,
         blocked_missing_image, error), audit_type, image_request_id, instruction.
 
-    Call only when get_intake_status shows ready_to_route true. For combined intent, call twice
+    Call only when intake shows ready_to_route true. For combined intent, call twice
     (audit_type skin then product). Do not call repeatedly on success for the same audit_type.
     """
 
@@ -1856,8 +1873,8 @@ def enque_request_for_auditing_stream(
             "audit_type": audit_type.value,
             "missing_for_routing": list(session.missing_for_routing),
             "instruction": (
-                "Intake is not ready to route. Call get_intake_status, complete missing items, "
-                "then enqueue."
+                "Intake is not ready to route. Complete the missing items with update_intake "
+                "or register_intake_image, then enqueue."
             ),
         }
 
@@ -2261,88 +2278,6 @@ def skin_profile_is_available(client_id: OrchestratorClientIdArg) -> bool:
     return True
 
 
-@tool(args_schema=UpdateSkinProfileInput)
-def update_skin_profile(
-    client_id: str,
-    age: Optional[int] = None,
-    gender: Optional[str] = None,
-    location: Optional[str] = None,
-    skin_type: Optional[str] = None,
-    current_products: Optional[list[str]] = None,
-    current_medications: Optional[list[str]] = None,
-    current_conditions: Optional[list[str]] = None,
-    current_goals: Optional[list[str]] = None,
-    allergies: Optional[list[str]] = None,
-    pregnancy: Optional[bool] = None,
-    breastfeeding: Optional[bool] = None,
-    notes: Optional[str] = None,
-) -> dict:
-    """
-    Create or update the client's long-lived skin profile (merge partial updates).
-
-    Arguments:
-        client_id (string, required): Exact client_id from the orchestrator input.
-        age, gender, location, skin_type, current_products, current_medications,
-        current_conditions, current_goals, allergies, pregnancy, breastfeeding, notes:
-            Optional profile fields; include only what the user provided.
-
-    Returns:
-        Full profile dict on success, or {status: error, detail: ...} on failure.
-
-    Call get_skin_profile first if a profile may exist. Pass at least one profile field.
-    """
-    skin_profile = SkinProfileUpdate(
-        age=age,
-        gender=gender,
-        location=location,
-        skin_type=skin_type,
-        current_products=current_products,
-        current_medications=current_medications,
-        current_conditions=current_conditions,
-        current_goals=current_goals,
-        allergies=allergies,
-        pregnancy=pregnancy,
-        breastfeeding=breastfeeding,
-        notes=notes,
-    )
-    cid = _normalize_client_id(client_id)
-    if not cid:
-        return {"status": "error", "detail": "client_id is required"}
-
-    if not skin_profile.model_dump(exclude_none=True):
-        return {"status": "error", "detail": "skin_profile must include at least one field to update"}
-
-    try:
-        existing = _fetch_skin_profile_dict(cid)
-        validated_profile = _merge_skin_profile(existing, skin_profile)
-    except Exception as exc:
-        return {"status": "error", "detail": f"invalid skin_profile payload: {exc}"}
-
-    firestore_client = _get_firestore_client()
-    if firestore_client is None:
-        return {"status": "error", "detail": "firestore is unavailable"}
-
-    try:
-        firestore_client.collection("skin_profiles").document(cid).set(validated_profile)
-    except Exception:
-        logger.exception("failed to write skin profile to firestore: client_id=%s", cid)
-        return {"status": "error", "detail": "failed to persist skin profile"}
-
-    if _redis is not None:
-        try:
-            run_with_redis_retries(
-                lambda: _redis.setex(
-                    _skin_profile_cache_key(cid),
-                    _SKIN_PROFILE_CACHE_TTL_SEC,
-                    _serialize_skin_profile(validated_profile),
-                ),
-                operation_name="skin_profile_set",
-            )
-        except Exception:
-            logger.exception("failed to cache updated skin profile: client_id=%s", cid)
-
-    return validated_profile
-
 @tool
 def get_skin_profile(client_id: OrchestratorClientIdArg) -> Dict[str, Any]:
     """
@@ -2623,13 +2558,8 @@ orchestrator_tools: list = [
     get_time,
     skin_profile_is_available,
     get_skin_profile,
-    update_skin_profile,
-    get_intake_status,
-    set_service_intent,
+    update_intake,
     register_intake_image,
-    set_primary_concern,
-    append_intake_note,
-    confirm_reproductive_status,
     enque_request_for_auditing_stream,
     read_status_of_a_case,
     check_medgemma_health,

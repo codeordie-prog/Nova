@@ -67,12 +67,17 @@ class TestIntakeTools:
         monkeypatch.setattr(tools, "_fetch_skin_profile_dict", lambda _cid: dict(_FULL_PROFILE))
 
     def _complete_product_intake(self, request_id: str) -> None:
-        tools.set_service_intent.invoke({"request_id": request_id, "intent": "product_review"})
+        tools.update_intake.invoke(
+            {
+                "request_id": request_id,
+                "service_intent": "product_review",
+                "primary_concern": "Is this safe?",
+                "confirm_reproductive_status": True,
+            }
+        )
         tools.register_intake_image.invoke(
             {"request_id": request_id, "image_category": "product", "visual_note": "Label visible"}
         )
-        tools.set_primary_concern.invoke({"request_id": request_id, "concern": "Is this safe?"})
-        tools.confirm_reproductive_status.invoke({"request_id": request_id})
 
     def test_set_intent_and_register_product_image(
         self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch
@@ -80,11 +85,12 @@ class TestIntakeTools:
         monkeypatch.setattr(tools, "_redis", fake_redis)
         self._cache_envelope(fake_redis, "req-1", "client-1", "case-1")
 
-        intent_result = tools.set_service_intent.invoke(
-            {"request_id": "req-1", "intent": "product_review"}
+        intent_result = tools.update_intake.invoke(
+            {"request_id": "req-1", "service_intent": "product_review"}
         )
         assert intent_result["status"] == "saved"
         assert intent_result["service_intent"] == "product_review"
+        assert "service_intent" in intent_result["updated_fields"]
 
         register_result = tools.register_intake_image.invoke(
             {
@@ -96,7 +102,8 @@ class TestIntakeTools:
         assert register_result["status"] == "registered"
         assert register_result["images"]["product"]["present"]
 
-        status = tools.get_intake_status.invoke({"request_id": "req-1"})
+        status = tools.update_intake.invoke({"request_id": "req-1"})
+        assert status["status"] == "unchanged"
         assert status["images"]["product"]["present"]
         assert status["images"]["product"]["request_id"] == "req-1"
 
@@ -104,17 +111,34 @@ class TestIntakeTools:
         monkeypatch.setattr(tools, "_redis", fake_redis)
         self._cache_envelope(fake_redis, "req-2", "client-2", "case-2")
 
-        tools.set_service_intent.invoke({"request_id": "req-2", "intent": "skin_review"})
-        tools.set_primary_concern.invoke(
-            {"request_id": "req-2", "concern": "Rash on cheek for two weeks"}
+        result = tools.update_intake.invoke(
+            {
+                "request_id": "req-2",
+                "service_intent": "skin_review",
+                "primary_concern": "Rash on cheek for two weeks",
+                "consultation_notes": ["Mild itching, no fever"],
+            }
         )
-        tools.append_intake_note.invoke(
-            {"request_id": "req-2", "note": "Mild itching, no fever"}
-        )
+        assert result["status"] == "saved"
+        assert result["primary_concern"] == "Rash on cheek for two weeks"
+        assert "Mild itching" in result["collected_context_summary"]
 
-        status = tools.get_intake_status.invoke({"request_id": "req-2"})
-        assert status["primary_concern"] == "Rash on cheek for two weeks"
-        assert "Mild itching" in status["collected_context_summary"]
+    def test_update_intake_is_idempotent(
+        self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(tools, "_redis", fake_redis)
+        self._cache_envelope(fake_redis, "req-idem", "client-idem", "case-idem")
+
+        first = tools.update_intake.invoke(
+            {"request_id": "req-idem", "service_intent": "skin_review"}
+        )
+        assert first["status"] == "saved"
+
+        second = tools.update_intake.invoke(
+            {"request_id": "req-idem", "service_intent": "skin_review"}
+        )
+        assert second["status"] == "unchanged"
+        assert second["updated_fields"] == []
 
     def test_enqueue_product_audit_when_ready(
         self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch
@@ -134,7 +158,7 @@ class TestIntakeTools:
 
         self._complete_product_intake("req-enq")
 
-        status = tools.get_intake_status.invoke({"request_id": "req-enq"})
+        status = tools.update_intake.invoke({"request_id": "req-enq"})
         assert status["ready_to_route"]
 
         result = tools.enque_request_for_auditing_stream.invoke(
@@ -186,13 +210,16 @@ class TestIntakeTools:
         monkeypatch.setattr(tools, "_dispatch_audit_image_ref", _fake_dispatch)
         monkeypatch.setattr(tools, "_emit_orchestrator_event", lambda _fields: None)
 
-        tools.set_service_intent.invoke({"request_id": "req-skin", "intent": "combined"})
+        tools.update_intake.invoke({"request_id": "req-skin", "service_intent": "combined"})
         tools.register_intake_image.invoke({"request_id": "req-skin", "image_category": "skin"})
         tools.register_intake_image.invoke({"request_id": "req-prod", "image_category": "product"})
-        tools.set_primary_concern.invoke(
-            {"request_id": "req-skin", "concern": "Rash and new serum safety"}
+        tools.update_intake.invoke(
+            {
+                "request_id": "req-skin",
+                "primary_concern": "Rash and new serum safety",
+                "confirm_reproductive_status": True,
+            }
         )
-        tools.confirm_reproductive_status.invoke({"request_id": "req-skin"})
 
         skin_result = tools.enque_request_for_auditing_stream.invoke(
             {"request_id": "req-skin", "audit_type": "skin"}

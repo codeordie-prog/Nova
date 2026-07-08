@@ -28,6 +28,7 @@ import redis
 
 from dermascan.backend.services.tools.orchestrator.orchestrator_tools import (
     cache_ingress_payload,
+    compute_intake_guidance,
     orchestrator_tools,
     internet_search,
     wikipedia_search,
@@ -132,21 +133,25 @@ OPENAI_MAX_RETRIES: int = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.gete
 # Hard ceiling on agent reasoning/tool-call steps per turn.
 AGENT_RECURSION_LIMIT: int = max(1, int(os.getenv("ORCHESTRATOR_AGENT_RECURSION_LIMIT", "12")))
 ORCHESTRATOR_TOOL_RUN_LIMIT: int = max(3, int(os.getenv("ORCHESTRATOR_TOOL_RUN_LIMIT", "8")))
-ORCHESTRATOR_GET_INTAKE_STATUS_RUN_LIMIT: int = max(
-    1, int(os.getenv("ORCHESTRATOR_GET_INTAKE_STATUS_RUN_LIMIT", "1"))
-)
 ORCHESTRATOR_GET_TIME_RUN_LIMIT: int = max(
     1, int(os.getenv("ORCHESTRATOR_GET_TIME_RUN_LIMIT", "1"))
 )
 ORCHESTRATOR_READ_STATUS_RUN_LIMIT: int = max(
     1, int(os.getenv("ORCHESTRATOR_READ_STATUS_RUN_LIMIT", "2"))
 )
+# Disable OpenAI parallel tool calls so the model emits at most one tool call
+# per step. Parallel batches can be truncated by summarization / tool-call caps,
+# leaving assistant tool_calls without matching tool responses -> a poisoned
+# checkpoint (OpenAI 400 on every subsequent turn). Sequential calls also prevent
+# lost updates from concurrent read-modify-write on the shared intake session.
+ORCHESTRATOR_DISABLE_PARALLEL_TOOL_CALLS: bool = os.getenv(
+    "ORCHESTRATOR_DISABLE_PARALLEL_TOOL_CALLS", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
 # User-facing reply sent when a turn fails (e.g. recursion limit / provider
 # error) so the client is never left without a response.
 ORCHESTRATOR_FAILURE_REPLY: str = os.getenv(
     "ORCHESTRATOR_FAILURE_REPLY",
-    "Sorry, I ran into a problem handling that. Please try again, and if you want a "
-    "skin review, share a clear photo of the affected area.",
+    "Sorry, I ran into a problem handling that. This requires internal introspection into my mind,  Am self-handling it, please be patient, if I don't respond in a few minutes, please try again",
 )
 # When a turn fails with a recursion/loop error, reset the client's checkpoint so
 # a poisoned conversation state cannot keep failing every subsequent message.
@@ -226,6 +231,22 @@ CONVERSATION_LOG_MAX_LEN: int = max(1, int(os.getenv("CONVERSATION_LOG_MAX_LEN",
 CONVERSATION_LOG_INCLUDE_N: int = max(0, int(os.getenv("CONVERSATION_LOG_INCLUDE_N", "8")))
 CONVERSATION_LOG_TTL_SEC: int = int(os.getenv("CONVERSATION_LOG_TTL_SEC", "2592000"))  # 30 days
 
+# Checkpoint restoration. When a poisoned checkpoint is reset on a recursion
+# failure, the LangGraph message history is wiped, but the durable stores (the
+# intake session and the conversation log) survive. The next job turn re-injects
+# a compact conversation recap so the orchestrator can resume the session without
+# asking the client to repeat information. A short-lived Redis marker flags that
+# a reset happened; it is cleared once a turn completes successfully.
+CHECKPOINT_RESET_MARKER_KEY_PREFIX: str = os.getenv(
+    "ORCHESTRATOR_CHECKPOINT_RESET_MARKER_KEY_PREFIX", "orchestrator:checkpoint_reset"
+)
+CHECKPOINT_RESET_MARKER_TTL_SEC: int = max(
+    60, int(os.getenv("ORCHESTRATOR_CHECKPOINT_RESET_MARKER_TTL_SEC", "900"))
+)
+CONVERSATION_RECAP_AFTER_RESET_N: int = max(
+    1, int(os.getenv("ORCHESTRATOR_CONVERSATION_RECAP_AFTER_RESET_N", "12"))
+)
+
 # In-flight markers so the two reactive flows (job + signal) can detect when a
 # peer agent invocation is already running for the same client. The job flow
 # waits briefly for an in-flight signal to complete (so proactive_log is fresh
@@ -259,9 +280,76 @@ reclaim_logic.set_redis_client(_redis)
 _checkpointer: Any = None
 
 
+def _checkpoint_reset_marker_key(client_id: str) -> str:
+    """
+    Build the Redis key for a client's checkpoint-reset restoration marker.
+
+    Args:
+        client_id: Conversation thread identifier.
+
+    Returns:
+        str: Redis key string.
+    """
+    return f"{CHECKPOINT_RESET_MARKER_KEY_PREFIX}:{client_id}"
+
+
+def _mark_checkpoint_reset(client_id: str) -> None:
+    """
+    Flag that a client's checkpoint was reset so the next turn restores context.
+
+    The marker is short-lived (self-expiring) and best-effort: a failure to set
+    it must never block the failing turn's recovery path.
+
+    Args:
+        client_id: Conversation thread identifier.
+    """
+    try:
+        _redis.setex(
+            _checkpoint_reset_marker_key(client_id),
+            CHECKPOINT_RESET_MARKER_TTL_SEC,
+            str(int(time.time() * 1000)),
+        )
+    except Exception:
+        logger.exception("failed to set checkpoint reset marker: client_id=%s", client_id)
+
+
+def _checkpoint_reset_pending(client_id: str) -> bool:
+    """
+    Return True when a checkpoint reset is awaiting context restoration.
+
+    Args:
+        client_id: Conversation thread identifier.
+
+    Returns:
+        bool: True when the restoration marker is present.
+    """
+    try:
+        return _redis.exists(_checkpoint_reset_marker_key(client_id)) > 0
+    except Exception:
+        logger.exception("failed to read checkpoint reset marker: client_id=%s", client_id)
+        return False
+
+
+def _clear_checkpoint_reset(client_id: str) -> None:
+    """
+    Clear the checkpoint-reset marker after a turn resumes successfully.
+
+    Args:
+        client_id: Conversation thread identifier.
+    """
+    try:
+        _redis.delete(_checkpoint_reset_marker_key(client_id))
+    except Exception:
+        logger.exception("failed to clear checkpoint reset marker: client_id=%s", client_id)
+
+
 def _reset_client_checkpoint(client_id: str) -> None:
     """
     Best-effort reset of a client's persisted conversation checkpoint.
+
+    Also flags the client for context restoration so the next job turn re-injects
+    a conversation recap (from the surviving intake session + conversation log)
+    and resumes the session rather than starting blind.
 
     Args:
         client_id: Conversation thread identifier to clear.
@@ -271,8 +359,31 @@ def _reset_client_checkpoint(client_id: str) -> None:
     try:
         if delete_checkpoint_thread(_checkpointer, client_id):
             logger.warning("reset poisoned checkpoint for client_id=%s", client_id)
+        _mark_checkpoint_reset(client_id)
     except Exception:
         logger.exception("failed to reset checkpoint for client_id=%s", client_id)
+
+
+def _format_conversation_recap(entries: List[dict[str, Any]]) -> str:
+    """
+    Render conversation-log entries as a compact chronological transcript.
+
+    Args:
+        entries: Conversation-log entries, newest first (as stored in Redis).
+
+    Returns:
+        str: Oldest-to-newest ``role: text`` lines, empty when nothing usable.
+    """
+    lines: List[str] = []
+    for entry in reversed(entries):
+        role = str(entry.get("role") or "?").strip() or "?"
+        text = str(entry.get("text") or "").strip()
+        if entry.get("has_image"):
+            text = (f"{text} [image attached]").strip()
+        if not text:
+            continue
+        lines.append(f"{role}: {text}")
+    return "\n".join(lines)
 
 
 def _is_recursion_error(exc: Exception) -> bool:
@@ -291,33 +402,43 @@ def _is_recursion_error(exc: Exception) -> bool:
 def _invoke_agent_with_recursion_retry(
     *,
     agent: Any,
-    payload: dict[str, Any],
     config: RunnableConfig,
     client_id: str,
     request_id: str,
     flow: str,
+    payload: Optional[dict[str, Any]] = None,
+    build_payload: Optional[Callable[[], dict[str, Any]]] = None,
 ) -> Any:
     """
     Invoke the orchestrator agent with automatic retries on recursion-limit failures.
 
     Resets the client checkpoint between attempts when enabled so poisoned tool-loop
-    state does not carry into the next try.
+    state does not carry into the next try. When ``build_payload`` is provided, the
+    payload is rebuilt on every attempt so a mid-turn checkpoint reset is picked up
+    as restored conversation context on the retried attempt.
 
     Args:
         agent: Orchestrator LangGraph agent.
-        payload: Invoke payload (messages dict).
         config: RunnableConfig for this turn.
         client_id: Conversation thread id.
         request_id: Ingress request id for logging.
         flow: ``job`` or ``signal`` label for logs.
+        payload: Static invoke payload (messages dict); used when ``build_payload``
+            is not provided.
+        build_payload: Optional factory that returns a fresh invoke payload per
+            attempt, allowing post-reset context restoration to take effect.
 
     Returns:
         Any: Agent invoke result on success.
 
     Raises:
+        ValueError: When neither ``payload`` nor ``build_payload`` is provided.
         Exception: The last failure when retries are exhausted or the error is not
             recursion-related.
     """
+    if payload is None and build_payload is None:
+        raise ValueError("either payload or build_payload is required")
+
     last_exc: Optional[Exception] = None
     max_attempts = ORCHESTRATOR_RECURSION_MAX_RETRIES + 1
 
@@ -336,8 +457,9 @@ def _invoke_agent_with_recursion_retry(
             if ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION:
                 _reset_client_checkpoint(client_id)
 
+        attempt_payload = build_payload() if build_payload is not None else payload
         try:
-            return agent.invoke(payload, config=config)
+            return agent.invoke(attempt_payload, config=config)
         except Exception as exc:
             last_exc = exc
             if not _is_recursion_error(exc):
@@ -972,6 +1094,11 @@ def _build_orchestrator_text_context(
     if intake_session is not None:
         summary_lines.append("intake_session_snapshot:")
         summary_lines.append(json.dumps(intake_session.model_dump(mode="json"), default=str))
+        # Deterministic next step so the model never needs a status tool call.
+        intake_guidance = compute_intake_guidance(client_id)
+        if intake_guidance is not None:
+            summary_lines.append("intake_guidance (authoritative; follow this):")
+            summary_lines.append(json.dumps(intake_guidance, default=str))
 
     proactive_entries = _read_proactive_log(client_id, PROACTIVE_LOG_INCLUDE_N)
     if proactive_entries:
@@ -980,6 +1107,23 @@ def _build_orchestrator_text_context(
         summary_lines.append(
             "Context hint: do not repeat or contradict the proactive messages above."
         )
+
+    # Restore context after a checkpoint reset. The poisoned LangGraph history was
+    # wiped, but the intake snapshot (above) and the conversation log survive, so
+    # re-inject a compact recap to resume the session without asking the client to
+    # repeat themselves. The marker is cleared once a turn completes successfully.
+    if _checkpoint_reset_pending(client_id):
+        summary_lines.append(
+            "session_recovery_note: Prior in-session memory was compacted after an internal "
+            "error. Rely on intake_session_snapshot and the recap below to continue seamlessly; "
+            "do NOT ask the client to repeat information they already provided."
+        )
+        recap_text = _format_conversation_recap(
+            _read_conversation_log(client_id, CONVERSATION_RECAP_AFTER_RESET_N)
+        )
+        if recap_text:
+            summary_lines.append("recent_conversation_recap (oldest to newest):")
+            summary_lines.append(recap_text)
 
     return "\n".join(summary_lines)
 
@@ -1123,6 +1267,12 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         """
         Walk the ordered model chain with per-model circuit breakers and retries.
 
+        Disables parallel tool calls for OpenAI models so the model emits at most
+        one tool call per step. This prevents parallel batches from being partially
+        truncated (orphaned tool_calls -> poisoned checkpoint) and serializes the
+        read-modify-write intake tools. The setting is applied only to OpenAI models,
+        since Gemini's ``bind_tools`` does not accept ``parallel_tool_calls``.
+
         Args:
             request: The model request.
             handler: The model handler.
@@ -1130,7 +1280,20 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         Returns:
             ModelResponse: The first successful model response.
         """
-        return chain_runner.invoke_middleware(request, handler)
+        def _handler_with_tool_call_policy(model_request: ModelRequest) -> ModelResponse:
+            if (
+                ORCHESTRATOR_DISABLE_PARALLEL_TOOL_CALLS
+                and type(model_request.model).__name__ == "ChatOpenAI"
+            ):
+                model_request = model_request.override(
+                    model_settings={
+                        **model_request.model_settings,
+                        "parallel_tool_calls": False,
+                    }
+                )
+            return handler(model_request)
+
+        return chain_runner.invoke_middleware(request, _handler_with_tool_call_policy)
 
     summarization_trigger_tokens: int = compute_summarization_trigger_tokens(
         max_model_len=ORCHESTRATOR_MAX_MODEL_LEN,
@@ -1160,11 +1323,6 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         system_prompt=system_prompt,
         middleware=[
             dynamic_model_selection,
-            ToolCallLimitMiddleware(
-                tool_name="get_intake_status",
-                run_limit=ORCHESTRATOR_GET_INTAKE_STATUS_RUN_LIMIT,
-                exit_behavior="continue",
-            ),
             ToolCallLimitMiddleware(
                 tool_name="get_time",
                 run_limit=ORCHESTRATOR_GET_TIME_RUN_LIMIT,
@@ -1414,15 +1572,19 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             },
         )
 
-        user_content = _build_orchestrator_user_content(
-            request_id=request_id,
-            case_id=case_id,
-            client_id=client_id,
-            message_id=message_id,
-            channel=channel,
-            username=username,
-            payload_json=payload_json,
-        )
+        def _build_job_payload() -> dict[str, Any]:
+            """Build a fresh job invoke payload, restoring context after a reset."""
+            user_content = _build_orchestrator_user_content(
+                request_id=request_id,
+                case_id=case_id,
+                client_id=client_id,
+                message_id=message_id,
+                channel=channel,
+                username=username,
+                payload_json=payload_json,
+            )
+            return {"messages": [HumanMessage(content=user_content)]}
+
         config: RunnableConfig = build_invoke_config(
             thread_id=client_id,
             checkpoint_ns="orchestrator",
@@ -1453,12 +1615,14 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         )
         res = _invoke_agent_with_recursion_retry(
             agent=agent,
-            payload={"messages": [HumanMessage(content=user_content)]},
+            build_payload=_build_job_payload,
             config=config,
             client_id=client_id,
             request_id=request_id,
             flow="job",
         )
+        # Turn resumed successfully; clear any pending checkpoint-restore marker.
+        _clear_checkpoint_reset(client_id)
         agent_call_tracer.set_tool_names(agent_call_tracer.extract_tool_names(res))
         agent_call_tracer.end_turn(status="ok")
         reply = (

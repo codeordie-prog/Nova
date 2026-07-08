@@ -30,8 +30,6 @@ logger = get_logger(__name__)
 # Define the default model chain for the orchestrator and report agent
 _DEFAULT_ORCHESTRATOR_MODEL_CHAIN: str = (
     "openai:gpt-4o,"
-    "openai:gpt-4o-mini,"
-    "openai:gpt-5-mini,"
     "openai:gpt-5,"
     "gemini:gemini-3.5-flash,"
     "gemini:gemini-3.1-flash-lite"
