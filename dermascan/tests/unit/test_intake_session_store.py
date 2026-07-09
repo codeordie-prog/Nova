@@ -114,7 +114,14 @@ class TestIntakeSessionStore:
             created_at_ms=1000,
             updated_at_ms=1000,
         )
-        profile = {"current_goals": ["relief"], "allergies": ["nuts"]}
+        profile = {
+            "age": 25,
+            "gender": "female",
+            "location": "Nairobi",
+            "current_products": ["cleanser"],
+            "current_goals": ["relief"],
+            "allergies": ["nuts"],
+        }
         final = save_intake_session_recomputed(
             session,
             profile,

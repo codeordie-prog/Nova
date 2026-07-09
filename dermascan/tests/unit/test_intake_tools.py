@@ -13,6 +13,10 @@ from dermascan.shared.intake_session_store import load_intake_session
 
 
 _FULL_PROFILE: dict[str, Any] = {
+    "age": 25,
+    "gender": "female",
+    "location": "Nairobi",
+    "current_products": ["cleanser"],
     "current_goals": ["hydration"],
     "allergies": ["none"],
     "pregnancy": False,
@@ -139,6 +143,69 @@ class TestIntakeTools:
         )
         assert second["status"] == "unchanged"
         assert second["updated_fields"] == []
+
+    def test_update_intake_empty_list_confirms_none_and_routes(
+        self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(tools, "_redis", fake_redis)
+        profile = {**_FULL_PROFILE, "current_products": []}
+        monkeypatch.setattr(tools, "_fetch_skin_profile_dict", lambda _cid: dict(profile))
+        monkeypatch.setattr(
+            tools, "_persist_skin_profile", lambda _cid, _updates: (dict(profile), None)
+        )
+        self._cache_envelope(fake_redis, "req-none", "client-none", "case-none")
+
+        tools.update_intake.invoke(
+            {
+                "request_id": "req-none",
+                "service_intent": "skin_review",
+                "primary_concern": "Bumps on back",
+                "confirm_reproductive_status": True,
+            }
+        )
+        tools.register_intake_image.invoke(
+            {"request_id": "req-none", "image_category": "skin"}
+        )
+
+        status = tools.update_intake.invoke({"request_id": "req-none"})
+        assert not status["ready_to_route"]
+        assert "current_products" in status["profile_gaps"]
+
+        result = tools.update_intake.invoke(
+            {"request_id": "req-none", "current_products": []}
+        )
+        assert result["status"] == "saved"
+        assert "confirmed_none_fields" in result["updated_fields"]
+        assert "current_products" not in result["profile_gaps"]
+        assert result["ready_to_route"]
+
+    def test_post_turn_dispatch_when_model_skips_enqueue(
+        self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(tools, "_redis", fake_redis)
+        self._wire_profile(monkeypatch)
+        self._cache_envelope(fake_redis, "req-auto", "client-auto", "case-auto")
+
+        dispatched: list[dict[str, Any]] = []
+
+        def _fake_dispatch(**kwargs: Any) -> dict[str, str]:
+            dispatched.append(kwargs)
+            return {"status": "queued", "medgemma_job_id": "job-auto"}
+
+        monkeypatch.setattr(tools, "_dispatch_audit_image_ref", _fake_dispatch)
+        monkeypatch.setattr(tools, "_emit_orchestrator_event", lambda _fields: None)
+
+        self._complete_product_intake("req-auto")
+
+        results = tools.ensure_ready_intake_dispatched("client-auto", "req-auto")
+        assert [item["status"] for item in results] == ["queued"]
+        assert len(dispatched) == 1
+
+        session = load_intake_session("client-auto", redis_client=fake_redis)
+        assert session is not None
+        assert session.phase == IntakePhase.AWAITING_AUDIT
+
+        assert tools.ensure_ready_intake_dispatched("client-auto", "req-auto") == []
 
     def test_enqueue_product_audit_when_ready(
         self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch

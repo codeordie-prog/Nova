@@ -29,6 +29,7 @@ import redis
 from dermascan.backend.services.tools.orchestrator.orchestrator_tools import (
     cache_ingress_payload,
     compute_intake_guidance,
+    ensure_ready_intake_dispatched,
     orchestrator_tools,
     internet_search,
     wikipedia_search,
@@ -1614,6 +1615,24 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
 
         print(reply)
         logger.info("Orchestrator reply: %s", reply)
+
+        # Safety net: if intake is ready_to_route but the model ended its turn
+        # without calling enque_request_for_auditing_stream, dispatch the
+        # required audits deterministically instead of trusting the reply text.
+        try:
+            dispatched = ensure_ready_intake_dispatched(
+                client_id=client_id, request_id=request_id
+            )
+            if dispatched:
+                logger.info(
+                    "post-turn audit dispatch results: client_id=%s statuses=%s",
+                    client_id,
+                    [str(item.get("status") or "") for item in dispatched],
+                )
+        except Exception:
+            logger.exception(
+                "post-turn audit dispatch check failed: client_id=%s", client_id
+            )
 
         try:
             payload_obj: dict[str, Any] = json.loads(payload_json)

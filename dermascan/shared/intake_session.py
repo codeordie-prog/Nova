@@ -37,6 +37,17 @@ INTAKE_SESSION_TTL_S: Final[int] = max(
 
 _DEFAULT_MIN_PROFILE_FIELDS: Final[tuple[str, ...]] = ("age", "gender", "current_products","current_goals", "allergies", "location")
 
+# List-valued skin-profile fields where "the user has none" is a valid, complete
+# answer. An explicit empty list from the model records that confirmation on the
+# session (confirmed_none_fields) so the gap check stops demanding the field.
+LIST_PROFILE_FIELDS: Final[tuple[str, ...]] = (
+    "current_products",
+    "current_medications",
+    "current_conditions",
+    "current_goals",
+    "allergies",
+)
+
 
 def _parse_min_profile_fields() -> tuple[str, ...]:
     """
@@ -189,6 +200,7 @@ class IntakeSession(BaseModel):
     consultation_notes: list[str] = Field(default_factory=list)
     collected_context_summary: str = ""
     reproductive_status_confirmed: bool = False
+    confirmed_none_fields: list[str] = Field(default_factory=list)
     profile_gaps: list[str] = Field(default_factory=list)
     missing_for_routing: list[str] = Field(default_factory=list)
     created_at_ms: int = 0
@@ -237,8 +249,7 @@ def _profile_field_is_gap(field_name: str, profile: Mapping[str, Any]) -> bool:
         bool: True when the field counts as a gap.
     """
     value = profile.get(field_name)
-    if field_name in ("current_goals", "allergies", "current_products", "current_medications",
-                      "current_conditions"):
+    if field_name in LIST_PROFILE_FIELDS:
         if not isinstance(value, list):
             return True
         return not any(str(item).strip() for item in value)
@@ -253,18 +264,25 @@ def _profile_field_is_gap(field_name: str, profile: Mapping[str, Any]) -> bool:
     return False
 
 
-def compute_profile_gaps(profile: Mapping[str, Any]) -> list[str]:
+def compute_profile_gaps(
+    profile: Mapping[str, Any],
+    confirmed_none_fields: tuple[str, ...] | list[str] = (),
+) -> list[str]:
     """
     List skin-profile field names still missing for routing minimums.
 
     Args:
         profile: Skin profile dict (e.g. from Firestore or SkinProfile.model_dump()).
+        confirmed_none_fields: List-valued fields the user explicitly confirmed as
+            "none"; these never count as gaps even when the stored list is empty.
 
     Returns:
         list[str]: Gap tokens matching MINIMUM_PROFILE_FIELDS names.
     """
     gaps: list[str] = []
     for field_name in MINIMUM_PROFILE_FIELDS:
+        if field_name in confirmed_none_fields:
+            continue
         if _profile_field_is_gap(field_name, profile):
             gaps.append(field_name)
     return gaps
@@ -303,7 +321,7 @@ def compute_missing_for_routing(
         missing.append(MISSING_PRIMARY_CONCERN)
 
     if requirements.requires_minimum_profile:
-        profile_gaps = compute_profile_gaps(profile)
+        profile_gaps = compute_profile_gaps(profile, session.confirmed_none_fields)
         if profile_gaps:
             missing.append(MISSING_PROFILE_MINIMUM)
 
@@ -372,7 +390,7 @@ def recompute_session(
         IntakeSession: New session instance with gaps, missing, and phase updated.
     """
     timestamp = now_ms if now_ms is not None else int(time.time() * 1000)
-    profile_gaps = compute_profile_gaps(profile)
+    profile_gaps = compute_profile_gaps(profile, session.confirmed_none_fields)
     missing = compute_missing_for_routing(session, profile)
     phase = infer_phase(session, missing)
 

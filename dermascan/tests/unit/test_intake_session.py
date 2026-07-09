@@ -54,10 +54,26 @@ class TestProfileGaps:
 
     def test_populated_profile_has_no_gaps(self) -> None:
         profile = {
+            "age": 25,
+            "gender": "female",
+            "location": "Nairobi",
+            "current_products": ["cleanser"],
             "current_goals": ["reduce acne"],
             "allergies": ["fragrance"],
         }
         assert compute_profile_gaps(profile) == []
+
+    def test_confirmed_none_clears_list_field_gap(self) -> None:
+        profile = {
+            "age": 25,
+            "gender": "female",
+            "location": "Nairobi",
+            "current_products": [],
+            "current_goals": ["reduce acne"],
+            "allergies": ["fragrance"],
+        }
+        assert "current_products" in compute_profile_gaps(profile)
+        assert compute_profile_gaps(profile, ["current_products"]) == []
 
 
 @pytest.mark.unit
@@ -75,6 +91,10 @@ class TestMissingForRouting:
 
     def _full_profile(self) -> dict[str, object]:
         return {
+            "age": 25,
+            "gender": "female",
+            "location": "Nairobi",
+            "current_products": ["cleanser"],
             "current_goals": ["hydration"],
             "allergies": ["none reported"],
         }
@@ -205,10 +225,44 @@ class TestRecomputeAndSummary:
                 ),
             },
         )
-        profile = {"current_goals": ["relief"], "allergies": ["nuts"]}
+        profile = {
+            "age": 25,
+            "gender": "female",
+            "location": "Nairobi",
+            "current_products": ["cleanser"],
+            "current_goals": ["relief"],
+            "allergies": ["nuts"],
+        }
         updated = recompute_session(session, profile, now_ms=1000)
         assert updated.phase == IntakePhase.READY_TO_ROUTE
         assert updated.missing_for_routing == []
+        assert is_ready_to_route(updated, profile)
+
+    def test_confirmed_none_session_reaches_ready(self) -> None:
+        session = IntakeSession(
+            client_id="c1",
+            case_id="case-1",
+            service_intent=ServiceIntent.SKIN_REVIEW,
+            primary_concern="Rash on cheek",
+            reproductive_status_confirmed=True,
+            confirmed_none_fields=["current_products"],
+            images={
+                IntakeImageCategory.SKIN.value: IntakeImageRef(
+                    request_id="req-1",
+                    image_url="https://example.com/a.jpg",
+                ),
+            },
+        )
+        profile = {
+            "age": 23,
+            "gender": "male",
+            "location": "Nairobi",
+            "current_products": [],
+            "current_goals": ["reduce bumps"],
+            "allergies": ["nuts"],
+        }
+        updated = recompute_session(session, profile, now_ms=1000)
+        assert updated.phase == IntakePhase.READY_TO_ROUTE
         assert is_ready_to_route(updated, profile)
 
     def test_build_collected_context_summary(self) -> None:

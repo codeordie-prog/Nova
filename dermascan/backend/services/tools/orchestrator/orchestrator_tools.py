@@ -35,6 +35,7 @@ from dermascan.shared.intake_session import (
     IntakeImageRef,
     IntakePhase,
     IntakeSession,
+    LIST_PROFILE_FIELDS,
     MISSING_PRIMARY_CONCERN,
     MISSING_PRODUCT_IMAGE,
     MISSING_PROFILE_MINIMUM,
@@ -285,7 +286,11 @@ class UpdateIntakeInput(BaseModel):
     )
     current_products: Optional[list[str]] = Field(
         default=None,
-        description="Profile: skincare or cosmetic products currently in the client's routine.",
+        description=(
+            "Profile: skincare or cosmetic products currently in the client's routine. "
+            "Pass an empty list [] when the user says they use no products — that records "
+            "the answer and clears the intake gap."
+        ),
     )
     current_medications: Optional[list[str]] = Field(
         default=None,
@@ -301,7 +306,11 @@ class UpdateIntakeInput(BaseModel):
     )
     allergies: Optional[list[str]] = Field(
         default=None,
-        description="Profile: known allergies or ingredient sensitivities.",
+        description=(
+            "Profile: known allergies or ingredient sensitivities. "
+            "Pass an empty list [] when the user says they have none — that records "
+            "the answer and clears the intake gap."
+        ),
     )
     pregnancy: Optional[bool] = Field(
         default=None,
@@ -361,6 +370,22 @@ class UpdateIntakeInput(BaseModel):
             or self.pregnancy is not None
             or self.breastfeeding is not None
         )
+
+    def confirmed_none_profile_fields(self) -> list[str]:
+        """
+        List list-valued profile fields explicitly provided as empty this call.
+
+        An explicit ``[]`` means the user confirmed they have none, which must
+        clear the corresponding intake gap.
+
+        Returns:
+            list[str]: Field names confirmed as "none".
+        """
+        return [
+            name
+            for name in LIST_PROFILE_FIELDS
+            if getattr(self, name) is not None and not getattr(self, name)
+        ]
 
 
 # Tool argument annotations (surfaced to the model in the JSON schema).
@@ -996,7 +1021,9 @@ def _intake_instruction(session: IntakeSession, profile: dict[str, Any]) -> str:
         gaps = ", ".join(session.profile_gaps) or "profile fields from profile_gaps"
         return (
             f"Call update_intake with the profile fields: {gaps}. "
-            f"Use values the user stated in their latest message.{stop}"
+            "Use values the user stated in their latest message. If the user said they "
+            "have none for a list field (e.g. no products, no allergies), pass an empty "
+            f"list [] for that field to record it.{stop}"
         )
 
     if MISSING_REPRODUCTIVE_STATUS in session.missing_for_routing:
@@ -1710,6 +1737,13 @@ def update_intake(
         updates["reproductive_status_confirmed"] = True
         changed.append("reproductive_status_confirmed")
 
+    confirmed_none = payload.confirmed_none_profile_fields()
+    if confirmed_none:
+        merged_none = sorted(set(session.confirmed_none_fields) | set(confirmed_none))
+        if merged_none != sorted(session.confirmed_none_fields):
+            updates["confirmed_none_fields"] = merged_none
+            changed.append("confirmed_none_fields")
+
     if payload.has_profile_update():
         changed.append("skin_profile")
 
@@ -2062,6 +2096,62 @@ def enque_request_for_auditing_stream(
     if instruction:
         result["instruction"] = instruction
     return result
+
+
+def ensure_ready_intake_dispatched(client_id: str, request_id: str) -> list[dict[str, Any]]:
+    """
+    Deterministically enqueue required audits when the model skipped the tool call.
+
+    Called by the orchestrator worker after an agent turn ends. When the intake
+    session is ready_to_route but not yet awaiting_audit, the model finished its
+    turn without calling enque_request_for_auditing_stream (e.g. it claimed the
+    case was sent without dispatching it). This dispatches every still-missing
+    required audit; the tool's dedupe and phase checks make repeat calls no-ops.
+
+    Args:
+        client_id: Client identifier for the intake session.
+        request_id: Current turn's ingress request id (must be in the ingress cache).
+
+    Returns:
+        list[dict[str, Any]]: Tool results for each dispatch attempted; empty when
+        nothing needed dispatching.
+    """
+    cid = _normalize_client_id(client_id)
+    if not cid or not str(request_id or "").strip():
+        return []
+
+    try:
+        session = load_intake_session(cid, redis_client=_redis)
+    except IntakeSessionStoreError:
+        logger.exception("post-turn dispatch: failed to load intake session: client_id=%s", cid)
+        return []
+    if session is None or session.phase in (IntakePhase.AWAITING_AUDIT, IntakePhase.DELIVERED):
+        return []
+
+    profile = _load_skin_profile_mapping(cid)
+    session = recompute_session(session, profile)
+    if not is_ready_to_route(session, profile):
+        return []
+
+    results: list[dict[str, Any]] = []
+    for category in _required_audit_categories(session):
+        image_ref = session.images.get(category.value)
+        if image_ref is not None and _is_audit_enqueued(image_ref.request_id):
+            continue
+        logger.warning(
+            "post-turn deterministic audit dispatch (model ended turn without enqueue): "
+            "client_id=%s case_id=%s audit_type=%s",
+            cid,
+            session.case_id,
+            category.value,
+        )
+        results.append(
+            enque_request_for_auditing_stream.func(
+                request_id=request_id,
+                audit_type=category,
+            )
+        )
+    return results
 
 
 def _event_ts_ms(event_id: str) -> int:

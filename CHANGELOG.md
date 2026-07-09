@@ -294,3 +294,69 @@ escalation replies (and all outbound messages) to actually reach users.
   supervisor; it is intentionally **not** in `do_work.py`.
 - `QUTIS_INTERNAL_SECRET` must be byte-identical in Nova `.env` and the dashboard `.env.local`, or every
   crossing returns 401.
+
+
+
+
+1. Make "no products" a valid answer (root cause). Mirror the pattern you already use for reproductive status
+  (reproductive_status_confirmed): add a confirmation flag to IntakeSession, e.g. products_confirmed_none. Concretely:
+
+  - Add an optional field to update_intake (e.g. no_current_products: bool) that sets the flag when the user says they use nothing.
+  - In _profile_field_is_gap / compute_profile_gaps (intake_session.py:228), treat current_products as satisfied when the flag is set
+  even though the list is empty.
+  - Add one line to the tool's field description so the model knows to use it ("set true when the user says they use no products").
+
+  The alternative — changing the profile default from [] to None so an explicitly-stored empty list means "confirmed none" — touches
+  serialization in Redis and Firestore and risks misreading existing profiles, so the session flag is the safer, smaller change.
+
+  ⏺ Two distinct issues in that orchestrator log — one loud, one quiet. The loud one is harmless-ish; the
+  quiet one is the real bug.
+
+  1. The Firestore traceback: wrong client construction in delivery_context.py
+
+  load_skin_profile_dict (dermascan/shared/delivery_context.py:143-148) does:
+
+  initialize_firebase_app()
+  from google.cloud import firestore
+  firestore_client = firestore.Client()   # ← uses Application Default Credentials
+
+  google.cloud.firestore.Client() ignores the firebase_admin app it just initialized and goes looking
+  for ADC (gcloud auth application-default login), which you don't have set up — hence
+  DefaultCredentialsError. Everywhere else in the codebase (e.g. _get_firestore_client in
+  orchestrator_tools) the pattern is initialize_firebase_app() then from firebase_admin import
+  firestore; firestore.client() — lowercase client(), which rides the service-account JSON. This one
+  call site just uses the wrong import.
+
+  It's caught and returns {}, so the flow continued — but it means the delivery/rules flow composed
+  your result without the skin profile (no age/allergies context) whenever the Redis cache misses.
+  One-line fix.
+
+  2. The quiet one: your audit ran twice — duplicate jobs, duplicate replies
+
+  Look at the correlation:
+
+  - MedGemma gateway logged audit_image_ref endpoint called twice (20:50:49 and 20:50:55), but the
+  orchestrator made only one tool call, and only one request got a 200 access log.
+  - MedGemma worker then processed two jobs (f1bc6d… and c6ed3e…, batch dispatched: size=2) for the
+  same image.
+  - That produced two diagnose_completed signals, both workers ran the rules flow, and you got two
+  near-identical proactive replies sent to WhatsApp (you can see both "Orchestrator proactive reply"
+  blocks at 20:52:33 and 20:52:34, with slightly different wording).
+
+  The cause is in _dispatch_audit_image_ref (orchestrator_tools.py:1564-1575): it retries on
+  httpx.TimeoutException. The first POST reached the endpoint and enqueued a job, but the endpoint
+  responded slower than MEDGEMMA_ENDPOINT_TIMEOUT_S, so the client timed out, retried, and enqueued a
+  second job. The Redis dedupe key in the tool only guards against the tool being called twice — it
+  doesn't help when one tool call fires two HTTP requests. The endpoint itself isn't idempotent: every
+  call mints a new job_id.
+
+  Fix options, in order of value:
+  1. Make the endpoint idempotent per request_id — in audit_image_ref, SET NX a
+  medgemma:enqueued:{request_id} key (or reuse the job payload's request_id as the dedupe) and return
+  the existing job as already_queued on repeat. This kills the whole class regardless of who retries.
+  2. Don't retry on read timeout in _dispatch_audit_image_ref — keep retries for ConnectError (request
+  never arrived, safe) but treat TimeoutException after the request was sent as "assume delivered"
+  rather than re-POST. Option 1 makes this less critical.
+  3. Optionally also dedupe diagnose_completed signals per request_id on the orchestrator signal
+  consumer, as a last line against duplicate outbound messages — same pattern as the per-request
+  escalation lock you added earlier.
