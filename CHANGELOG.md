@@ -298,65 +298,120 @@ escalation replies (and all outbound messages) to actually reach users.
 
 
 
-1. Make "no products" a valid answer (root cause). Mirror the pattern you already use for reproductive status
-  (reproductive_status_confirmed): add a confirmation flag to IntakeSession, e.g. products_confirmed_none. Concretely:
+---
 
-  - Add an optional field to update_intake (e.g. no_current_products: bool) that sets the flag when the user says they use nothing.
-  - In _profile_field_is_gap / compute_profile_gaps (intake_session.py:228), treat current_products as satisfied when the flag is set
-  even though the list is empty.
-  - Add one line to the tool's field description so the model knows to use it ("set true when the user says they use no products").
+## 2026-07-09 — Intake dead-end fix + deterministic audit dispatch (E2E diagnosis debugging)
 
-  The alternative — changing the profile default from [] to None so an explicitly-stored empty list means "confirmed none" — touches
-  serialization in Redis and Firestore and risks misreading existing profiles, so the session flag is the safer, smaller change.
+Findings from a live end-to-end WhatsApp test (skin review → MedGemma → rules flow → escalation).
+Two bugs were **fixed and shipped** in commit `97b7f4f`; three more were **found and deferred**
+(section 3). Operational gotchas discovered along the way are in section 4.
 
-  ⏺ Two distinct issues in that orchestrator log — one loud, one quiet. The loud one is harmless-ish; the
-  quiet one is the real bug.
+### 1. FIXED — Intake dead-end: "I use no products" could never complete intake
 
-  1. The Firestore traceback: wrong client construction in delivery_context.py
+**Symptom.** A user answered *"Not any skin products for now"* during intake. The conversation
+stalled forever: the case was never enqueued to MedGemma (`medgemma:jobs` stayed empty), the model
+eventually replied *"I'm sending your case to our specialist team now"* **without actually calling
+any dispatch tool**, and the pipeline went silent.
 
-  load_skin_profile_dict (dermascan/shared/delivery_context.py:143-148) does:
+**Root cause.** `current_products` is one of the minimum profile fields required before routing
+(`INTAKE_MIN_PROFILE_FIELDS`). The gap check in `dermascan/shared/intake_session.py`
+(`_profile_field_is_gap`) treated an **empty list as "not yet collected"** — there was no way to
+represent "user confirmed they have none". So `profile_minimum` stayed in `missing_for_routing`
+forever, `ready_to_route` never became true, and the deterministic intake guidance kept demanding
+`current_products` on every turn. The same trap existed for every list-valued minimum field
+(e.g. a user with no allergies).
 
-  initialize_firebase_app()
-  from google.cloud import firestore
-  firestore_client = firestore.Client()   # ← uses Application Default Credentials
+**Fix.**
+- `IntakeSession` gained `confirmed_none_fields: list[str]` (mirrors the existing
+  `reproductive_status_confirmed` pattern; old stored sessions deserialize fine — the field
+  defaults to `[]`).
+- `compute_profile_gaps(profile, confirmed_none_fields)` skips fields the user explicitly
+  confirmed as "none"; `compute_missing_for_routing` / `recompute_session` pass the session's
+  confirmations through.
+- `update_intake` records an **explicit empty list** (e.g. `current_products=[]`) as a
+  confirmed-none answer. The tool schema descriptions for `current_products` / `allergies` and
+  the deterministic intake instruction now tell the model to pass `[]` when the user says they
+  have none.
 
-  google.cloud.firestore.Client() ignores the firebase_admin app it just initialized and goes looking
-  for ADC (gcloud auth application-default login), which you don't have set up — hence
-  DefaultCredentialsError. Everywhere else in the codebase (e.g. _get_firestore_client in
-  orchestrator_tools) the pattern is initialize_firebase_app() then from firebase_admin import
-  firestore; firestore.client() — lowercase client(), which rides the service-account JSON. This one
-  call site just uses the wrong import.
+### 2. FIXED — Orchestrator could end a turn claiming dispatch without dispatching
 
-  It's caught and returns {}, so the flow continued — but it means the delivery/rules flow composed
-  your result without the skin profile (no age/allergies context) whenever the Redis cache misses.
-  One-line fix.
+**Symptom.** The model's final message said the case was "sent to our specialist team", but
+`enque_request_for_auditing_stream` (the only thing that actually pushes a job to
+`medgemma:jobs`) was never called. A text-only reply ends the agent turn, so nothing downstream
+ever ran. Aggravated by gpt-4o TPM 429s mid-turn: the fallback model (gpt-5) picked up the turn
+and answered in prose instead of calling the tool.
 
-  2. The quiet one: your audit ran twice — duplicate jobs, duplicate replies
+**Fix.** New `ensure_ready_intake_dispatched(client_id, request_id)` in
+`orchestrator_tools.py`, called by `orchestrator_worker` after every job-flow reply: if the
+intake session is `ready_to_route` but not yet `awaiting_audit`, it deterministically enqueues
+every still-missing required audit through the same tool path. The tool's Redis dedupe key and
+phase checks make repeat calls no-ops, so it's safe whether or not the model already enqueued.
+The reply text is no longer the only thing standing between a completed intake and MedGemma.
 
-  Look at the correlation:
+Tests: new coverage for confirmed-none gap clearing, ready-to-route via `[]`, and the post-turn
+dispatcher (including idempotency). Also repaired six stale fixtures that predated the 6-field
+`INTAKE_MIN_PROFILE_FIELDS` minimum.
 
-  - MedGemma gateway logged audit_image_ref endpoint called twice (20:50:49 and 20:50:55), but the
-  orchestrator made only one tool call, and only one request got a 200 access log.
-  - MedGemma worker then processed two jobs (f1bc6d… and c6ed3e…, batch dispatched: size=2) for the
-  same image.
-  - That produced two diagnose_completed signals, both workers ran the rules flow, and you got two
-  near-identical proactive replies sent to WhatsApp (you can see both "Orchestrator proactive reply"
-  blocks at 20:52:33 and 20:52:34, with slightly different wording).
+### 3. FOUND, NOT YET FIXED
 
-  The cause is in _dispatch_audit_image_ref (orchestrator_tools.py:1564-1575): it retries on
-  httpx.TimeoutException. The first POST reached the endpoint and enqueued a job, but the endpoint
-  responded slower than MEDGEMMA_ENDPOINT_TIMEOUT_S, so the client timed out, retried, and enqueued a
-  second job. The Redis dedupe key in the tool only guards against the tool being called twice — it
-  doesn't help when one tool call fires two HTTP requests. The endpoint itself isn't idempotent: every
-  call mints a new job_id.
+**3a. `delivery_context.py` uses the wrong Firestore client (MEDIUM).**
+`load_skin_profile_dict` (`dermascan/shared/delivery_context.py:~147`) does:
 
-  Fix options, in order of value:
-  1. Make the endpoint idempotent per request_id — in audit_image_ref, SET NX a
-  medgemma:enqueued:{request_id} key (or reuse the job payload's request_id as the dedupe) and return
-  the existing job as already_queued on repeat. This kills the whole class regardless of who retries.
-  2. Don't retry on read timeout in _dispatch_audit_image_ref — keep retries for ConnectError (request
-  never arrived, safe) but treat TimeoutException after the request was sent as "assume delivered"
-  rather than re-POST. Option 1 makes this less critical.
-  3. Optionally also dedupe diagnose_completed signals per request_id on the orchestrator signal
-  consumer, as a last line against duplicate outbound messages — same pattern as the per-request
-  escalation lock you added earlier.
+```python
+initialize_firebase_app()
+from google.cloud import firestore
+firestore_client = firestore.Client()   # ← wants Application Default Credentials
+```
+
+`google.cloud.firestore.Client()` ignores the firebase_admin app initialized on the line above
+and resolves credentials via ADC (`gcloud auth application-default login`), which is not set up —
+every call raises `DefaultCredentialsError`. Everywhere else the codebase uses
+`initialize_firebase_app()` + `from firebase_admin import firestore; firestore.client()`
+(lowercase `client()`), which rides the service-account JSON. The exception is caught and the
+function returns `{}`, so the pipeline continues — but whenever the Redis skin-profile cache
+misses, the delivery/rules flow composes the user's report **without their profile** (no age,
+allergies, or goals context). One-line fix: use the firebase_admin client like
+`_get_firestore_client` in `orchestrator_tools.py`.
+
+**3b. Duplicate audit dispatch — MedGemma endpoint is not idempotent (MEDIUM).**
+Observed live: the MedGemma gateway logged `audit_image_ref endpoint called` **twice** for one
+orchestrator tool call; the worker processed **two jobs** for the same image; two
+`diagnose_completed` signals came back; the rules flow ran twice; the user received **two
+near-identical proactive WhatsApp replies** (double LLM cost included). Cause:
+`_dispatch_audit_image_ref` (`orchestrator_tools.py`) retries on `httpx.TimeoutException`. The
+first POST reached the endpoint and enqueued a job, but the response was slower than
+`MEDGEMMA_ENDPOINT_TIMEOUT_S`, so the client timed out and re-POSTed — and the endpoint mints a
+new `job_id` on every call. The tool's Redis dedupe key only guards against the *tool* being
+called twice, not one tool call firing two HTTP requests. Fixes, in order of value:
+1. Make `/audit_image_ref` idempotent per `request_id` (`SET NX` a
+   `medgemma:enqueued:{request_id}` key; return `already_queued` on repeat) — kills the whole
+   class regardless of who retries.
+2. Stop retrying read timeouts client-side (keep `ConnectError` retries — those are safe because
+   the request never arrived).
+3. Optionally dedupe `diagnose_completed` signals per `request_id` in the orchestrator signal
+   consumer, as a last line against duplicate outbound messages.
+
+**3c. Untracked GCP service-account key in repo root (SECURITY).**
+`qutisai-4e331c643ebb.json` sits untracked at the repo root. Deliberately excluded from commits —
+gitignore or move it before it gets swept into one. (Key rotation for the previously-committed
+keys is also still pending; they remain in git history.)
+
+### 4. Operational notes from the escalation test
+
+- **Escalation thresholds are read at import time.** `DIAGNOSE_CONFIDENCE_THRESHOLD` /
+  `PRODUCT_REVIEW_CONFIDENCE_THRESHOLD` become module constants in
+  `ai_service/postprocessing/escalation.py`, and the escalate-or-not decision runs inside the
+  **MedGemma worker** process. Editing `.env` does nothing until that worker is restarted
+  (uvicorn `--reload` on the gateway doesn't cover it — different process, and `.env` isn't a
+  watched file). This is why a threshold change to `1.0` was still evaluated as `0.2` — the
+  `diagnose_inference_completed` event on `events:stream` records the `confidence` and
+  `threshold` actually applied, which is the fastest way to verify.
+- **The comparison is strict `confidence < threshold`.** A confidence of exactly the threshold
+  value does NOT escalate. With both thresholds env-pinned to `0.2`, a 0.2-confidence case stays
+  with the AI; under the code defaults (0.75 / 0.60) it would escalate.
+- **gpt-4o TPM 429s** during intake are caused by repeated `update_intake` calls inflating
+  per-turn token usage past the 30k TPM org limit. The fallback chain (→ gpt-5) recovers the
+  turn, but fallback models have been observed skipping tool calls (see 2 above).
+- **Escalation dashboard image 404s for old cases**: `/v1/escalations/{case_id}/image` resolves
+  the blob via `escalation:image_path:{case_id}` in Redis; once that key is gone (expiry/flush),
+  the dashboard still lists the case from its own Postgres but Nova can no longer serve the image.
