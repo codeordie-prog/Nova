@@ -35,7 +35,7 @@ INTAKE_SESSION_TTL_S: Final[int] = max(
     int(os.getenv(_ENV_INTAKE_TTL_S, str(_DEFAULT_JOB_TTL_S))),
 )
 
-_DEFAULT_MIN_PROFILE_FIELDS: Final[tuple[str, ...]] = ("current_goals", "allergies")
+_DEFAULT_MIN_PROFILE_FIELDS: Final[tuple[str, ...]] = ("age", "gender", "current_products","current_goals", "allergies", "location")
 
 
 def _parse_min_profile_fields() -> tuple[str, ...]:

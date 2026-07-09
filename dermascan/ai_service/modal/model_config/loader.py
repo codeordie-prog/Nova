@@ -97,7 +97,7 @@ DEFAULT_CONFIGS: Final["ModelConfig"] = ModelConfig(
     revision="main",
     dtype="bfloat16",
     gpu_memory_utilization=0.85,
-    max_model_len=1536,
+    max_model_len=2048,
     max_num_seqs=24,
     max_num_batched_tokens=8192,
 )

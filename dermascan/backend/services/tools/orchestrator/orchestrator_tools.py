@@ -79,6 +79,10 @@ SEARCH_RESULT_TOTAL_CHARS: int = max(1000, int(os.getenv("SEARCH_RESULT_TOTAL_CH
 TAVILY_TIMEOUT_S: float = max(1.0, float(os.getenv("TAVILY_TIMEOUT_S", "12")))
 SEARCH_CACHE_TTL_S: int = max(0, int(os.getenv("SEARCH_CACHE_TTL_S", str(60 * 60 * 6))))
 MEDGEMMA_HEALTH_TIMEOUT_S: float = max(0.5, float(os.getenv("MEDGEMMA_HEALTH_TIMEOUT_S", "3")))
+MEDGEMMA_AUDIT_CONTEXT_MAX_CHARS: int = max(
+    200,
+    int(os.getenv("MEDGEMMA_AUDIT_CONTEXT_MAX_CHARS", "800")),
+)
 
 
 def _init_redis_client() -> Redis | None:
@@ -1386,6 +1390,26 @@ def _enqueue_group_params(session: IntakeSession) -> tuple[str, int]:
     return "", 0
 
 
+def _truncate_audit_context(text: str, *, max_chars: int = MEDGEMMA_AUDIT_CONTEXT_MAX_CHARS) -> str:
+    """
+    Trim audit context to stay within MedGemma vLLM prompt budget.
+
+    Args:
+        text: Full audit context string.
+        max_chars: Maximum allowed character length.
+
+    Returns:
+        str: Original text or a truncated variant with an explicit suffix.
+    """
+    normalized = str(text or "").strip()
+    if len(normalized) <= max_chars:
+        return normalized
+
+    suffix = " [truncated for MedGemma context budget]"
+    keep = max(0, max_chars - len(suffix))
+    return f"{normalized[:keep].rstrip()}{suffix}"
+
+
 def _build_audit_context_text(
     session: IntakeSession,
     profile: dict[str, Any],
@@ -1417,7 +1441,7 @@ def _build_audit_context_text(
     extra = str(collected_context or "").strip()
     if extra:
         parts.append(extra)
-    return "\n".join(parts)
+    return _truncate_audit_context("\n".join(parts))
 
 
 def _enqueue_audit_instruction(
@@ -1774,7 +1798,9 @@ def register_intake_image(
     profile = _load_skin_profile_mapping(client_id)
 
     try:
+        # Create a new intake session if one doesn't exist
         session = get_or_create_intake_session(client_id, case_id, redis_client=_redis)
+
     except IntakeSessionStoreError as exc:
         return {"status": "error", "detail": f"failed to load intake session: {exc}", "request_id": request_id}
 
@@ -1807,7 +1833,7 @@ def enque_request_for_auditing_stream(
     collected_context: AuditCollectedContextArg = "",
 ) -> dict[str, Any]:
     """
-    Send a registered intake image to the specialist audit team (MedGemma).
+    Send a registered intake image to the specialist audit team (MedGemma + Dermatologist).
 
     Arguments:
         request_id (string, required): Exact request_id from the current orchestrator turn
@@ -2436,6 +2462,67 @@ def _run_tavily_search(
     return formatted
 
 
+def _format_search_results(raw: str, *, label: str = "Search") -> str:
+    """
+    Convert compact Tavily JSON into readable text for the orchestrator agent.
+
+    Passes through non-JSON strings unchanged (configuration notices, terminal
+    failure directives, cache hits that are already formatted).
+
+    Args:
+        raw: Compact JSON from ``_format_tavily_results``, or a plain-text message.
+        label: Human-readable source label (e.g. ``Internet``, ``Wikipedia``).
+
+    Returns:
+        str: Formatted multi-line summary with numbered results, URLs, and snippets.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return f"{label}: no results."
+
+    # Pass through terminal directives and configuration errors unchanged.
+    if not text.startswith("{"):
+        return text
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+    if not isinstance(payload, dict):
+        return text
+
+    query = str(payload.get("query") or "").strip()
+    items = payload.get("results") or []
+    if not isinstance(items, list) or not items:
+        if query:
+            return f'{label} query "{query}": no results found.'
+        return f"{label}: no results found."
+
+    lines: list[str] = []
+    if query:
+        lines.append(f"{label} results for: {query}")
+    lines.append("")
+
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "Untitled").strip() or "Untitled"
+        url = str(item.get("url") or "").strip()
+        content = str(item.get("content") or "").strip()
+        lines.append(f"{index}. {title}")
+        if url:
+            lines.append(f"   URL: {url}")
+        if content:
+            lines.append(f"   Summary: {content}")
+        lines.append("")
+
+    formatted = "\n".join(lines).strip()
+    if len(formatted) <= SEARCH_RESULT_TOTAL_CHARS:
+        return formatted
+    return formatted[:SEARCH_RESULT_TOTAL_CHARS] + "\n...<truncated>"
+
+
 @tool
 def wikipedia_search(query: str, max_results: int = 3) -> str:
     """
@@ -2449,11 +2536,14 @@ def wikipedia_search(query: str, max_results: int = 3) -> str:
         query: Search query string.
         max_results: Maximum number of results to retrieve (capped internally).
     """
-    return _run_tavily_search(
+    return _format_search_results(
+        _run_tavily_search(
+            label="Wikipedia",
+            query=query,
+            max_results=max(1, min(max_results, 5)),
+            include_domains=["wikipedia.org"],
+        ),
         label="Wikipedia",
-        query=query,
-        max_results=max(1, min(max_results, 5)),
-        include_domains=["wikipedia.org"],
     )
 
 
@@ -2470,12 +2560,15 @@ def internet_search(query: str, max_results: int = 3) -> str:
         query: Search query string.
         max_results: Maximum number of results to retrieve (capped internally).
     """
-    return _run_tavily_search(
+    return _format_search_results(
+        _run_tavily_search(
+            label="Internet",
+            query=query,
+            max_results=max(1, min(max_results, 3)),
+            include_domains=["mayoclinic.org", "webmd.com", "healthline.com", "cdc.gov", "nih.gov", "mydawa.com"],
+            search_depth="advanced",
+        ),
         label="Internet",
-        query=query,
-        max_results=max(1, min(max_results, 3)),
-        include_domains=["mayoclinic.org", "webmd.com", "healthline.com", "cdc.gov", "nih.gov", "mydawa.com"],
-        search_depth="advanced",
     )
 
 

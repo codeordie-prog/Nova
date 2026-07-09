@@ -77,6 +77,7 @@ from dermascan.backend.services.agents.model_fallback_chain import (
     build_model_chain_from_spec,
     is_recursion_error,
     orchestrator_model_chain_spec,
+    serial_tool_calls_middleware,
     summarization_model_chain_spec,
 )
 from dermascan.backend.services.agents.memory.redis_checkpointer import (
@@ -139,11 +140,8 @@ ORCHESTRATOR_GET_TIME_RUN_LIMIT: int = max(
 ORCHESTRATOR_READ_STATUS_RUN_LIMIT: int = max(
     1, int(os.getenv("ORCHESTRATOR_READ_STATUS_RUN_LIMIT", "2"))
 )
-# Disable OpenAI parallel tool calls so the model emits at most one tool call
-# per step. Parallel batches can be truncated by summarization / tool-call caps,
-# leaving assistant tool_calls without matching tool responses -> a poisoned
-# checkpoint (OpenAI 400 on every subsequent turn). Sequential calls also prevent
-# lost updates from concurrent read-modify-write on the shared intake session.
+# Disable parallel tool calls so the model emits at most one tool call per step.
+# See model_fallback_chain.serial_tool_calls_middleware (OpenAI flag + Gemini trim).
 ORCHESTRATOR_DISABLE_PARALLEL_TOOL_CALLS: bool = os.getenv(
     "ORCHESTRATOR_DISABLE_PARALLEL_TOOL_CALLS", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -1043,7 +1041,7 @@ def _build_orchestrator_text_context(
         attachments = []
 
     summary_lines = [
-        "You are handling one orchestrator ingress job.",
+        "You are handling a service request from a client.",
         "Use tool calls when routing is needed.",
         f"request_id: {request_id}",
         f"case_id: {case_id}",
@@ -1081,12 +1079,12 @@ def _build_orchestrator_text_context(
 
     if text and attachments:
         summary_lines.append(
-            "Routing hint: user provided both text and attachment(s). You may need to forward for diagnosis."
+            "Routing hint: user provided both text and attachment(s). You may need to enqueue for audit."
         )
     if text:
-        summary_lines.append("Routing hint: text is available. You may need to just respond or check event progress.")
+        summary_lines.append("Routing hint: text is available. You may need to just respond, confirm intention or check event progress.")
     if attachments and not text:
-        summary_lines.append("Routing hint: attachment-only request. May be a follow-up image or new case.")
+        summary_lines.append("Routing hint: attachment-only request. May be a follow-up image or new case. Confirm intention.")
     if not text and not attachments:
         summary_lines.append("Routing hint: missing content; ask clarification.")
 
@@ -1267,12 +1265,6 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         """
         Walk the ordered model chain with per-model circuit breakers and retries.
 
-        Disables parallel tool calls for OpenAI models so the model emits at most
-        one tool call per step. This prevents parallel batches from being partially
-        truncated (orphaned tool_calls -> poisoned checkpoint) and serializes the
-        read-modify-write intake tools. The setting is applied only to OpenAI models,
-        since Gemini's ``bind_tools`` does not accept ``parallel_tool_calls``.
-
         Args:
             request: The model request.
             handler: The model handler.
@@ -1280,20 +1272,7 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         Returns:
             ModelResponse: The first successful model response.
         """
-        def _handler_with_tool_call_policy(model_request: ModelRequest) -> ModelResponse:
-            if (
-                ORCHESTRATOR_DISABLE_PARALLEL_TOOL_CALLS
-                and type(model_request.model).__name__ == "ChatOpenAI"
-            ):
-                model_request = model_request.override(
-                    model_settings={
-                        **model_request.model_settings,
-                        "parallel_tool_calls": False,
-                    }
-                )
-            return handler(model_request)
-
-        return chain_runner.invoke_middleware(request, _handler_with_tool_call_policy)
+        return chain_runner.invoke_middleware(request, handler)
 
     summarization_trigger_tokens: int = compute_summarization_trigger_tokens(
         max_model_len=ORCHESTRATOR_MAX_MODEL_LEN,
@@ -1342,6 +1321,7 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
                 trigger=("tokens", summarization_trigger_tokens),
                 keep=("messages", 3),
             ),
+            serial_tool_calls_middleware,
         ],
         checkpointer=checkpointer,
         response_format=StructuredResponse,

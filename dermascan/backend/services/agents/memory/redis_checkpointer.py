@@ -1,4 +1,9 @@
 """
+Author: DermascanTeam
+Date: 2026-07-09
+License: MIT
+
+Description:
 Redis checkpointer wrapper for agent state persistence.
 Uses langgraph's built-in RedisSaver.
 

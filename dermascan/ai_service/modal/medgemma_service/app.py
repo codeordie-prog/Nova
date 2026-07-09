@@ -341,6 +341,62 @@ class MedGemmaService:
             img = img.resize((self.cfg.image_size, self.cfg.image_size))
         return img
 
+    def _encode_image_for_vllm(self, image_bytes: bytes) -> bytes:
+        """
+        Decode, resize, and JPEG-encode image bytes for vLLM data URLs.
+
+        vLLM receives the same resized inputs as the transformers path so visual
+        token count stays within ``max_model_len``.
+
+        Args:
+            image_bytes: Raw uploaded image bytes.
+
+        Returns:
+            bytes: JPEG-encoded image bytes.
+        """
+        img: Image.Image = self._decode_image_bytes(image_bytes)
+        buf: BytesIO = BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
+
+    def _truncate_vllm_user_prompt(self, prompt: str) -> str:
+        """
+        Trim user prompt text to the configured MedGemma audit context budget.
+
+        Args:
+            prompt: User prompt accompanying the image.
+
+        Returns:
+            str: Original or truncated prompt.
+        """
+        max_chars: int = max(
+            200,
+            int(os.environ.get("MEDGEMMA_AUDIT_CONTEXT_MAX_CHARS", "800")),
+        )
+        normalized: str = str(prompt or "").strip()
+        if len(normalized) <= max_chars:
+            return normalized
+
+        suffix: str = " [truncated for MedGemma context budget]"
+        keep: int = max(0, max_chars - len(suffix))
+        return f"{normalized[:keep].rstrip()}{suffix}"
+
+    @staticmethod
+    def _raise_vllm_http_error(resp: Response) -> None:
+        """
+        Raise a descriptive error when vLLM returns a non-success HTTP status.
+
+        Args:
+            resp: HTTP response from the vLLM OpenAI-compatible API.
+
+        Raises:
+            RuntimeError: Always raised with status code and response body excerpt.
+        """
+        body: str = (resp.text or "")[:2000]
+        raise RuntimeError(
+            f"vLLM chat/completions failed: status={resp.status_code} body={body}"
+        )
+
     # Format messages for MedGemma
     def _messages(self, *, img: Image.Image, prompt: str) -> list[dict]:
         """
@@ -381,8 +437,12 @@ class MedGemmaService:
             List of messages in vLLM format
         """
 
+        # Resize and JPEG-encode so vLLM visual token count matches transformers path.
+        prepared_bytes: bytes = self._encode_image_for_vllm(image_bytes)
+        truncated_prompt: str = self._truncate_vllm_user_prompt(prompt)
+
         # Encode image to base64 and create data URL
-        b64: str = base64.b64encode(image_bytes).decode("ascii")
+        b64: str = base64.b64encode(prepared_bytes).decode("ascii")
         data_url: str = f"data:image/jpeg;base64,{b64}"
         return [
             {"role": "system", "content": _STRUCTURED_SYSTEM_PROMPT},
@@ -390,7 +450,7 @@ class MedGemmaService:
                 "role": "user",
                 "content": [
                     {"type": "image_url", "image_url": {"url": data_url}},
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": truncated_prompt},
                 ],
             },
         ]
@@ -451,7 +511,13 @@ class MedGemmaService:
             json=payload,
             timeout=self._vllm_request_timeout_s,
         )
-        r.raise_for_status()
+        if r.status_code >= 400:
+            log.error(
+                "vLLM inference failed: status=%s body=%s",
+                r.status_code,
+                (r.text or "")[:2000],
+            )
+            self._raise_vllm_http_error(r)
 
         # Parse the response
         data: Dict[str, Any] = r.json()
@@ -524,9 +590,14 @@ class MedGemmaService:
                     responses = await asyncio.gather(*tasks)
                     texts: list[Dict[str, Any]] = []
                     for resp in responses:
-                        resp.raise_for_status()
+                        if resp.status_code >= 400:
+                            log.error(
+                                "vLLM batch inference failed: status=%s body=%s",
+                                resp.status_code,
+                                (resp.text or "")[:2000],
+                            )
+                            self._raise_vllm_http_error(resp)
                         data = resp.json()
-                        print(data)
                         content: str = data["choices"][0]["message"]["content"]
                         confidence: float = compute_confidence_score(data)
                         texts.append({"text": content, "confidence": confidence})

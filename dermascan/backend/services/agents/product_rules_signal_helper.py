@@ -27,6 +27,7 @@ from dermascan.backend.services.agents.model_fallback_chain import (
     ModelChainRunner,
     build_model_chain_from_spec,
     report_model_chain_spec,
+    serial_tool_calls_middleware,
 )
 from dermascan.rules_engine.engine.engine import RulesEngineRequest, SkinContext
 from dermascan.rules_engine.engine.rules_engine import RulesEngine
@@ -92,6 +93,13 @@ REPORT_AGENT_INCI_SEARCH_RUN_LIMIT: int = max(
 )
 REPORT_AGENT_INTERNET_SEARCH_RUN_LIMIT: int = max(
     1, int(os.getenv("REPORT_AGENT_INTERNET_SEARCH_RUN_LIMIT", "2"))
+)
+# Shown to the user when no ingredients could be read for a product review.
+PRODUCT_LABEL_UNREADABLE_MESSAGE: str = os.getenv(
+    "PRODUCT_LABEL_UNREADABLE_MESSAGE",
+    "I couldn't read the ingredient list for this product. Please resend a clear, "
+    "well-lit close-up of the ingredients label (text in focus and fully visible) so "
+    "the specialist team can review it. This is informational only, not medical advice.",
 )
 
 # Define response models
@@ -222,6 +230,7 @@ def _build_report_agent_middleware(tools: list[Any]) -> list[Any]:
             exit_behavior="continue",
         )
     )
+    middleware.append(serial_tool_calls_middleware)
     return middleware
 
 
@@ -549,20 +558,54 @@ def skin_review_search(query: str, max_results: int = 2) -> str:
 
 def _ingredient_extraction_system_prompt() -> str:
     """
-    Build the system prompt for ingredient extraction agents.
+    Build the system prompt for the ingredient structuring model call.
 
     Returns:
         str: System prompt text.
     """
     return (
-        "You extract cosmetic product ingredient names in strict INCI-style naming. "
-        "Always use the inci_decoder_search tool before finalizing when product identity is available. "
+        "You extract cosmetic product ingredient names in strict INCI-style naming "
+        "from the provided reference text. "
+        "Use ONLY the supplied product name and search reference text; do not invent "
+        "ingredients or call any tools. "
         "Return only ingredient names without concentration or percentages. "
         "Example: 'Niacinamide 10%' -> 'Niacinamide'. "
-        "Never return explanatory prose in ingredients; keep it clean and deduplicated."
-        "Return at-most the first 10 main ingredients."
-        "Avoid formatting your responses, reply with a clean well structured response, No bold or italics."
+        "Never return explanatory prose in ingredients; keep it clean and deduplicated. "
+        "Return at most the first 10 main ingredients in order. "
+        "If the reference text does not contain a usable ingredient list, return an empty "
+        "ingredients array and briefly say why in notes. "
+        "Avoid formatting; no bold or italics."
     )
+
+
+def _search_incidecoder_reference(product_name: str, *, max_results: int = 5) -> str:
+    """
+    Run a single deterministic INCI Decoder search for a product.
+
+    This is Phase A of ingredient extraction: a controlled, non-agent tool call so
+    no model decides when to stop searching (removes the ReAct recursion loop).
+
+    Args:
+        product_name: Product identity to search for.
+        max_results: Maximum search results to request.
+
+    Returns:
+        str: Raw search text (JSON string) or an empty string when unavailable.
+
+    Time complexity: O(1) network calls.
+    """
+    query = f"{product_name} ingredients".strip()
+    if not query or query == "ingredients":
+        return ""
+    try:
+        return str(
+            inci_decoder_search.invoke(
+                {"query": query, "max_results": max_results}
+            )
+        )
+    except Exception:
+        logger.exception("inci_decoder_search failed during phase-A lookup")
+        return ""
 
 
 def extract_product_ingredients(
@@ -572,31 +615,41 @@ def extract_product_ingredients(
     invoke_config: Optional[RunnableConfig] = None,
 ) -> IngredientExtractionResponse:
     """
-    Extract product ingredients.
+    Extract product ingredients using a two-phase, recursion-proof pipeline.
+
+    Phase A performs a single deterministic ``inci_decoder_search`` (no agent, no
+    model-driven loop). Phase B makes one structured-output model call with NO tools
+    bound, so a ReAct graph is never created and ``GraphRecursionError`` cannot occur.
+
     Args:
-        product_name (str): The name of the product
-        description (str): The description of the product
-    
+        product_name: The name of the product.
+        description: Optional description / supplemental text.
+        invoke_config: Optional RunnableConfig for tracing.
+
     Returns:
-        IngredientExtractionResponse: The extracted ingredients
+        IngredientExtractionResponse: Extracted ingredients (empty on failure).
     """
+    # Phase A: deterministic reference lookup (bounded, cannot loop).
+    reference_text = _search_incidecoder_reference(product_name)
+
+    # Phase B: single structured-output call, no tools -> recursion impossible.
     system_prompt = _ingredient_extraction_system_prompt()
     prompt = (
-        "Extract the ingredient list for this cosmetic product.\n"
-        "Use INCI names only and remove concentration values.\n"
+        "Extract the INCI ingredient list for this cosmetic product from the "
+        "reference text below. Remove concentrations. Return at most 10 main "
+        "ingredients in order.\n"
         f"product_name: {product_name}\n"
         f"description: {description}\n"
+        f"search_reference_text: {reference_text or '(no reference text found)'}\n"
     )
     try:
-        response = _invoke_with_model_chain(
-            system_prompt=system_prompt,
-            tools=[inci_decoder_search],
-            response_format=IngredientExtractionResponse,
-            prompt=prompt,
+        runner = _get_report_chain_runner()
+        structured = runner.invoke_structured_output(
+            messages=[("system", system_prompt), ("human", prompt)],
+            schema=IngredientExtractionResponse,
+            config=invoke_config,
             operation="ingredient_extraction",
-            invoke_config=invoke_config,
         )
-        structured = response.get("structured_response") if isinstance(response, dict) else None
         if isinstance(structured, IngredientExtractionResponse):
             ingredients = [_normalize_inci_name(item) for item in structured.ingredients]
             ingredients = [item for item in ingredients if item]
@@ -667,8 +720,8 @@ def _product_report_system_prompt(
         "Convert structured product safety evidence into a brief audit for a non-technical user. "
         "Do not claim medical diagnosis and do not prescribe treatment. "
         "Use report_internet_search only when it meaningfully strengthens unclear or missing safety points. "
-        "Write at most 5 sentences total as one plain-text paragraph. "
-        "Do NOT use section labels, headings, bullet lists, or markdown. "
+        "Compress the report into at most 5 short sentences in total, use bullet points if needed. "
+        "Do NOT use markdown formatting. "
         "Prioritize findings that matter for THIS user (pregnancy, breastfeeding, allergies, goals, "
         "primary concern). Lead with the highest-risk mismatch first — e.g. if the user is pregnant "
         "and the formula contains retinol, say that clearly in sentence 1. "
@@ -703,8 +756,8 @@ def _skin_review_system_prompt(
         "Produce a brief image-based skin pattern review from the candidate pattern, condition summary, "
         "and needs/treatment context. "
         "Use skin_review_search only when it materially improves uncertain or thin evidence. "
-        "Write at most 5 sentences total as one plain-text paragraph. "
-        "Do NOT use section labels, headings, bullet lists, or markdown. "
+        "Compress the report into at most 5 short sentences in total, use bullet points if needed. "
+        "Do NOT use markdown formatting. "
         "Do not prescribe medications, dosages, or definitive treatment plans. "
         "Treat the candidate pattern as an internal hypothesis, not a confirmed diagnosis. "
         "Use cautious language such as 'appears consistent with', 'may suggest', 'could reflect', "
@@ -887,6 +940,27 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
         len(extraction.ingredients),
         extraction.ingredients,
     )
+
+    # No readable ingredients: skip the rules engine (it would run on an empty list
+    # and produce a misleading "no info" report) and ask for a clearer label photo.
+    if not extraction.ingredients:
+        logger.warning(
+            "product review has no readable ingredients; skipping rules engine: "
+            "request_id=%s case_id=%s client_id=%s product_name=%s",
+            request_id,
+            case_id,
+            client_id,
+            product_name or "<empty>",
+        )
+        return {
+            "summary": "",
+            "user_friendly_report": PRODUCT_LABEL_UNREADABLE_MESSAGE,
+            "sources": [],
+            "ingredients": [],
+            "indexed_ingredients": [],
+            "report": {},
+            "ingredients_unreadable": True,
+        }
 
     rules_engine = get_rules_engine()
     request = RulesEngineRequest(

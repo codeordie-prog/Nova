@@ -14,8 +14,15 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
+from langchain.agents.middleware import (
+    ExtendedModelResponse,
+    ModelRequest,
+    ModelResponse,
+    wrap_model_call,
+)
+from langchain_core.messages import AIMessage, BaseMessage
 from langchain_openai import ChatOpenAI
 
 from dermascan.backend.services.agents.build import build_gemini_chat_model
@@ -29,8 +36,8 @@ logger = get_logger(__name__)
 
 # Define the default model chain for the orchestrator and report agent
 _DEFAULT_ORCHESTRATOR_MODEL_CHAIN: str = (
-    "openai:gpt-4o,"
     "openai:gpt-5,"
+    "openai:gpt-4o,"
     "gemini:gemini-3.5-flash,"
     "gemini:gemini-3.1-flash-lite"
 )
@@ -69,6 +76,141 @@ OPENAI_REASONING_MAX_TOKENS: int = max(
 OPENAI_REASONING_EFFORT: str = str(
     os.getenv("OPENAI_REASONING_EFFORT", "minimal")
 ).strip().lower()
+
+# Serialize tool calls to one per model step (OpenAI API flag + Gemini response trim).
+AGENT_DISABLE_PARALLEL_TOOL_CALLS: bool = os.getenv(
+    "AGENT_DISABLE_PARALLEL_TOOL_CALLS",
+    os.getenv("ORCHESTRATOR_DISABLE_PARALLEL_TOOL_CALLS", "true"),
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_openai_chat_model(model: Any) -> bool:
+    """
+    Return True when the bound model is LangChain OpenAI chat.
+
+    Args:
+        model: Model instance from a ModelRequest.
+
+    Returns:
+        bool: True for ChatOpenAI instances.
+    """
+    return isinstance(model, ChatOpenAI)
+
+
+def apply_serial_tool_call_request(request: ModelRequest) -> ModelRequest:
+    """
+    Apply provider-specific request settings for serial tool calling.
+
+    OpenAI accepts ``parallel_tool_calls=False`` via bind_tools kwargs.
+    Gemini has no equivalent flag; response trimming handles it downstream.
+
+    Args:
+        request: Incoming model request.
+
+    Returns:
+        ModelRequest: Possibly overridden request.
+    """
+    if not AGENT_DISABLE_PARALLEL_TOOL_CALLS or not _is_openai_chat_model(request.model):
+        return request
+    return request.override(
+        model_settings={
+            **request.model_settings,
+            "parallel_tool_calls": False,
+        }
+    )
+
+
+def _truncate_ai_message_tool_calls(message: BaseMessage) -> BaseMessage:
+    """
+    Keep at most one tool call on an AI message.
+
+    Args:
+        message: Model output message.
+
+    Returns:
+        BaseMessage: Original message or a copy with extra tool calls removed.
+    """
+    if not isinstance(message, AIMessage):
+        return message
+    tool_calls = list(message.tool_calls or [])
+    if len(tool_calls) <= 1:
+        return message
+    return message.model_copy(update={"tool_calls": tool_calls[:1]}, deep=True)
+
+
+def enforce_serial_tool_call_response(
+    response: Union[ModelResponse, AIMessage, ExtendedModelResponse],
+) -> Union[ModelResponse, AIMessage, ExtendedModelResponse]:
+    """
+    Trim parallel tool calls from a model response to a single call.
+
+    Args:
+        response: Raw middleware/model handler result.
+
+    Returns:
+        Same response type with at most one tool call per AI message.
+    """
+    if not AGENT_DISABLE_PARALLEL_TOOL_CALLS:
+        return response
+
+    if isinstance(response, AIMessage):
+        truncated = _truncate_ai_message_tool_calls(response)
+        if truncated is not response and len(response.tool_calls or []) > 1:
+            logger.warning(
+                "truncated %s parallel tool calls to 1 (direct AIMessage response)",
+                len(response.tool_calls) - 1,
+            )
+        return truncated
+
+    if isinstance(response, ExtendedModelResponse):
+        trimmed = enforce_serial_tool_call_response(response.model_response)
+        if trimmed is response.model_response:
+            return response
+        return ExtendedModelResponse(
+            model_response=trimmed,
+            command=response.command,
+        )
+
+    truncated_messages = [_truncate_ai_message_tool_calls(msg) for msg in response.result]
+    dropped = sum(
+        max(0, len(getattr(msg, "tool_calls", []) or []) - 1)
+        for msg in response.result
+        if isinstance(msg, AIMessage) and len(msg.tool_calls or []) > 1
+    )
+    if dropped:
+        logger.warning(
+            "truncated %s parallel tool calls to 1 (ModelResponse)",
+            dropped,
+        )
+    if truncated_messages == response.result:
+        return response
+    return ModelResponse(
+        result=truncated_messages,
+        structured_response=response.structured_response,
+    )
+
+
+@wrap_model_call
+def serial_tool_calls_middleware(
+    request: ModelRequest,
+    handler: Callable[[ModelRequest], Any],
+) -> Any:
+    """
+    Force at most one tool call per model step across providers.
+
+    OpenAI: ``parallel_tool_calls=False`` on bind_tools.
+    Gemini and others: keep only the first tool call in the model response.
+
+    Args:
+        request: Model request about to invoke the LLM.
+        handler: Next middleware/model handler.
+
+    Returns:
+        ModelResponse | AIMessage | ExtendedModelResponse: Serial tool-call result.
+    """
+    adjusted = apply_serial_tool_call_request(request)
+    response = handler(adjusted)
+    return enforce_serial_tool_call_response(response)
 
 
 def model_breaker_key(provider: str, model_id: str) -> str:
@@ -357,6 +499,82 @@ def should_retry_agent_invoke(exc: Exception) -> bool:
     return should_fallback_to_next_model(exc)
 
 
+def is_provider_health_error(exc: Exception) -> bool:
+    """
+    Return True only for failures that indicate the provider/endpoint is unhealthy.
+
+    Circuit breakers must trip on provider-health signals (rate limits/quota,
+    timeouts, connection errors, 5xx) and ignore request-shaped or permanent
+    failures (recursion/tool loops, structured-output/JSON errors, output-length
+    limits, tool-protocol mismatches, context-length overflows, and invalid model
+    ids). Those are deterministic for the given input and must not blacklist a
+    healthy model for all other concurrent traffic.
+
+    Args:
+        exc: Raised exception from a model or agent invocation.
+
+    Returns:
+        bool: True when the failure reflects provider unhealthiness.
+    """
+    # Request-shaped or permanent errors are out of scope for health tracking.
+    if (
+        is_recursion_error(exc)
+        or is_structured_output_error(exc)
+        or is_length_limit_error(exc)
+        or is_tool_protocol_error(exc)
+        or is_model_unavailable_error(exc)
+    ):
+        return False
+
+    if is_resource_exhaustion_error(exc) or is_timeout_error(exc):
+        return True
+
+    health_markers: tuple[str, ...] = (
+        "connection",
+        "connect error",
+        "service unavailable",
+        "temporarily unavailable",
+        "internal server error",
+        "bad gateway",
+        "gateway timeout",
+        "overloaded",
+        "500",
+        "502",
+        "503",
+        "504",
+    )
+    for current in _iter_exception_chain(exc):
+        class_name: str = current.__class__.__name__.lower()
+        if "connecterror" in class_name or "connectionerror" in class_name:
+            return True
+        text: str = str(current).lower()
+        # Context-length overflow is request-shaped even though it is transient-looking.
+        if "context length" in text or "maximum context" in text or "reduce the length" in text:
+            continue
+        if any(marker in text for marker in health_markers):
+            return True
+    return False
+
+
+def record_breaker_outcome(breaker: Any, exc: Exception) -> None:
+    """
+    Record a failed attempt against a circuit breaker only when provider-unhealthy.
+
+    Request-shaped failures (recursion, structured output, length, tool protocol,
+    context length, invalid model) are left neutral: the breaker is neither
+    penalized nor reset, so one bad request cannot open a healthy model's circuit.
+
+    Args:
+        breaker: CircuitBreaker guarding the attempted model.
+        exc: Exception raised by the attempt.
+
+    Returns:
+        None
+    """
+    if is_provider_health_error(exc):
+        breaker.record_failure()
+
+
 def build_model_chain_from_spec(
     *,
     chain_spec: str,
@@ -643,6 +861,114 @@ class ModelChainRunner:
                     raise
         raise last_exc if last_exc is not None else RuntimeError(f"{operation}: chat chain empty")
 
+    def invoke_structured_output(
+        self,
+        *,
+        messages: Any,
+        schema: Any,
+        config: Optional[Any] = None,
+        operation: str = "structured",
+    ) -> Any:
+        """
+        Produce structured output across the model chain with no tools.
+
+        Binds ``schema`` via ``model.with_structured_output`` and invokes each model
+        in chain order with circuit breakers and full-chain retries. Because no tools
+        are bound and no agent graph is created, this call cannot recurse
+        (``GraphRecursionError`` is structurally impossible here).
+
+        Args:
+            messages: Message list or prompt input accepted by chat models.
+            schema: Pydantic model / schema for structured output.
+            config: Optional RunnableConfig for tracing.
+            operation: Label for logs.
+
+        Returns:
+            Any: Parsed structured output (instance of ``schema``).
+
+        Raises:
+            Exception: Last failure when all models and retries are exhausted.
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(self._max_retries + 1):
+            if attempt > 0:
+                logger.warning(
+                    "%s structured chain retry %s/%s; sleeping %.1fs",
+                    operation,
+                    attempt,
+                    self._max_retries,
+                    self._retry_delay_s,
+                )
+                time.sleep(self._retry_delay_s)
+            try:
+                return self._invoke_structured_once(
+                    messages=messages,
+                    schema=schema,
+                    config=config,
+                    operation=operation,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= self._max_retries or not should_fallback_to_next_model(exc):
+                    raise
+        raise last_exc if last_exc is not None else RuntimeError(
+            f"{operation}: structured chain empty"
+        )
+
+    def _invoke_structured_once(
+        self,
+        *,
+        messages: Any,
+        schema: Any,
+        config: Optional[Any],
+        operation: str,
+    ) -> Any:
+        """Walk the model chain once for a structured-output invoke."""
+        last_exc: Optional[Exception] = None
+        chain_len = len(self._model_chain)
+
+        for index, (name, model) in enumerate(self._model_chain):
+            role = "primary" if index == 0 else f"fallback#{index}"
+            is_last = index == chain_len - 1
+            breaker = self._breakers[name]
+
+            if not is_last and not breaker.allow():
+                logger.warning(
+                    "%s: model %s circuit OPEN (state=%s); skipping",
+                    operation,
+                    name,
+                    breaker.state,
+                )
+                self._record(name, False)
+                continue
+
+            try:
+                logger.info("%s: invoking structured model %s (%s)", operation, name, role)
+                structured_model = model.with_structured_output(schema)
+                if config is not None:
+                    response = structured_model.invoke(messages, config=config)
+                else:
+                    response = structured_model.invoke(messages)
+                breaker.record_success()
+                self._record(name, True)
+                return response
+            except Exception as exc:
+                last_exc = exc
+                record_breaker_outcome(breaker, exc)
+                self._record(name, False)
+                if is_last or not should_fallback_to_next_model(exc):
+                    raise
+                logger.warning(
+                    "%s: structured model %s failed (%s); falling back",
+                    operation,
+                    name,
+                    exc,
+                )
+
+        raise last_exc if last_exc is not None else RuntimeError(
+            f"{operation}: structured chain empty"
+        )
+
     def _invoke_chat_once(
         self,
         input: Any,
@@ -680,7 +1006,7 @@ class ModelChainRunner:
                 return response
             except Exception as exc:
                 last_exc = exc
-                breaker.record_failure()
+                record_breaker_outcome(breaker, exc)
                 self._record(name, False)
                 if is_last or not should_fallback_to_next_model(exc):
                     raise
@@ -733,7 +1059,7 @@ class ModelChainRunner:
 
             except Exception as exc:
                 last_exc = exc
-                breaker.record_failure()
+                record_breaker_outcome(breaker, exc)
                 self._record(name, False)
                 if is_last or not should_fallback_to_next_model(exc):
                     raise
@@ -794,7 +1120,7 @@ class ModelChainRunner:
                 return response if isinstance(response, dict) else {}
             except Exception as exc:
                 last_exc = exc
-                breaker.record_failure()
+                record_breaker_outcome(breaker, exc)
                 if is_last or not should_fallback_to_next_model(exc):
                     raise
                 logger.warning(

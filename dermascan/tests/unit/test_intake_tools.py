@@ -244,3 +244,18 @@ class TestIntakeTools:
         session_final = load_intake_session("client-combo", redis_client=fake_redis)
         assert session_final is not None
         assert session_final.phase == IntakePhase.AWAITING_AUDIT
+
+
+@pytest.mark.unit
+class TestAuditContextTruncation:
+    """MedGemma audit context budget helpers."""
+
+    def test_truncate_audit_context_short_text_unchanged(self) -> None:
+        text = "Service: skin. Primary concern: acne."
+        assert tools._truncate_audit_context(text, max_chars=800) == text
+
+    def test_truncate_audit_context_long_text_adds_suffix(self) -> None:
+        text = "x" * 1000
+        truncated = tools._truncate_audit_context(text, max_chars=100)
+        assert len(truncated) <= 100
+        assert truncated.endswith("[truncated for MedGemma context budget]")
