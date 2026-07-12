@@ -50,6 +50,7 @@ Thumbs.db
 *.txt
 llms.md
 claude_review.md
+grok_review.md
 audit.md
 test.py
 test2.py

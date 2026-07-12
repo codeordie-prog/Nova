@@ -77,8 +77,10 @@ from dermascan.backend.services.agents.model_fallback_chain import (
     build_chained_chat_model,
     build_model_chain_from_spec,
     is_recursion_error,
+    is_tool_protocol_error,
     orchestrator_model_chain_spec,
     serial_tool_calls_middleware,
+    should_retry_agent_invoke,
     summarization_model_chain_spec,
 )
 from dermascan.backend.services.agents.memory.redis_checkpointer import (
@@ -398,6 +400,19 @@ def _is_recursion_error(exc: Exception) -> bool:
     return is_recursion_error(exc)
 
 
+def _should_reset_checkpoint_on_agent_error(exc: Exception) -> bool:
+    """
+    Return True when an agent failure likely poisoned the LangGraph checkpoint.
+
+    Args:
+        exc: Raised exception from an agent invocation.
+
+    Returns:
+        bool: True when clearing the checkpoint before retry may recover.
+    """
+    return _is_recursion_error(exc) or is_tool_protocol_error(exc)
+
+
 def _invoke_agent_with_recursion_retry(
     *,
     agent: Any,
@@ -409,12 +424,17 @@ def _invoke_agent_with_recursion_retry(
     build_payload: Optional[Callable[[], dict[str, Any]]] = None,
 ) -> Any:
     """
-    Invoke the orchestrator agent with automatic retries on recursion-limit failures.
+    Invoke the orchestrator agent with automatic retries on recoverable failures.
 
-    Resets the client checkpoint between attempts when enabled so poisoned tool-loop
-    state does not carry into the next try. When ``build_payload`` is provided, the
-    payload is rebuilt on every attempt so a mid-turn checkpoint reset is picked up
-    as restored conversation context on the retried attempt.
+    Retries when ``should_retry_agent_invoke`` returns True (recursion limit,
+    orphaned tool calls, structured-output parse failures, length limits, and
+    model-chain fallover errors). For checkpoint-poisoning failures (recursion
+    and tool-protocol mismatches), clears the client checkpoint between attempts
+    when enabled so the next try starts from a clean LangGraph thread.
+
+    When ``build_payload`` is provided, the payload is rebuilt on every attempt
+    so post-reset context restoration (intake snapshot + conversation recap) is
+    injected into the retried turn.
 
     Args:
         agent: Orchestrator LangGraph agent.
@@ -432,8 +452,8 @@ def _invoke_agent_with_recursion_retry(
 
     Raises:
         ValueError: When neither ``payload`` nor ``build_payload`` is provided.
-        Exception: The last failure when retries are exhausted or the error is not
-            recursion-related.
+        Exception: The last failure when retries are exhausted or the error is
+            not retryable.
     """
     if payload is None and build_payload is None:
         raise ValueError("either payload or build_payload is required")
@@ -444,7 +464,7 @@ def _invoke_agent_with_recursion_retry(
     for attempt in range(max_attempts):
         if attempt > 0:
             logger.warning(
-                "orchestrator recursion retry %s/%s: client_id=%s request_id=%s flow=%s",
+                "orchestrator agent invoke retry %s/%s: client_id=%s request_id=%s flow=%s",
                 attempt,
                 ORCHESTRATOR_RECURSION_MAX_RETRIES,
                 client_id,
@@ -453,7 +473,11 @@ def _invoke_agent_with_recursion_retry(
             )
             if ORCHESTRATOR_RECURSION_RETRY_DELAY_S > 0:
                 time.sleep(ORCHESTRATOR_RECURSION_RETRY_DELAY_S)
-            if ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION:
+            if (
+                ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION
+                and last_exc is not None
+                and _should_reset_checkpoint_on_agent_error(last_exc)
+            ):
                 _reset_client_checkpoint(client_id)
 
         attempt_payload = build_payload() if build_payload is not None else payload
@@ -461,16 +485,24 @@ def _invoke_agent_with_recursion_retry(
             return agent.invoke(attempt_payload, config=config)
         except Exception as exc:
             last_exc = exc
-            if not _is_recursion_error(exc):
+            if not should_retry_agent_invoke(exc):
                 raise
             if attempt >= ORCHESTRATOR_RECURSION_MAX_RETRIES:
+                if (
+                    ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION
+                    and _should_reset_checkpoint_on_agent_error(exc)
+                ):
+                    _reset_client_checkpoint(client_id)
                 raise
             logger.warning(
-                "orchestrator recursion limit hit (attempt %s/%s): client_id=%s request_id=%s",
+                "orchestrator agent invoke failed (attempt %s/%s, will retry): "
+                "client_id=%s request_id=%s flow=%s error=%s",
                 attempt + 1,
                 max_attempts,
                 client_id,
                 request_id,
+                flow,
+                exc.__class__.__name__,
             )
 
     raise last_exc if last_exc is not None else RuntimeError("agent invoke failed")
@@ -1681,9 +1713,6 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
 
         agent_call_tracer.end_turn(status="failed", error=str(exc))
 
-        if ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION and _is_recursion_error(exc):
-            _reset_client_checkpoint(client_id)
-
         try:
             _enqueue_outbound(
                 client_id=client_id,
@@ -2121,8 +2150,6 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
     except Exception as exc:
         # Finalize the trace for this turn (no-op if already ended on success).
         agent_call_tracer.end_turn(status="failed", error=str(exc))
-        if ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION and _is_recursion_error(exc):
-            _reset_client_checkpoint(client_id)
         _redis.xadd(
             ORCHESTRATOR_SIGNAL_DLQ_STREAM,
             {
