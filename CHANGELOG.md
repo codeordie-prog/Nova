@@ -415,3 +415,42 @@ keys is also still pending; they remain in git history.)
 - **Escalation dashboard image 404s for old cases**: `/v1/escalations/{case_id}/image` resolves
   the blob via `escalation:image_path:{case_id}` in Redis; once that key is gone (expiry/flush),
   the dashboard still lists the case from its own Postgres but Nova can no longer serve the image.
+
+---
+
+## 2026-07-12 — Orchestrator agent invoke retry for poisoned checkpoints
+
+**Symptom.** A client thread could get stuck in a permanent failure loop after a prior turn left
+an orphaned `tool_calls` entry in the LangGraph checkpoint. The next `agent.invoke` raised
+`openai.BadRequestError` ("An assistant message with 'tool_calls' must be followed by tool
+messages…"). The worker logged the error and moved on, but the poisoned checkpoint was never
+cleared in the same turn — so every subsequent message for that client failed the same way.
+
+**Root cause.** `_invoke_agent_with_recursion_retry` only retried on recursion-limit errors.
+Tool-protocol mismatches, structured-output parse failures, and other recoverable invoke errors
+were not retried. Checkpoint reset ran only in outer `except` handlers *after* a failed invoke,
+with no same-turn retry to recover.
+
+**Fix.**
+- `should_retry_agent_invoke()` in `model_fallback_chain.py` centralizes retry eligibility:
+  recursion limit, orphaned tool calls / tool-protocol errors, structured-output failures,
+  length-limit errors, and model-chain fallover errors. Permanent failures
+  (`is_model_unavailable_error`) are not retried.
+- `_invoke_agent_with_recursion_retry` in `orchestrator_worker.py` now retries whenever
+  `should_retry_agent_invoke` returns True (job and signal flows).
+- New `_should_reset_checkpoint_on_agent_error()` clears the LangGraph thread before each retry
+  (and on final exhausted retry) for checkpoint-poisoning failures: recursion errors and
+  tool-protocol mismatches. Controlled by existing env vars
+  `ORCHESTRATOR_RESET_CHECKPOINT_ON_RECURSION`, `ORCHESTRATOR_RECURSION_MAX_RETRIES`,
+  `ORCHESTRATOR_RECURSION_RETRY_DELAY_S`.
+- Job-flow retries rebuild the invoke payload via `build_payload()` so intake snapshot and
+  conversation recap are re-injected after a checkpoint reset.
+- Removed a duplicate, overly-broad `is_tool_protocol_error` definition in
+  `model_fallback_chain.py` that matched every `BadRequestError` instead of tool-protocol
+  markers only.
+- Duplicate checkpoint resets in outer job/signal `except` handlers removed — reset is now
+  owned by the invoke retry path.
+
+**Operational note.** Restart the orchestrator worker after deploy so the new retry/reset logic
+is active. Affected clients may still need a one-time manual checkpoint reset if they were stuck
+before this fix (`dermascan/scripts/reset_checkpoint.py`).
