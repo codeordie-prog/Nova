@@ -170,7 +170,7 @@ def _resolve_image_blob_path(payload: dict[str, Any]) -> str:
         try:
             return extract_blob_path_from_url(source_value)
         except ValueError:
-            return source_value
+            return ""
     return source_value
 
 

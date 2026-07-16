@@ -1,4 +1,9 @@
-"""Escalation worker: consume escalation:jobs, enrich, relay to dermatologist platform."""
+"""
+Author: Dermascan Team
+Date: 2026-07-16
+License: MIT
+Description:
+Escalation worker: consume escalation:jobs, enrich, relay to dermatologist platform."""
 
 from __future__ import annotations
 
@@ -18,6 +23,10 @@ from pydantic import BaseModel
 
 from dermascan.backend.services.agents import reclaim_logic
 from dermascan.ai_service.postprocessing.escalation import ESCALATION_DEFERRED_CLIENT_MESSAGE
+from dermascan.shared.escalation_image import (
+    cache_escalation_image_path,
+    resolve_escalation_image_blob_path,
+)
 from dermascan.shared.hmac_auth import SIGNATURE_HEADER, TIMESTAMP_HEADER, signature_header
 from dermascan.shared.logger import get_logger
 from dermascan.shared.redis_stability import (
@@ -256,11 +265,18 @@ def _cache_signal_payload(job: EscalationJobPayload, payload: dict[str, Any]) ->
         SIGNAL_PAYLOAD_TTL_SEC,
         json.dumps(enriched, default=str),
     )
-    if job.image_blob_path:
-        _redis.setex(
-            f"escalation:image_path:{job.case_id}",
-            IMAGE_PATH_TTL_SEC,
-            job.image_blob_path,
+    resolved_image_path = resolve_escalation_image_blob_path(
+        _redis,
+        image_blob_path=job.image_blob_path,
+        request_id=job.request_id,
+        case_id=job.case_id,
+    )
+    if resolved_image_path:
+        cache_escalation_image_path(
+            _redis,
+            case_id=job.case_id,
+            blob_path=resolved_image_path,
+            ttl_sec=IMAGE_PATH_TTL_SEC,
         )
     _redis.delete(f"escalation:closed:{job.case_id}")
     return enriched

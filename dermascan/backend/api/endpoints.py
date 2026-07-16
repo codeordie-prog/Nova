@@ -35,6 +35,10 @@ from dermascan.backend.api.group_media_helper import (
     enrich_payload_with_group_metadata,
     wait_for_media_batch_quiet,
 )
+from dermascan.shared.escalation_image import (
+    cache_escalation_image_path,
+    resolve_escalation_image_blob_path,
+)
 from dermascan.shared.firebase_storage import upload_client_image, download_client_image_bytes_by_path
 from dermascan.shared.global_rate_limiter import _enforce_global_rate_limit
 from dermascan.shared.hmac_auth import SIGNATURE_HEADER, TIMESTAMP_HEADER, verify as verify_hmac
@@ -1092,6 +1096,21 @@ async def escalation_case_image_proxy(case_id: str, request: Request) -> Respons
         raise HTTPException(status_code=410, detail="case review closed")
 
     blob_path = redis_client.get(f"escalation:image_path:{case_id}")
+    if blob_path and not str(blob_path).startswith("client-media/"):
+        blob_path = None
+    if not blob_path:
+        blob_path = resolve_escalation_image_blob_path(
+            redis_client,
+            image_blob_path="",
+            request_id=case_id,
+            case_id=case_id,
+        )
+        if blob_path:
+            cache_escalation_image_path(
+                redis_client,
+                case_id=case_id,
+                blob_path=str(blob_path),
+            )
     if not blob_path:
         raise HTTPException(status_code=404, detail="image not found")
 
