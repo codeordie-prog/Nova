@@ -9,7 +9,7 @@ Model loads once per container in `@enter`. Inference runs in `run`.
 Use `modal run app.py` from the project root (where pyproject.toml lives).
 
 Documentation for the inference parameter configurations is provided in:
-`dermascan\ai_services\docs\inference.md`
+dermascan/ai_service/docs/inference.md
 """
 
 import base64
@@ -79,6 +79,11 @@ app: modal.App = modal.App("medgemma-service")
 
 # Logger initialization
 log: logging.Logger = get_logger(__name__)
+
+# 27B weight load on 2x L40S routinely exceeds Modal/vLLM default 300s startup budgets.
+_VLLM_STARTUP_TIMEOUT_S: float = float(os.environ.get("VLLM_STARTUP_TIMEOUT_S", "1200"))
+_CLS_STARTUP_TIMEOUT_S: int = int(_VLLM_STARTUP_TIMEOUT_S) + 120
+_CLS_TIMEOUT_S: int = int(_VLLM_STARTUP_TIMEOUT_S) + 300
 
 # System prompt to force structured JSON output for diagnosis/product review responses
 _STRUCTURED_SYSTEM_PROMPT: str = (
@@ -169,12 +174,14 @@ _STRUCTURED_SYSTEM_PROMPT: str = (
 )
 # Create class for MedGemma service, runs on A10G/L4 GPU with specified image and secrets
 @app.cls(
-    gpu="A10G",
+    gpu="L40S:2",
     image=image,
     secrets=[hf_secret],
     max_containers=1,
     min_containers=1,
     scaledown_window=600,
+    timeout=_CLS_TIMEOUT_S,
+    startup_timeout=_CLS_STARTUP_TIMEOUT_S,
     # Image already mounts dermascan via add_local_python_source (.py only).
     # Default include_source=True would auto-mount the whole package tree,
     # including frontend node_modules (~40k+ files) and block startup for hours.
@@ -251,6 +258,7 @@ class MedGemmaService:
         max_model_len: int = self.cfg.max_model_len
         max_num_seqs: int = self.cfg.max_num_seqs
         max_num_batched_tokens: int = self.cfg.max_num_batched_tokens
+        tensor_parallel_size: int = self.cfg.tensor_parallel_size
 
         # Build command - vLLM server
         cmd: list[str] = [
@@ -271,38 +279,53 @@ class MedGemmaService:
             str(max_num_seqs),
             "--max-num-batched-tokens",
             str(max_num_batched_tokens),
+            "--tensor-parallel-size",
+            str(tensor_parallel_size),
         ]
+
+        log.info(
+            "Starting vLLM subprocess: model_id=%s, tensor_parallel_size=%s, startup_timeout_s=%s",
+            model_id,
+            tensor_parallel_size,
+            _VLLM_STARTUP_TIMEOUT_S,
+        )
+        log.info("vLLM command: %s", " ".join(cmd))
 
         # Set environment variables
         env = os.environ.copy()
         if hf_token:
             env["HF_TOKEN"] = hf_token
+            env.setdefault("HUGGINGFACE_HUB_TOKEN", hf_token)
 
-        # Start vLLM process, capture output, and set environment variables
+        # Inherit stdout/stderr so vLLM logs stream to Modal and the pipe cannot deadlock.
         self._vllm_proc: subprocess.Popen[str] = subprocess.Popen(
             cmd,
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
         )
 
         # Wait for vLLM to start
-        deadline_s: float = float(os.environ.get("VLLM_STARTUP_TIMEOUT_S", "300"))
+        deadline_s: float = _VLLM_STARTUP_TIMEOUT_S
         start: float = time.time()
         last_err: Exception | None = None
+        next_progress_log_s: float = start + 30.0
         while time.time() - start < deadline_s:
 
             # Check if process has exited
             if self._vllm_proc.poll() is not None:
-                out: str = ""
-                try:
-                    # Read last 5000 characters of output
-                    if self._vllm_proc.stdout is not None:
-                        out = self._vllm_proc.stdout.read()[-5000:]
-                except Exception:
-                    pass
-                raise RuntimeError(f"vLLM server exited during startup. Output:\n{out}")
+                raise RuntimeError(
+                    "vLLM server exited during startup. "
+                    "Check Modal container logs above for vLLM stderr/stdout."
+                )
+
+            if time.time() >= next_progress_log_s:
+                elapsed_s: float = time.time() - start
+                log.info(
+                    "Still waiting for vLLM readiness: elapsed_s=%.0f, deadline_s=%.0f, pid=%s",
+                    elapsed_s,
+                    deadline_s,
+                    self._vllm_proc.pid,
+                )
+                next_progress_log_s += 30.0
 
             try:
                 # Check if vLLM server is ready
@@ -311,11 +334,14 @@ class MedGemmaService:
                     log.info("vLLM server ready: base_url=%s, model_id=%s", self._vllm_base_url, model_id)
                     return
             except Exception as e:
-                last_err: Exception = e
+                last_err = e
 
             time.sleep(1.0)
 
-        raise RuntimeError(f"Timed out waiting for vLLM server to start: {last_err}")
+        raise RuntimeError(
+            f"Timed out waiting for vLLM server to start after {deadline_s:.0f}s: {last_err}. "
+            "Check Modal container logs for vLLM download/load errors."
+        )
 
     # Decode image bytes to PIL Image
     def _decode_image_bytes(self, image_bytes: bytes) -> Image.Image:
