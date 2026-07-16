@@ -41,6 +41,7 @@ class _ModelConfigDict(TypedDict):
     max_model_len: int
     max_num_seqs: int
     max_num_batched_tokens: int
+    tensor_parallel_size: int
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,8 @@ class ModelConfig:
             (e.g. ``24``).
         max_num_batched_tokens: Maximum number of tokens that can be batched
             (e.g. ``8192``).
+        tensor_parallel_size: Number of GPUs vLLM shards the model across
+            (must match Modal ``gpu`` count, e.g. ``2`` for ``L40S:2``).
     """
 
     model_id: str
@@ -86,6 +89,7 @@ class ModelConfig:
     max_model_len: int
     max_num_seqs: int
     max_num_batched_tokens: int
+    tensor_parallel_size: int
 
 # Create a fallback default configs
 DEFAULT_CONFIGS: Final["ModelConfig"] = ModelConfig(
@@ -100,6 +104,7 @@ DEFAULT_CONFIGS: Final["ModelConfig"] = ModelConfig(
     max_model_len=2048,
     max_num_seqs=24,
     max_num_batched_tokens=8192,
+    tensor_parallel_size=2,
 )
 
 def load_config(path: Path | None = None) -> ModelConfig:
@@ -142,6 +147,7 @@ def load_config(path: Path | None = None) -> ModelConfig:
             max_model_len=int(data["max_model_len"]),
             max_num_seqs=int(data["max_num_seqs"]),
             max_num_batched_tokens=int(data["max_num_batched_tokens"]),
+            tensor_parallel_size=int(data.get("tensor_parallel_size", 1)),
         )
 
         _log.info(
