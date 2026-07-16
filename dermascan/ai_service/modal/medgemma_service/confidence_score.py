@@ -143,10 +143,15 @@ def compute_confidence_score(data: dict) -> float:
         return 0.0
 
     # Compute mean logprob over the diagnosis span
-    mean_logprob = sum(span_logprobs) / len(span_logprobs)
+    #mean_logprob = sum(span_logprobs) / len(span_logprobs)
 
     # Convert logprob to probability
-    confidence = math.exp(mean_logprob)
+    #confidence = math.exp(mean_logprob)
+
+    m = len(span_logprobs)
+    from math import prod
+    geometric_mean = prod(math.exp(lp) for lp in span_logprobs) ** (1/m)
+    confidence = geometric_mean 
 
     # Clamp to [0,1]
     return max(0.0, min(1.0, confidence))
