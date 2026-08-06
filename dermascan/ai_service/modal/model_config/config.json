@@ -1,5 +1,5 @@
 {
-    "model_id": "google/medgemma-27b-it",
+    "model_id": "google/medgemma-1.5-4b-it",
     "task": "vision-text-generation",
     "max_new_tokens": 512,
     "temperature": 0.0,

@@ -80,7 +80,7 @@ app: modal.App = modal.App("medgemma-service")
 # Logger initialization
 log: logging.Logger = get_logger(__name__)
 
-# 27B weight load on 2x L40S routinely exceeds Modal/vLLM default 300s startup budgets.
+# MedGemma 4B on a single L4 can still exceed Modal/vLLM default 300s startup budgets during cold start.
 _VLLM_STARTUP_TIMEOUT_S: float = float(os.environ.get("VLLM_STARTUP_TIMEOUT_S", "1200"))
 _CLS_STARTUP_TIMEOUT_S: int = int(_VLLM_STARTUP_TIMEOUT_S) + 120
 _CLS_TIMEOUT_S: int = int(_VLLM_STARTUP_TIMEOUT_S) + 300
@@ -172,9 +172,9 @@ _STRUCTURED_SYSTEM_PROMPT: str = (
     "- For skin/hybrid reviews with insufficient evidence, use diagnosis='uncertain' instead of forcing a label.\n"
     "- Keep all values concise.\n"
 )
-# Create class for MedGemma service, runs on A10G/L4 GPU with specified image and secrets
+# Create class for MedGemma service, runs on L4 GPU with specified image and secrets
 @app.cls(
-    gpu="L40S:2",
+    gpu="L4",
     image=image,
     secrets=[hf_secret],
     max_containers=1,
@@ -258,9 +258,8 @@ class MedGemmaService:
         max_model_len: int = self.cfg.max_model_len
         max_num_seqs: int = self.cfg.max_num_seqs
         max_num_batched_tokens: int = self.cfg.max_num_batched_tokens
-        tensor_parallel_size: int = self.cfg.tensor_parallel_size
 
-        # Build command - vLLM server
+        # Build command - vLLM server (single-GPU; tensor_parallel_size kept in config for future use)
         cmd: list[str] = [
             "python",
             "-m",
@@ -279,14 +278,11 @@ class MedGemmaService:
             str(max_num_seqs),
             "--max-num-batched-tokens",
             str(max_num_batched_tokens),
-            "--tensor-parallel-size",
-            str(tensor_parallel_size),
         ]
 
         log.info(
-            "Starting vLLM subprocess: model_id=%s, tensor_parallel_size=%s, startup_timeout_s=%s",
+            "Starting vLLM subprocess: model_id=%s, gpu=L4, startup_timeout_s=%s",
             model_id,
-            tensor_parallel_size,
             _VLLM_STARTUP_TIMEOUT_S,
         )
         log.info("vLLM command: %s", " ".join(cmd))

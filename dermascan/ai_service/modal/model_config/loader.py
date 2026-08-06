@@ -74,8 +74,8 @@ class ModelConfig:
             (e.g. ``24``).
         max_num_batched_tokens: Maximum number of tokens that can be batched
             (e.g. ``8192``).
-        tensor_parallel_size: Number of GPUs vLLM shards the model across
-            (must match Modal ``gpu`` count, e.g. ``2`` for ``L40S:2``).
+        tensor_parallel_size: Reserved for future multi-GPU deployments; not passed to vLLM
+            for the 4B single-GPU (L4) setup.
     """
 
     model_id: str
