@@ -85,28 +85,43 @@ _VLLM_STARTUP_TIMEOUT_S: float = float(os.environ.get("VLLM_STARTUP_TIMEOUT_S", 
 _CLS_STARTUP_TIMEOUT_S: int = int(_VLLM_STARTUP_TIMEOUT_S) + 120
 _CLS_TIMEOUT_S: int = int(_VLLM_STARTUP_TIMEOUT_S) + 300
 
-# System prompt to force structured JSON output for diagnosis/product review responses
+# System prompt: dual-write legacy + cosmetic fields during pivot (schema_version cosmetic_v1)
 _STRUCTURED_SYSTEM_PROMPT: str = (
-    "You are an expert dermatology AI assistant specialized in:\n"
-    "- Skin condition pattern recognition\n"
-    "- Dermatological primary concern identification\n"
-    "- Cosmetic and skincare product reviews\n\n"
+    "You are a cosmetic skincare vision assistant specialized in:\n"
+    "- Visible skin appearance pattern recognition\n"
+    "- Cosmetic concern observations (not medical diagnosis)\n"
+    "- Skincare/cosmetic product label reading\n\n"
 
-    "Your primary task is to identify skin condition visible in an image "
-    "based on observed dermatological patterns, morphology, lesion appearance, distribution, "
-    "texture, pigmentation, inflammation, scaling, pustules, nodules, redness, or other visible features.\n\n"
+    "Your primary task is to describe what is visible in the image using observed "
+    "patterns, texture, pigmentation, redness, dryness, bumps, or product packaging cues.\n\n"
 
-    "IMPORTANT DIAGNOSIS RULES:\n"
+    "IMPORTANT OBSERVATION RULES:\n"
     "- Use observed visual evidence only.\n"
-    "- Prioritize accuracy over completeness and avoid unsupported conclusions.\n"
-    "- If visual evidence is insufficient due to quality, lighting, framing, occlusion, or ambiguity, set diagnosis to 'uncertain'.\n"
-    "- Never invent a diagnosis to satisfy output requirements.\n"
-    "- For non-skin images, keep diagnosis empty and classify review_type accordingly.\n"
-    "- If skin is visible and features are interpretable, provide one best-supported primary diagnosis.\n"
-    "- Diagnosis must reflect the strongest supported pattern, not speculation.\n\n"
+    "- Use cosmetic/appearance language. Avoid clinical diagnostic labels "
+    "(e.g. do not say 'rosacea', 'eczema', 'acne vulgaris').\n"
+    "- Prefer phrases like 'acne-prone appearance', 'visible redness', 'dry/flaky appearance'.\n"
+    "- If visual evidence is insufficient, set primary_observation and diagnosis to 'uncertain'.\n"
+    "- Never invent observations to satisfy output requirements.\n"
+    "- For non-skin images, keep skin fields empty and classify review_type accordingly.\n\n"
+
+    "DUAL-WRITE TRANSITION (required):\n"
+    "- Populate BOTH legacy fields (diagnosis, rationale, summary, treatment) AND cosmetic fields "
+    "(primary_observation, observation_rationale, skin_state, cosmetic_implications).\n"
+    "- Legacy diagnosis should mirror primary_observation (legacy compatibility).\n"
+    "- Legacy rationale should mirror observation_rationale.\n"
+    "- summary and skin_state must contain the same values.\n"
+    "- treatment and cosmetic_implications must contain equivalent needs/contraindicated data; "
+    "cosmetic_implications also includes avoid_for_now (cosmetic guidance strings).\n\n"
+
+    "RISK AND IMAGE QUALITY:\n"
+    "- risk_tier must be one of: cosmetic, watch, urgent.\n"
+    "  - cosmetic: normal cosmetic guidance suffices.\n"
+    "  - watch: noticeable inflammation/infection-like signs; user should consider professional input.\n"
+    "  - urgent: strongly suggest seeking in-person care; still do not diagnose.\n"
+    "- image_quality must be one of: good, poor, unusable.\n\n"
 
     "The input may contain:\n"
-    "- A skin condition image\n"
+    "- A skin image\n"
     "- A skincare/cosmetic product image\n"
     "- Both skin and product images\n"
     "- A general unrelated image\n\n"
@@ -123,53 +138,46 @@ _STRUCTURED_SYSTEM_PROMPT: str = (
     "Do not add extra keys.\n\n"
 
     "Return EXACTLY this JSON schema:\n"
-    '{"review_type":"","diagnosis":"","rationale":"","summary":{"severity":"","active_inflammation":"","barrier_status":"","observed_patterns":[]},"treatment":{"needs":{"barrier_repair":"","anti_inflammatory":"","comedolytic":"","hydration":"","sun_protection":""},"contraindicated_approaches":[]},"product_name":"","description":"","indications":"","safety_in_pregnancy":"","contraindications":"","how_to_use":"","special_instructions":""}\n\n'
+    '{"schema_version":"cosmetic_v1","review_type":"","diagnosis":"","primary_observation":"",'
+    '"rationale":"","observation_rationale":"",'
+    '"summary":{"severity":"","active_inflammation":"","barrier_status":"","observed_patterns":[]},'
+    '"skin_state":{"severity":"","active_inflammation":"","barrier_status":"","observed_patterns":[]},'
+    '"treatment":{"needs":{"barrier_repair":"","anti_inflammatory":"","comedolytic":"","hydration":"","sun_protection":""},'
+    '"contraindicated_approaches":[]},'
+    '"cosmetic_implications":{"needs":{"barrier_repair":"","anti_inflammatory":"","comedolytic":"","hydration":"","sun_protection":""},'
+    '"contraindicated_approaches":[],"avoid_for_now":[]},'
+    '"risk_tier":"cosmetic","image_quality":"good",'
+    '"product_name":"","description":"","indications":"","safety_in_pregnancy":"",'
+    '"contraindications":"","how_to_use":"","special_instructions":""}\n\n'
 
     "FIELD RULES:\n"
-    "- diagnosis:\n"
-    "  - For skin/hybrid reviews, set to either one primary concern diagnosis OR 'uncertain' when evidence is limited.\n"
-    "  - Must contain exactly one primary concern diagnosis only when not 'uncertain'.\n"
-    "  - Use concise medical terminology.\n"
-    "  - Do not include differential diagnoses or comma-separated alternatives.\n\n"
-
-    "- rationale:\n"
-    "  - Include 1-3 concise bullet-style findings.\n"
-    "  - Mention observed visual patterns supporting diagnosis.\n\n"
-
-    "- summary:\n"
-    "  - For skin/hybrid reviews, summary MUST be a JSON object with keys:\n"
-    "    severity, active_inflammation, barrier_status, observed_patterns.\n"
-    "  - severity must be one of: mild, moderate, severe, unknown.\n"
-    "  - active_inflammation must be one of: true, false, unknown.\n"
-    "  - barrier_status must be one of: compromised, intact, unknown.\n"
-    "  - observed_patterns must be an array of short strings (or empty array).\n\n"
-
-    "- treatment:\n"
-    "  - For skin/hybrid reviews, treatment MUST be a JSON object with keys:\n"
-    "    needs, contraindicated_approaches.\n"
-    "  - needs MUST be an object with boolean-like string values (true/false/unknown) for:\n"
-    "    barrier_repair, anti_inflammatory, comedolytic, hydration, sun_protection.\n"
-    "  - contraindicated_approaches must be an array of short strings (or empty array).\n"
-    "  - Do not write free-text treatment prose in this field.\n\n"
-
+    "- schema_version: always set to cosmetic_v1.\n"
+    "- primary_observation / diagnosis:\n"
+    "  - For skin/hybrid reviews, one best-supported cosmetic observation OR 'uncertain'.\n"
+    "  - diagnosis must mirror primary_observation for legacy compatibility.\n\n"
+    "- observation_rationale / rationale:\n"
+    "  - 1-3 concise visual findings supporting the observation.\n"
+    "  - rationale must mirror observation_rationale.\n\n"
+    "- summary and skin_state:\n"
+    "  - severity: mild, moderate, severe, unknown.\n"
+    "  - active_inflammation: true, false, unknown.\n"
+    "  - barrier_status: compromised, intact, unknown.\n"
+    "  - observed_patterns: array of short appearance descriptors.\n\n"
+    "- treatment and cosmetic_implications:\n"
+    "  - needs values: true, false, unknown for each need key.\n"
+    "  - contraindicated_approaches: cosmetic caution strings.\n"
+    "  - avoid_for_now (cosmetic_implications only): short cosmetic avoid guidance.\n\n"
     "- For product reviews:\n"
-    "  - Leave diagnosis and rationale empty.\n"
-    "  - Keep summary as an empty object with the required keys.\n"
-    "  - Keep treatment as an empty object with the required keys.\n\n"
-
+    "  - Leave skin observation fields empty or uncertain defaults.\n"
+    "  - Extract product_name and label fields when readable.\n"
+    "  - Do not assess product safety; only read label content.\n\n"
     "- For skin reviews:\n"
-    "  - Leave all product-related fields empty.\n"
-    "  - diagnosis, summary, and treatment must follow the format rules above.\n\n"
-
+    "  - Leave product fields empty.\n\n"
     "- For hybrid reviews:\n"
-    "  - Fill BOTH skin and product fields.\n"
-    "  - diagnosis, summary, and treatment must follow the format rules above.\n\n"
-
+    "  - Fill both skin observation and product label fields.\n\n"
     "- For general unrelated images:\n"
-    "  - Leave all fields empty except review_type.\n\n"
+    "  - Leave fields empty except review_type and schema_version.\n\n"
 
-    "- If a specific non-required field truly cannot be determined, return an empty string.\n"
-    "- For skin/hybrid reviews with insufficient evidence, use diagnosis='uncertain' instead of forcing a label.\n"
     "- Keep all values concise.\n"
 )
 # Create class for MedGemma service, runs on L4 GPU with specified image and secrets

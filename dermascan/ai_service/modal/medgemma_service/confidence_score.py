@@ -26,6 +26,10 @@ import json
 import math
 from typing import Any
 
+from dermascan.ai_service.postprocessing.medgemma_structured_output import (
+    resolve_confidence_span_target,
+)
+
 
 _PRODUCT_CONFIDENCE_FIELDS: tuple[str, ...] = (
     "product_name",
@@ -87,15 +91,17 @@ def compute_confidence_score(data: dict) -> float:
         return 0.0
     choice = choices[0]
 
-    # Parse the JSON content to get the diagnosis text
-    diagnosis_text = ""
+    # Parse the JSON content to get the confidence span target text.
+    span_text = ""
+    span_field = ""
     parsed: dict[str, Any] = {}
     content = (choice.get("message") or {}).get("content") or ""
     try:
         parsed = json.loads(content)
-        diagnosis_text = str(parsed.get("diagnosis") or "").strip()
+        span_text, span_field = resolve_confidence_span_target(parsed)
     except Exception:
-        diagnosis_text = ""
+        span_text = ""
+        span_field = ""
         parsed = {}
 
     # Extract logprobs
@@ -111,15 +117,13 @@ def compute_confidence_score(data: dict) -> float:
 
     # Find the target field spans in the emitted text
     span_logprobs: list[float] = []
-    if diagnosis_text:
-        start_search = full_text.find("\"diagnosis\"")
-        start_idx = full_text.find(diagnosis_text, start_search if start_search != -1 else 0)
+    if span_text and span_field:
+        start_search = full_text.find(f"\"{span_field}\"")
+        start_idx = full_text.find(span_text, start_search if start_search != -1 else 0)
         if start_idx != -1:
-            end_idx = start_idx + len(diagnosis_text)
-
-            # Extract the logprobs that overlap with the diagnosis text
+            end_idx = start_idx + len(span_text)
             span_logprobs = _tokens_for_span(tokens, full_text, start_idx, end_idx)
-    else:
+    elif not span_text:
         # Product-review case: diagnosis is intentionally empty.
         # Build confidence from product_name + how_to_use + safety_in_pregnancy spans.
         for field_name in _PRODUCT_CONFIDENCE_FIELDS:
