@@ -29,6 +29,7 @@ import redis
 from dermascan.backend.services.tools.orchestrator.orchestrator_tools import (
     cache_ingress_payload,
     compute_intake_guidance,
+    continue_product_review_after_skin_prerequisite,
     ensure_ready_intake_dispatched,
     orchestrator_tools,
     internet_search,
@@ -43,6 +44,7 @@ from dermascan.backend.services.agents.product_rules_signal_helper import (
     run_product_signal_rules_flow,
     run_skin_signal_rules_flow,
 )
+from dermascan.ai_service.postprocessing.consent_escalation import append_escalation_offer_to_reply
 from dermascan.ai_service.postprocessing.escalation import resolve_client_message_for_signal
 from dermascan.backend.services.agents.group_report_aggregator import (
     collect_and_compile_if_ready,
@@ -664,13 +666,24 @@ def _append_proactive_log(client_id: str, entry: dict[str, Any]) -> None:
         logger.exception("failed to append proactive log: client_id=%s", client_id)
 
 
-def _finalize_intake_after_delivery(case_id: str, client_id: str) -> None:
+def _finalize_intake_after_delivery(
+    case_id: str,
+    client_id: str,
+    *,
+    signal_type: str = "",
+    request_id: str = "",
+) -> None:
     """
     Mark intake delivered and clear the active worksheet after outbound report.
+
+    When a skin prerequisite was queued for a deferred product review, chain the
+    product audit instead of clearing the worksheet on skin delivery.
 
     Args:
         case_id: Case identifier from the signal envelope.
         client_id: Client identifier from the signal envelope.
+        signal_type: Completed signal type (used to detect skin prerequisite completion).
+        request_id: Request identifier from the signal envelope.
     """
     cid = str(client_id or "anonymous").strip() or "anonymous"
     case = str(case_id or "").strip()
@@ -679,6 +692,25 @@ def _finalize_intake_after_delivery(case_id: str, client_id: str) -> None:
         session = load_intake_session(cid, redis_client=_redis)
     if session is None:
         return
+
+    normalized_signal = str(signal_type or "").strip().lower()
+    if session.pending_product_after_skin and (
+        normalized_signal.startswith("skin_") or normalized_signal.startswith("diagnose_")
+    ):
+        try:
+            continue_product_review_after_skin_prerequisite(
+                cid,
+                case,
+                request_id=request_id,
+            )
+        except Exception:
+            logger.exception(
+                "failed to auto-chain product after skin prerequisite: case_id=%s client_id=%s",
+                case,
+                cid,
+            )
+        return
+
     try:
         archive_intake_session(session, redis_client=_redis, delete_active=True)
     except IntakeSessionStoreError:
@@ -2031,6 +2063,8 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             sources_text = "\n".join(str(item) for item in sources if str(item).strip())
             primary_text = friendly_report or summary
             reply = primary_text if not sources_text else f"{primary_text}\n\nSources:\n{sources_text}"
+            if payload_obj.get("escalation_offer"):
+                reply = append_escalation_offer_to_reply(reply)
         else:
             # Read recent conversations first and build an input for the signal
             conversation_entries = _read_conversation_log(client_id, CONVERSATION_LOG_INCLUDE_N)
@@ -2124,7 +2158,12 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             threshold=signal_threshold or None,
         )
 
-        _finalize_intake_after_delivery(case_id, client_id)
+        _finalize_intake_after_delivery(
+            case_id,
+            client_id,
+            signal_type=signal_type,
+            request_id=request_id,
+        )
 
         # Persist a compact record of the proactive message so the next user
         # turn (job flow) can see what was already sent. Best-effort.
