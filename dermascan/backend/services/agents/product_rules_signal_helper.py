@@ -19,6 +19,7 @@ from langchain.tools import tool
 from pydantic import BaseModel, Field
 from tavily import TavilyClient
 
+from dermascan.ai_service.postprocessing.medgemma_structured_output import resolve_skin_observation_text
 from dermascan.backend.services.agents.model_fallback_chain import (
     AGENT_INVOKE_MAX_RETRIES,
     AGENT_INVOKE_RETRY_DELAY_S,
@@ -29,8 +30,25 @@ from dermascan.backend.services.agents.model_fallback_chain import (
     report_model_chain_spec,
     serial_tool_calls_middleware,
 )
-from dermascan.rules_engine.engine.engine import RulesEngineRequest, SkinContext
+from dermascan.rules_engine.confidence.decision_confidence import (
+    GuidanceMode,
+    finalize_product_report_text,
+    product_report_guidance_mode_instructions,
+)
+from dermascan.rules_engine.engine.engine import RulesEngineRequest, SkinAudit, SkinContext
 from dermascan.rules_engine.engine.rules_engine import RulesEngine
+from dermascan.shared.cosmetic_feature_flags import cosmetic_guidance_mode_active
+from dermascan.shared.cosmetic_profile import (
+    is_skin_snapshot_fresh,
+    resolve_product_personalization_mode,
+)
+from dermascan.shared.cosmetic_types import (
+    GENERIC_PRODUCT_REPORT_DISCLAIMER,
+    PROFILE_ONLY_PRODUCT_REPORT_DISCLAIMER,
+    PersonalizationMode,
+    normalize_personalization_mode,
+    product_report_personalization_guidance,
+)
 from dermascan.shared.logger import get_logger
 from dermascan.shared.langsmith_observability import (
     build_invoke_config,
@@ -47,7 +65,11 @@ from dermascan.shared.delivery_context import (
     load_delivery_context,
     merge_profile_into_skin_audit,
 )
-from dermascan.shared.redis_stability import get_redis_client, run_with_redis_retries
+from dermascan.shared.skin_audit_store import (
+    load_latest_skin_audit,
+    parse_signal_confidence,
+    persist_skin_audit_snapshot,
+)
 from langchain_core.runnables import RunnableConfig
 
 # Load env variables
@@ -71,7 +93,6 @@ GOOGLE_PROJECT_ID = str(
     or os.getenv("GOOGLE_PROJECT_ID_QUTIS", "qutisai")
 )
 GOOGLE_LOCATION = str(os.getenv("GOOGLE_CLOUD_LOCATION", "global"))
-_SKIN_AUDIT_KEY_TEMPLATE = "skin_profile:{client_id}"
 _REPORT_MAX_SOURCES = max(1, int(os.getenv("SIGNAL_RULES_MAX_SOURCES", "2")))
 _FINAL_REPORT_MAX_SENTENCES = max(3, int(os.getenv("SIGNAL_RULES_MAX_SENTENCES", "5")))
 REPORT_AGENT_RECURSION_LIMIT: int = max(
@@ -336,54 +357,9 @@ def _safe_json_loads(raw: str) -> dict[str, Any]:
         return {}
 
 
-def _skin_audit_key(client_id: str) -> str:
-    """
-    Build Redis key for latest client skin audit.
-    Args:
-        client_id (str): The client ID
-
-    Returns:
-        str: The Redis key
-    """
-    normalized_client_id = str(client_id or "anonymous").strip() or "anonymous"
-    return _SKIN_AUDIT_KEY_TEMPLATE.format(client_id=normalized_client_id)
-
-
 def _load_latest_skin_audit(client_id: str) -> tuple[dict[str, Any], int | None]:
-    """
-    Load latest persisted skin audit (+timestamp) from Redis for a client.
-    Args:
-        client_id (str): The client ID
-
-    Returns:
-        tuple[dict[str, Any], int | None]: The latest skin audit and timestamp
-    """
-    key = _skin_audit_key(client_id)
-    try:
-        redis_client = get_redis_client(decode_responses=True)
-        raw_payload = run_with_redis_retries(
-            lambda: redis_client.get(key),
-            operation_name="skin_audit_get",
-        )
-    except Exception as exc:
-        logger.warning("failed to load skin audit from redis: client_id=%s err=%s", client_id, exc)
-        return {}, None
-
-    if not raw_payload:
-        return {}, None
-    parsed = _safe_json_loads(str(raw_payload))
-    if not isinstance(parsed, dict):
-        return {}, None
-
-    if isinstance(parsed.get("skin_audit"), dict):
-        updated_at_ts_raw = parsed.get("updated_at_ts")
-        try:
-            updated_at_ts = int(updated_at_ts_raw) if updated_at_ts_raw is not None else None
-        except Exception:
-            updated_at_ts = None
-        return parsed["skin_audit"], updated_at_ts
-
-    return parsed, None
+    """Load latest skin audit snapshot from Redis (delegates to shared store)."""
+    return load_latest_skin_audit(client_id)
 
 
 def _coerce_summary_payload(value: Any) -> str:
@@ -704,6 +680,10 @@ def report_internet_search(query: str, max_results: int = 2) -> str:
 def _product_report_system_prompt(
     context: list[dict[str, Any]],
     delivery_prompt: str = "",
+    *,
+    personalization_mode: PersonalizationMode = "personalized",
+    guidance_mode: GuidanceMode | None = None,
+    apply_guidance_mode: bool = False,
 ) -> str:
     """
     Build the system prompt for product report agents.
@@ -711,20 +691,43 @@ def _product_report_system_prompt(
     Args:
         context: Recent conversation entries for personalization.
         delivery_prompt: Optional delivery-channel formatting hints.
+        personalization_mode: How strongly the report may reference skin/profile context.
+        guidance_mode: Decision-confidence guidance band when Step 7.1 is active.
+        apply_guidance_mode: When True, include guidance-mode instructions in the prompt.
 
     Returns:
         str: System prompt text.
     """
+    mode_guidance = product_report_personalization_guidance(personalization_mode)
+    guidance_line = ""
+    if apply_guidance_mode and guidance_mode is not None:
+        guidance_line = product_report_guidance_mode_instructions(guidance_mode)
+    personalization_clause = (
+        "Prioritize findings that matter for THIS user (pregnancy, breastfeeding, allergies, goals, "
+        "primary concern). Lead with the highest-risk mismatch first — e.g. if the user is pregnant "
+        "and the formula contains retinol, say that clearly in sentence 1. "
+    )
+    if personalization_mode == "generic":
+        personalization_clause = (
+            "Focus on formula-wide safety themes (contraindications, pregnancy/lactation when "
+            "universally relevant to the ingredient, irritation/sensitization, photosensitivity, "
+            "actives to introduce slowly). Do not rank findings against a specific user profile. "
+        )
+    elif personalization_mode == "profile_only":
+        personalization_clause = (
+            "Prioritize findings that match the user's STATED profile (pregnancy, breastfeeding, "
+            "allergies, goals, primary concern). Lead with the highest-risk mismatch first. "
+            "Do not reference image-based or vision-derived skin observations. "
+        )
+
     return (
-        "You are a dermatology-focused product-audit assistant. "
+        "You are a cosmetic skincare product-safety assistant. "
         "Convert structured product safety evidence into a brief audit for a non-technical user. "
         "Do not claim medical diagnosis and do not prescribe treatment. "
         "Use report_internet_search only when it meaningfully strengthens unclear or missing safety points. "
         "Compress the report into at most 5 short sentences in total, use bullet points if needed. "
         "Do NOT use markdown formatting. "
-        "Prioritize findings that matter for THIS user (pregnancy, breastfeeding, allergies, goals, "
-        "primary concern). Lead with the highest-risk mismatch first — e.g. if the user is pregnant "
-        "and the formula contains retinol, say that clearly in sentence 1. "
+        f"{personalization_clause}"
         "Do NOT mention filler or low-risk ingredients (water, aqua, glycerin, basic emollients, "
         "common preservatives) unless they are the main safety issue. "
         "Synthesize across the formula into a few safety themes only (contraindications, pregnancy/lactation, "
@@ -732,8 +735,98 @@ def _product_report_system_prompt(
         "Include the product name in sentence 1 when known. "
         "End with one short educational disclaimer: not medical advice; consult a professional when unsure. "
         "Do not include URLs in the report body (sources are appended separately). "
+        f"{mode_guidance}\n"
+        f"{guidance_line}\n"
         f"last_conversation_entries: {json.dumps(context, default=str)}\n"
         f"{delivery_prompt}\n"
+    )
+
+
+def _product_report_user_prompt(
+    *,
+    product_name: str,
+    description: str,
+    ingredients: list[str],
+    report: dict[str, Any],
+    limited_sources: list[str],
+    personalization_mode: PersonalizationMode,
+    guidance_mode: GuidanceMode | None = None,
+    apply_guidance_mode: bool = False,
+) -> str:
+    """
+    Build the user prompt for the product report agent.
+
+    Args:
+        product_name: Product name from label read or user input.
+        description: Product description text.
+        ingredients: Normalized INCI ingredient list.
+        report: Rules engine structured report.
+        limited_sources: Capped reference source list.
+        personalization_mode: Active personalization mode.
+        guidance_mode: Decision-confidence guidance band when Step 7.1 is active.
+        apply_guidance_mode: When True, include guidance-mode instructions in the prompt.
+
+    Returns:
+        str: User prompt text.
+    """
+    mode_line = product_report_personalization_guidance(personalization_mode)
+    guidance_line = ""
+    if apply_guidance_mode and guidance_mode is not None:
+        guidance_line = product_report_guidance_mode_instructions(guidance_mode)
+    return (
+        "Generate the final product audit using the inputs below.\n"
+        f"Hard limit: at most {_FINAL_REPORT_MAX_SENTENCES} sentences in one paragraph; no section labels.\n"
+        f"{mode_line}\n"
+        f"{guidance_line}\n"
+        "Include the product name in sentence 1 when available.\n"
+        "If a field is missing, state 'unknown' briefly and continue.\n"
+        f"product_name: {product_name}\n"
+        f"description: {description}\n"
+        f"ingredients: {json.dumps(ingredients, default=str)}\n"
+        f"rules_engine_report_json: {json.dumps(report, default=str)}\n"
+        f"reference_sources: {json.dumps(limited_sources, default=str)}\n"
+    )
+
+
+def _product_report_fallback_message(
+    mode: PersonalizationMode,
+    *,
+    guidance_mode: GuidanceMode | None = None,
+    apply_guidance_mode: bool = False,
+) -> str:
+    """
+    Return a mode-appropriate fallback when report generation fails.
+
+    Args:
+        mode: Active personalization mode.
+        guidance_mode: Decision-confidence guidance band when Step 7.1 is active.
+        apply_guidance_mode: When True, append guidance-mode footers.
+
+    Returns:
+        str: Short fallback message for the user.
+    """
+    if mode == "generic":
+        base = (
+            "General product safety review completed. "
+            f"{GENERIC_PRODUCT_REPORT_DISCLAIMER} "
+            "Please follow product caution guidance and consult a professional when unsure."
+        )
+    elif mode == "profile_only":
+        base = (
+            "Product safety review completed based on your stated profile. "
+            f"{PROFILE_ONLY_PRODUCT_REPORT_DISCLAIMER} "
+            "Please follow product caution guidance and consult a professional when unsure."
+        )
+    else:
+        base = (
+            "Safety review completed. Please consult the detailed report and follow product "
+            "caution guidance."
+        )
+    return finalize_product_report_text(
+        base,
+        personalization_mode=mode,
+        guidance_mode=guidance_mode,
+        apply_guidance_mode=apply_guidance_mode,
     )
 
 
@@ -826,6 +919,9 @@ def build_user_friendly_report(
     context: list[dict[str, Any]],
     delivery: Optional[DeliveryContext] = None,
     invoke_config: Optional[RunnableConfig] = None,
+    personalization_mode: PersonalizationMode = "personalized",
+    guidance_mode: GuidanceMode | None = None,
+    apply_guidance_mode: bool = False,
 ) -> str:
     """
     Build a user-friendly report from the rules engine report.
@@ -836,26 +932,35 @@ def build_user_friendly_report(
         ingredients: List of ingredients
         report: Rules engine report
         sources: List of sources
-        
+        context: Recent conversation entries for personalization.
+        delivery: Optional delivery context for prompt formatting.
+        invoke_config: Optional RunnableConfig for tracing.
+        personalization_mode: How strongly the report may reference skin/profile context.
+        guidance_mode: Decision-confidence guidance band from the rules engine.
+        apply_guidance_mode: When True, shape prompts and footers by guidance mode.
+
     Returns:
         User-friendly report as string
     """
+    mode = normalize_personalization_mode(personalization_mode)
     delivery_prompt = format_delivery_context_for_prompt(delivery) if delivery else ""
-    system_prompt = _product_report_system_prompt(context, delivery_prompt)
+    system_prompt = _product_report_system_prompt(
+        context,
+        delivery_prompt,
+        personalization_mode=mode,
+        guidance_mode=guidance_mode,
+        apply_guidance_mode=apply_guidance_mode,
+    )
     limited_sources = _limit_sources(sources)
-    prompt = (
-        "Generate the final product audit using the inputs below.\n"
-        f"Hard limit: at most {_FINAL_REPORT_MAX_SENTENCES} sentences in one paragraph; no section labels.\n"
-        "Rank findings by patient relevance: contraindications that match the user's stated pregnancy, "
-        "breastfeeding, allergies, or goals come first; skip filler ingredients unless they are the main risk.\n"
-        "Include the product name in sentence 1 when available.\n"
-        "If a field is missing, state 'unknown' briefly and continue.\n"
-        "Personalize pregnancy/lactation and allergy guidance using client context when present.\n"
-        f"product_name: {product_name}\n"
-        f"description: {description}\n"
-        f"ingredients: {json.dumps(ingredients, default=str)}\n"
-        f"rules_engine_report_json: {json.dumps(report, default=str)}\n"
-        f"reference_sources: {json.dumps(limited_sources, default=str)}\n"
+    prompt = _product_report_user_prompt(
+        product_name=product_name,
+        description=description,
+        ingredients=ingredients,
+        report=report,
+        limited_sources=limited_sources,
+        personalization_mode=mode,
+        guidance_mode=guidance_mode,
+        apply_guidance_mode=apply_guidance_mode,
     )
     try:
         response = _invoke_with_model_chain(
@@ -868,11 +973,21 @@ def build_user_friendly_report(
         )
         structured = response.get("structured_response") if isinstance(response, dict) else None
         if isinstance(structured, UserFriendlyReportResponse) and structured.report_text.strip():
-            return _enforce_max_sentences(structured.report_text)
+            report_text = _enforce_max_sentences(structured.report_text)
+            return finalize_product_report_text(
+                report_text,
+                personalization_mode=mode,
+                guidance_mode=guidance_mode,
+                apply_guidance_mode=apply_guidance_mode,
+            )
     except Exception:
         logger.exception("failed to build user-friendly product report")
 
-    return "Safety review completed. Please consult the detailed report and follow product caution guidance."
+    return _product_report_fallback_message(
+        mode,
+        guidance_mode=guidance_mode,
+        apply_guidance_mode=apply_guidance_mode,
+    )
 
 
 def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, Any]]) -> dict[str, Any]:
@@ -894,6 +1009,24 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
     signal_confidence = extract_confidence_from_fields(fields)
     signal_threshold = extract_threshold_from_fields(fields)
 
+    delivery = load_delivery_context(case_id, client_id)
+    skin_context = SkinContext.model_validate(build_rules_skin_context(delivery))
+
+    product_name = str(payload.get("product_name") or "").strip()
+    description = str(payload.get("description") or "").strip()
+
+    latest_skin_audit, skin_audit_updated_at_ts = _load_latest_skin_audit(client_id)
+    latest_skin_audit = merge_profile_into_skin_audit(latest_skin_audit, delivery)
+
+    snapshot_fresh = is_skin_snapshot_fresh(latest_skin_audit, skin_audit_updated_at_ts)
+
+    personalization_mode: PersonalizationMode = resolve_product_personalization_mode(
+        skin_audit=latest_skin_audit,
+        profile=delivery.skin_profile,
+        intake_session=delivery.intake_session,
+        snapshot_fresh=snapshot_fresh,
+    )
+
     trace_config = build_invoke_config(
         thread_id=client_id,
         checkpoint_ns="signal_rules:product",
@@ -906,27 +1039,22 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
         message_id=message_id,
         extra_metadata={
             "review_type": "product",
+            "personalization_mode": personalization_mode,
             **({"confidence": signal_confidence} if signal_confidence else {}),
             **({"threshold": signal_threshold} if signal_threshold else {}),
         },
         extra_tags=["product"],
     )
 
-    delivery = load_delivery_context(case_id, client_id)
-    skin_context = SkinContext.model_validate(build_rules_skin_context(delivery))
-
-    product_name = str(payload.get("product_name") or "").strip()
-    description = str(payload.get("description") or "").strip()
-
-    latest_skin_audit, _ = _load_latest_skin_audit(client_id)
-    latest_skin_audit = merge_profile_into_skin_audit(latest_skin_audit, delivery)
-
     logger.info(
-        "product signal rules flow started: request_id=%s case_id=%s client_id=%s product_name=%s",
+        "product signal rules flow started: request_id=%s case_id=%s client_id=%s "
+        "product_name=%s personalization_mode=%s text_only=%s",
         request_id,
         case_id,
         client_id,
         product_name or "<empty>",
+        personalization_mode,
+        bool(payload.get("text_only")),
     )
 
     extraction = extract_product_ingredients(
@@ -963,6 +1091,7 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
         }
 
     rules_engine = get_rules_engine()
+    skin_audit_model = SkinAudit.model_validate(latest_skin_audit)
     request = RulesEngineRequest(
         request_id=request_id,
         case_id=case_id,
@@ -970,8 +1099,9 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
         message_id=message_id,
         channel=channel,
         review_type="product",
+        personalization_mode=personalization_mode,
         ingredients=extraction.ingredients,
-        skin_audit=latest_skin_audit,
+        skin_audit=skin_audit_model,
         skin_context=skin_context,
         escalation_notes=delivery.collected_context_summary or delivery.primary_concern,
         product_name=product_name,
@@ -984,13 +1114,31 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
         raw_model_json=str(fields.get("payload") or ""),
     )
 
-    logger.info("rules engine request created: request_id=%s", request_id)
-    result = rules_engine.process(request)
     logger.info(
-        "rules engine completed: request_id=%s indexed_ingredients=%s",
+        "rules engine request created: request_id=%s personalization_mode=%s has_skin_context=%s",
+        request_id,
+        request.personalization_mode,
+        request.has_skin_context(),
+    )
+
+    # Run rules engine process with the built request
+    result = rules_engine.process(request)
+    
+    logger.info(
+        "rules engine completed: request_id=%s indexed_ingredients=%s "
+        "decision_confidence=%s confidence_tier=%s guidance_mode=%s",
         request_id,
         len(result.indexed_ingredients),
+        result.decision_confidence,
+        result.confidence_tier,
+        result.guidance_mode,
     )
+    if result.confidence_components:
+        logger.info(
+            "decision confidence components: request_id=%s components=%s",
+            request_id,
+            result.confidence_components,
+        )
 
     user_friendly_report = build_user_friendly_report(
         product_name=product_name,
@@ -1001,6 +1149,9 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
         context=context,
         delivery=delivery,
         invoke_config=trace_config,
+        personalization_mode=personalization_mode,
+        guidance_mode=result.guidance_mode,
+        apply_guidance_mode=cosmetic_guidance_mode_active(),
     )
     outbound_sources = _limit_sources(result.sources)
 
@@ -1011,6 +1162,11 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
         "ingredients": extraction.ingredients,
         "indexed_ingredients": [item.model_dump() for item in result.indexed_ingredients],
         "report": result.report,
+        "personalization_mode": personalization_mode,
+        "decision_confidence": result.decision_confidence,
+        "confidence_tier": result.confidence_tier,
+        "guidance_mode": result.guidance_mode,
+        "confidence_components": dict(result.confidence_components),
     }
 
 
@@ -1047,19 +1203,23 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
     skin_context = SkinContext.model_validate(build_rules_skin_context(delivery))
 
     diagnosis = str(payload.get("diagnosis") or payload.get("diagnosis_text") or "").strip()
-    summary = _coerce_summary_payload(payload.get("summary"))
-    treatment = _coerce_treatment_payload(payload.get("treatment"))
-    diagnosis_normalized = diagnosis.lower()
+    primary_observation = str(payload.get("primary_observation") or "").strip()
+    observation = resolve_skin_observation_text(payload) or diagnosis
+    summary = _coerce_summary_payload(payload.get("skin_state") or payload.get("summary"))
+    treatment = _coerce_treatment_payload(
+        payload.get("cosmetic_implications") or payload.get("treatment")
+    )
+    observation_normalized = observation.lower()
 
     logger.info(
-        "skin signal rules flow started: request_id=%s case_id=%s client_id=%s diagnosis=%s",
+        "skin signal rules flow started: request_id=%s case_id=%s client_id=%s observation=%s",
         request_id,
         case_id,
         client_id,
-        diagnosis or "<empty>",
+        observation or "<empty>",
     )
 
-    if diagnosis_normalized == "uncertain":
+    if observation_normalized == "uncertain":
         logger.info(
             "skin signal marked uncertain; skipping rules engine: request_id=%s case_id=%s client_id=%s",
             request_id,
@@ -1084,6 +1244,7 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
         }
 
     rules_engine = get_rules_engine()
+    vision_confidence = parse_signal_confidence(signal_confidence)
     request = RulesEngineRequest(
         request_id=request_id,
         case_id=case_id,
@@ -1091,18 +1252,34 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
         message_id=message_id,
         channel=channel,
         review_type="skin",
-        diagnosis=diagnosis,
+        diagnosis=diagnosis or observation,
+        primary_observation=primary_observation or observation,
+        risk_tier=str(payload.get("risk_tier") or "cosmetic"),
+        image_quality=str(payload.get("image_quality") or "unknown"),
         summary=summary,
         treatment=treatment,
         skin_context=skin_context,
+        skin_audit=SkinAudit(confidence=vision_confidence),
         escalation_notes=delivery.collected_context_summary or delivery.primary_concern,
-        raw_model_json=str(fields.get("payload") or ""),
+        raw_model_json=json.dumps(payload, default=str),
     )
 
     logger.info("skin rules engine request created: request_id=%s", request_id)
     result = rules_engine.process(request)
 
     report = result.report if isinstance(result.report, dict) else {}
+    skin_audit_payload = report.get("skin_audit")
+    if isinstance(skin_audit_payload, dict):
+        persist_skin_audit_snapshot(
+            client_id,
+            skin_audit=skin_audit_payload,
+            request_id=request_id,
+            primary_observation=primary_observation or observation,
+            risk_tier=str(payload.get("risk_tier") or "cosmetic"),
+            image_quality=str(payload.get("image_quality") or "unknown"),
+            signal_confidence=signal_confidence,
+        )
+
     user_friendly_report = build_skin_review_report(
         diagnosis=str(report.get("diagnosis") or diagnosis),
         summary=str(report.get("summary") or summary),
