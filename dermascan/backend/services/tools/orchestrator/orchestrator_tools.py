@@ -30,6 +30,18 @@ from dermascan.shared.ingress_payload import (
     resolve_first_image_url_from_payload,
     resolve_image_urls_from_payload,
 )
+from dermascan.ai_service.postprocessing.escalation import (
+    ESCALATION_CLIENT_MESSAGE,
+    dispatch_consent_escalation,
+    has_pending_consent_escalation_offer,
+)
+from dermascan.shared.cosmetic_feature_flags import (
+    cosmetic_consent_escalation_active,
+    cosmetic_pivot_enabled,
+    cosmetic_skin_first_routing_active,
+    cosmetic_text_product_review_enabled,
+)
+from dermascan.shared.cosmetic_types import PersonalizationMode, normalize_personalization_mode
 from dermascan.shared.intake_session import (
     IntakeImageCategory,
     IntakeImageRef,
@@ -42,17 +54,25 @@ from dermascan.shared.intake_session import (
     MISSING_REPRODUCTIVE_STATUS,
     MISSING_SERVICE_INTENT,
     MISSING_SKIN_IMAGE,
+    MISSING_SKIN_SNAPSHOT,
     ServiceIntent,
     build_collected_context_summary,
-    is_ready_to_route,
+    has_product_image,
     recompute_session,
 )
 from dermascan.shared.intake_session_store import (
     IntakeSessionStoreError,
     archive_intake_session,
     get_or_create_intake_session,
+    load_archived_intake_session,
     load_intake_session,
+    recompute_intake_session,
     save_intake_session_recomputed,
+)
+from dermascan.backend.services.agents.text_product_review import (
+    dispatch_text_product_review_signal,
+    is_text_product_review_enqueued,
+    text_product_review_eligible,
 )
 from dermascan.shared.firebase_storage import initialize_firebase_app
 
@@ -336,6 +356,28 @@ class UpdateIntakeInput(BaseModel):
             "Optional. Set true to confirm pregnancy/breastfeeding was discussed when you are "
             "not changing those fields. Implied automatically when pregnancy or breastfeeding "
             "is provided."
+        ),
+    )
+    skin_snapshot_skipped: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Optional. Set true when the user explicitly declines a skin photo and accepts "
+            "a general (non-tailored) product safety check. Sets personalization to generic."
+        ),
+    )
+    personalization_mode: Optional[PersonalizationMode] = Field(
+        default=None,
+        description=(
+            "Optional. Override personalization mode: personalized, profile_only, or generic. "
+            "Normally derived from skin_snapshot_skipped; only set when explicitly needed."
+        ),
+    )
+    product_ref_text: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional. Product name or text reference when the user provides a product "
+            "without a label photo (cosmetic pivot routing). Does not replace label photo "
+            "for specialist enqueue until text-only review is enabled."
         ),
     )
 
@@ -954,6 +996,99 @@ def _intake_stop_suffix() -> str:
     )
 
 
+def _skin_prerequisite_enqueue_eligible(session: IntakeSession) -> bool:
+    """
+    Return True when a skin audit may be enqueued as a product-review prerequisite.
+
+    Args:
+        session: Current intake session.
+
+    Returns:
+        bool: True when skin-first routing requires a snapshot before product review.
+    """
+    if not cosmetic_skin_first_routing_active():
+        return False
+    if session.service_intent != ServiceIntent.PRODUCT_REVIEW:
+        return False
+    if session.skin_snapshot_skipped:
+        return False
+    if MISSING_SKIN_SNAPSHOT not in session.missing_for_routing:
+        return False
+    if session.images.get(IntakeImageCategory.SKIN.value) is None:
+        return False
+    blocking = [item for item in session.missing_for_routing if item != MISSING_SKIN_SNAPSHOT]
+    return not blocking
+
+
+def _ready_for_audit_enqueue(session: IntakeSession, audit_type: IntakeImageCategory) -> bool:
+    """
+    Return True when the requested audit type may be enqueued for the current session.
+
+    Args:
+        session: Current intake session.
+        audit_type: Audit category the agent is trying to enqueue.
+
+    Returns:
+        bool: True when enqueue should proceed.
+    """
+    if not session.missing_for_routing:
+        return True
+    if audit_type == IntakeImageCategory.SKIN and _skin_prerequisite_enqueue_eligible(session):
+        return True
+    return False
+
+
+def _mark_skin_prerequisite_pending(
+    session: IntakeSession,
+    profile: dict[str, Any],
+) -> IntakeSession:
+    """
+    Persist skin-prerequisite state and archive intake for signal delivery.
+
+    Args:
+        session: Intake session after skin prerequisite enqueue.
+        profile: Skin profile mapping for recomputation.
+
+    Returns:
+        IntakeSession: Updated session when persistence succeeds; otherwise the input session.
+    """
+    pending_session = session.model_copy(
+        update={
+            "pending_product_after_skin": True,
+            "phase": IntakePhase.AWAITING_AUDIT,
+        }
+    )
+    updated, persist_error = _persist_intake_session(pending_session, profile)
+    if persist_error or updated is None:
+        return session
+    _archive_intake_for_signal_delivery(updated)
+    return updated
+
+
+def _needs_product_label_photo_for_enqueue(session: IntakeSession) -> bool:
+    """
+    Return True when intake is ready but product enqueue still requires a label photo.
+
+    Applies when cosmetic pivot accepts product name for routing but MedGemma label
+    read (or Step 5 text-only path) is not yet available.
+
+    Args:
+        session: Current intake session.
+
+    Returns:
+        bool: True when the agent should ask for a product label photo before enqueue.
+    """
+    if not cosmetic_pivot_enabled():
+        return False
+    if cosmetic_text_product_review_enabled():
+        return False
+    if session.service_intent not in (ServiceIntent.PRODUCT_REVIEW, ServiceIntent.COMBINED):
+        return False
+    if has_product_image(session):
+        return False
+    return bool(session.product_ref_text.strip())
+
+
 def _derive_intake_next_action(session: IntakeSession, profile: dict[str, Any]) -> str:
     """
     Recommend exactly one next tool for the orchestrator model.
@@ -965,11 +1100,17 @@ def _derive_intake_next_action(session: IntakeSession, profile: dict[str, Any]) 
     Returns:
         str: Tool name the model should call next, or reply_only when done.
     """
-    if is_ready_to_route(session, profile):
+    if not session.missing_for_routing:
         return "enque_request_for_auditing_stream"
 
     missing = session.missing_for_routing
-    if MISSING_SKIN_IMAGE in missing or MISSING_PRODUCT_IMAGE in missing:
+    if MISSING_SKIN_SNAPSHOT in missing and _skin_prerequisite_enqueue_eligible(session):
+        return "enque_request_for_auditing_stream"
+    if (
+        MISSING_SKIN_SNAPSHOT in missing
+        or MISSING_SKIN_IMAGE in missing
+        or MISSING_PRODUCT_IMAGE in missing
+    ):
         return "register_intake_image"
     # Every remaining gap (service intent, primary concern, profile minimums,
     # reproductive status) is recorded through the consolidated update_intake tool.
@@ -996,6 +1137,12 @@ def _intake_instruction(session: IntakeSession, profile: dict[str, Any]) -> str:
     """
     stop = _intake_stop_suffix()
     next_tool = _derive_intake_next_action(session, profile)
+    skip_suffix = ""
+    if session.skin_snapshot_skipped:
+        skip_suffix = (
+            " User opted out of skin snapshot — generic product check only; "
+            "do NOT ask for a skin photo."
+        )
 
     if session.phase == IntakePhase.AWAITING_AUDIT:
         return (
@@ -1003,7 +1150,23 @@ def _intake_instruction(session: IntakeSession, profile: dict[str, Any]) -> str:
             "Do NOT call enque_request_for_auditing_stream again."
         )
 
-    if is_ready_to_route(session, profile):
+    if not session.missing_for_routing:
+        if _needs_product_label_photo_for_enqueue(session):
+            return (
+                "Product name is recorded. Ask the user for a clear, readable product label "
+                "photo so the specialist team can run the review."
+                f"{skip_suffix}{stop}"
+            )
+        if (
+            text_product_review_eligible(session)
+            and session.service_intent in (ServiceIntent.PRODUCT_REVIEW, ServiceIntent.COMBINED)
+        ):
+            audit_type = "product"
+            return (
+                f"Call enque_request_for_auditing_stream once with audit_type={audit_type} "
+                f"to run the text-only product check (current turn request_id)."
+                f"{skip_suffix}{stop}"
+            )
         if session.service_intent == ServiceIntent.COMBINED:
             return (
                 "Call enque_request_for_auditing_stream twice: audit_type=skin then product "
@@ -1029,16 +1192,50 @@ def _intake_instruction(session: IntakeSession, profile: dict[str, Any]) -> str:
     if MISSING_REPRODUCTIVE_STATUS in session.missing_for_routing:
         return (
             "Call update_intake with pregnancy and breastfeeding from the user's answer "
-            f"(providing them confirms reproductive status).{stop}"
+            f"(providing them confirms reproductive status).{skip_suffix}{stop}"
+        )
+
+    if (
+        MISSING_SKIN_SNAPSHOT in session.missing_for_routing
+        and session.service_intent == ServiceIntent.PRODUCT_REVIEW
+        and not session.skin_snapshot_skipped
+    ):
+        if _skin_prerequisite_enqueue_eligible(session):
+            return (
+                "Call enque_request_for_auditing_stream once with audit_type=skin "
+                "(current turn request_id). Product check will run automatically after the "
+                "skin snapshot completes. Tell the user both steps are queued."
+                f"{stop}"
+            )
+        return (
+            "Fresh skin snapshot required before product check. Ask for a close-up skin photo "
+            "and call register_intake_image (skin) then enque_request_for_auditing_stream with "
+            "audit_type=skin when ready. Product check will run automatically after skin review. "
+            "OR offer generic product-only check: if user explicitly declines skin photo, call "
+            "update_intake with skin_snapshot_skipped=true."
+            f"{stop}"
+        )
+
+    if (
+        MISSING_SKIN_IMAGE in session.missing_for_routing
+        and session.service_intent == ServiceIntent.COMBINED
+        and not session.skin_snapshot_skipped
+    ):
+        return (
+            "Missing skin photo for combined check. Offer skin snapshot OR product-only "
+            "generic safety check. If user explicitly declines skin photo, call update_intake "
+            "with service_intent=product_review and skin_snapshot_skipped=true."
+            f"{skip_suffix}{stop}"
         )
 
     if session.missing_for_routing:
         missing = ", ".join(session.missing_for_routing)
         return (
-            f"Missing: {missing}. Call {next_tool} once using the latest user message.{stop}"
+            f"Missing: {missing}. Call {next_tool} once using the latest user message."
+            f"{skip_suffix}{stop}"
         )
 
-    return f"Continue intake. Next tool: {next_tool}.{stop}"
+    return f"Continue intake. Next tool: {next_tool}.{skip_suffix}{stop}"
 
 
 def _format_intake_status(
@@ -1060,7 +1257,7 @@ def _format_intake_status(
     """
     skin_ref = session.images.get(IntakeImageCategory.SKIN.value)
     product_ref = session.images.get(IntakeImageCategory.PRODUCT.value)
-    ready = is_ready_to_route(session, profile)
+    ready = not session.missing_for_routing
 
     return {
         "status": "ok",
@@ -1083,6 +1280,9 @@ def _format_intake_status(
         "missing_for_routing": list(session.missing_for_routing),
         "ready_to_route": ready,
         "collected_context_summary": session.collected_context_summary,
+        "skin_snapshot_skipped": session.skin_snapshot_skipped,
+        "personalization_mode": session.personalization_mode,
+        "product_ref_text": session.product_ref_text,
         "next_recommended_tool": _derive_intake_next_action(session, profile),
         "instruction": _intake_instruction(session, profile),
     }
@@ -1112,11 +1312,14 @@ def compute_intake_guidance(client_id: str) -> dict[str, Any] | None:
         return None
 
     profile = _load_skin_profile_mapping(cid)
-    recomputed = recompute_session(session, profile)
+    recomputed = recompute_intake_session(session, profile)
     return {
         "phase": recomputed.phase.value,
         "missing_for_routing": list(recomputed.missing_for_routing),
-        "ready_to_route": is_ready_to_route(recomputed, profile),
+        "ready_to_route": not recomputed.missing_for_routing,
+        "skin_snapshot_skipped": recomputed.skin_snapshot_skipped,
+        "personalization_mode": recomputed.personalization_mode,
+        "product_ref_text": recomputed.product_ref_text,
         "next_recommended_tool": _derive_intake_next_action(recomputed, profile),
         "instruction": _intake_instruction(recomputed, profile),
     }
@@ -1357,7 +1560,14 @@ def _required_audit_categories(session: IntakeSession) -> list[IntakeImageCatego
     if intent == ServiceIntent.PRODUCT_REVIEW:
         return [IntakeImageCategory.PRODUCT]
     if intent == ServiceIntent.COMBINED:
-        return [IntakeImageCategory.SKIN, IntakeImageCategory.PRODUCT]
+        categories: list[IntakeImageCategory] = []
+        if not (
+            cosmetic_pivot_enabled()
+            and session.skin_snapshot_skipped
+        ):
+            categories.append(IntakeImageCategory.SKIN)
+        categories.append(IntakeImageCategory.PRODUCT)
+        return categories
     return []
 
 
@@ -1375,6 +1585,13 @@ def _all_required_audits_enqueued(session: IntakeSession) -> bool:
     if not required:
         return False
     for category in required:
+        if (
+            category == IntakeImageCategory.PRODUCT
+            and text_product_review_eligible(session)
+        ):
+            if is_text_product_review_enqueued(_redis, session.case_id):
+                continue
+            return False
         ref = session.images.get(category.value)
         if ref is None or not _is_audit_enqueued(ref.request_id):
             return False
@@ -1396,8 +1613,18 @@ def _audit_type_allowed(session: IntakeSession, audit_type: IntakeImageCategory)
     if intent == ServiceIntent.SKIN_REVIEW:
         return audit_type == IntakeImageCategory.SKIN
     if intent == ServiceIntent.PRODUCT_REVIEW:
-        return audit_type == IntakeImageCategory.PRODUCT
+        if audit_type == IntakeImageCategory.PRODUCT:
+            return True
+        if audit_type == IntakeImageCategory.SKIN and _skin_prerequisite_enqueue_eligible(session):
+            return True
+        return False
     if intent == ServiceIntent.COMBINED:
+        if (
+            cosmetic_pivot_enabled()
+            and session.skin_snapshot_skipped
+            and audit_type == IntakeImageCategory.SKIN
+        ):
+            return False
         return audit_type in (IntakeImageCategory.SKIN, IntakeImageCategory.PRODUCT)
     return False
 
@@ -1413,7 +1640,10 @@ def _enqueue_group_params(session: IntakeSession) -> tuple[str, int]:
         tuple[str, int]: group_id and group_expected_count for MedGemma dispatch.
     """
     if session.service_intent == ServiceIntent.COMBINED:
-        return session.case_id, 2
+        expected = 2
+        if cosmetic_pivot_enabled() and session.skin_snapshot_skipped:
+            expected = 1
+        return session.case_id, expected
     return "", 0
 
 
@@ -1503,6 +1733,17 @@ def _enqueue_audit_instruction(
                 f"again with audit_type={other.value}. Do NOT re-enqueue {audit_type.value}. "
                 "Tell the user both photos are being reviewed when both are queued."
             )
+
+    if (
+        session.service_intent == ServiceIntent.PRODUCT_REVIEW
+        and audit_type == IntakeImageCategory.SKIN
+        and session.pending_product_after_skin
+    ):
+        return (
+            "Skin snapshot queued for product check. Product review will run automatically "
+            "when skin analysis completes. Do NOT enqueue product yet. Tell the user their "
+            "skin photo is being reviewed and the product check will follow."
+        )
 
     return (
         "The image audit request is now in the queue. Do NOT call this tool again. "
@@ -1631,6 +1872,9 @@ def update_intake(
     breastfeeding: Optional[bool] = None,
     notes: Optional[str] = None,
     confirm_reproductive_status: Optional[bool] = None,
+    skin_snapshot_skipped: Optional[bool] = None,
+    personalization_mode: Optional[PersonalizationMode] = None,
+    product_ref_text: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Record any subset of intake facts in ONE call (load, mutate, recompute, save).
@@ -1649,6 +1893,13 @@ def update_intake(
             (optional): Long-lived skin-profile fields; merged into the stored profile.
         confirm_reproductive_status (bool, optional): Confirm pregnancy/breastfeeding was
             discussed. Implied automatically when pregnancy or breastfeeding is provided.
+        skin_snapshot_skipped (bool, optional): Set true only after the user explicitly
+            declines a skin photo and accepts a general (non-tailored) product safety check.
+            Automatically sets personalization_mode to generic. If switching from combined
+            or skin_review to product-only, also pass service_intent=product_review.
+        personalization_mode (enum, optional): Override personalization mode when needed.
+        product_ref_text (string, optional): Product name or text when user provides it
+            without a label photo (cosmetic pivot routing). Label photo still required for enqueue.
 
     Returns:
         Intake status JSON (phase, service_intent, images, profile_gaps, missing_for_routing,
@@ -1675,6 +1926,9 @@ def update_intake(
         breastfeeding=breastfeeding,
         notes=notes,
         confirm_reproductive_status=confirm_reproductive_status,
+        skin_snapshot_skipped=skin_snapshot_skipped,
+        personalization_mode=personalization_mode,
+        product_ref_text=product_ref_text,
     )
 
     logger.info(
@@ -1746,6 +2000,34 @@ def update_intake(
 
     if payload.has_profile_update():
         changed.append("skin_profile")
+
+    if skin_snapshot_skipped is not None and session.skin_snapshot_skipped != skin_snapshot_skipped:
+        updates["skin_snapshot_skipped"] = skin_snapshot_skipped
+        changed.append("skin_snapshot_skipped")
+        if skin_snapshot_skipped:
+            updates["personalization_mode"] = "generic"
+            changed.append("personalization_mode")
+        elif normalize_personalization_mode(
+            str(updates.get("personalization_mode", session.personalization_mode))
+        ) == "generic":
+            updates["personalization_mode"] = "personalized"
+            changed.append("personalization_mode")
+
+    if personalization_mode is not None:
+        normalized_mode = normalize_personalization_mode(personalization_mode)
+        pending_mode = normalize_personalization_mode(
+            str(updates.get("personalization_mode", session.personalization_mode))
+        )
+        if pending_mode != normalized_mode:
+            updates["personalization_mode"] = normalized_mode
+            if "personalization_mode" not in changed:
+                changed.append("personalization_mode")
+
+    if product_ref_text is not None:
+        normalized_ref = product_ref_text.strip()
+        if normalized_ref and session.product_ref_text.strip() != normalized_ref:
+            updates["product_ref_text"] = normalized_ref
+            changed.append("product_ref_text")
 
     if updates:
         session = session.model_copy(update=updates)
@@ -1926,7 +2208,7 @@ def enque_request_for_auditing_stream(
             ),
         }
 
-    if not is_ready_to_route(session, profile):
+    if not _ready_for_audit_enqueue(session, audit_type):
         return {
             "status": "blocked_not_ready",
             "request_id": request_id,
@@ -1953,6 +2235,76 @@ def enque_request_for_auditing_stream(
 
     image_ref = session.images.get(audit_type.value)
     if image_ref is None:
+        if (
+            audit_type == IntakeImageCategory.PRODUCT
+            and text_product_review_eligible(session)
+        ):
+            try:
+                text_result = dispatch_text_product_review_signal(
+                    _redis,
+                    session=session,
+                    profile=profile,
+                    request_id=request_id,
+                    case_id=case_id,
+                    client_id=client_id,
+                    message_id=str(envelope.get("message_id") or request_id),
+                    channel=str(envelope.get("channel") or ""),
+                    collected_context=collected_context,
+                )
+            except RuntimeError as exc:
+                return {
+                    "status": "error",
+                    "request_id": request_id,
+                    "audit_type": audit_type.value,
+                    "detail": str(exc),
+                }
+
+            _emit_orchestrator_event(
+                {
+                    "request_id": request_id,
+                    "case_id": case_id,
+                    "client_id": client_id,
+                    "message_id": str(envelope.get("message_id") or request_id),
+                    "channel": str(envelope.get("channel") or ""),
+                    "agent": "orchestrator",
+                    "status": "routed_text_product_review",
+                    "enqueue_source": "orchestrator_tool",
+                    "audit_type": audit_type.value,
+                    "product_ref_text": session.product_ref_text,
+                }
+            )
+
+            if _all_required_audits_enqueued(session):
+                _mark_intake_awaiting_audit(session, profile)
+
+            text_result["request_id"] = request_id
+            text_result["product_ref_text"] = session.product_ref_text
+            instruction = _enqueue_audit_instruction(
+                session,
+                audit_type,
+                str(text_result.get("status") or ""),
+            )
+            if instruction:
+                text_result["instruction"] = instruction
+            return text_result
+
+        if (
+            audit_type == IntakeImageCategory.PRODUCT
+            and session.product_ref_text.strip()
+            and cosmetic_pivot_enabled()
+            and not cosmetic_text_product_review_enabled()
+        ):
+            return {
+                "status": "blocked_missing_image",
+                "request_id": request_id,
+                "audit_type": audit_type.value,
+                "product_ref_text": session.product_ref_text,
+                "instruction": (
+                    "Product name is recorded but a clear label photo is still required "
+                    "for specialist review. Ask the user to send a readable product label image, "
+                    "then register_intake_image before enqueueing."
+                ),
+            }
         return {
             "status": "blocked_missing_image",
             "request_id": request_id,
@@ -2009,7 +2361,12 @@ def enque_request_for_auditing_stream(
             audit_type.value,
         )
         instruction = _enqueue_audit_instruction(session, audit_type, "already_queued")
-        if _all_required_audits_enqueued(session):
+        if (
+            audit_type == IntakeImageCategory.SKIN
+            and _skin_prerequisite_enqueue_eligible(session)
+        ):
+            session = _mark_skin_prerequisite_pending(session, profile)
+        elif _all_required_audits_enqueued(session):
             _mark_intake_awaiting_audit(session, profile)
         return {
             "status": "already_queued",
@@ -2086,7 +2443,12 @@ def enque_request_for_auditing_stream(
         }
     )
 
-    if _all_required_audits_enqueued(session):
+    if (
+        audit_type == IntakeImageCategory.SKIN
+        and _skin_prerequisite_enqueue_eligible(session)
+    ):
+        session = _mark_skin_prerequisite_pending(session, profile)
+    elif _all_required_audits_enqueued(session):
         _mark_intake_awaiting_audit(session, profile)
 
     result["request_id"] = request_id
@@ -2096,6 +2458,191 @@ def enque_request_for_auditing_stream(
     if instruction:
         result["instruction"] = instruction
     return result
+
+
+def continue_product_review_after_skin_prerequisite(
+    client_id: str,
+    case_id: str,
+    *,
+    request_id: str = "",
+) -> bool:
+    """
+    Dispatch product review automatically after a skin prerequisite audit completes.
+
+    Called from the orchestrator signal worker when ``pending_product_after_skin`` is set
+    on the intake session and a skin review signal has been delivered.
+
+    Args:
+        client_id: Client identifier.
+        case_id: Case identifier from the skin signal envelope.
+        request_id: Request id from the skin signal (used for product dispatch).
+
+    Returns:
+        bool: True when product review was dispatched successfully.
+    """
+    cid = _normalize_client_id(client_id)
+    case = str(case_id or "").strip()
+    if not cid:
+        return False
+
+    try:
+        session = load_intake_session(cid, redis_client=_redis)
+    except IntakeSessionStoreError:
+        logger.exception(
+            "product auto-chain: failed to load intake session: client_id=%s",
+            cid,
+        )
+        return False
+
+    if session is None and case:
+        session = load_archived_intake_session(case, redis_client=_redis)
+
+    if session is None or not session.pending_product_after_skin:
+        return False
+
+    profile = _load_skin_profile_mapping(cid)
+    reset_session = session.model_copy(
+        update={
+            "pending_product_after_skin": False,
+            "phase": IntakePhase.GREETING,
+        }
+    )
+    session = recompute_intake_session(reset_session, profile)
+
+    if session.missing_for_routing:
+        logger.warning(
+            "product auto-chain blocked after skin prerequisite: client_id=%s missing=%s",
+            cid,
+            session.missing_for_routing,
+        )
+        try:
+            save_intake_session_recomputed(session, profile, redis_client=_redis)
+        except IntakeSessionStoreError:
+            logger.exception(
+                "product auto-chain: failed to persist blocked session: client_id=%s",
+                cid,
+            )
+        return False
+
+    req_id = str(request_id or case or cid).strip()
+    dispatched = False
+
+    if text_product_review_eligible(session):
+        if is_text_product_review_enqueued(_redis, session.case_id):
+            logger.info(
+                "product auto-chain skipped; text review already enqueued: case_id=%s",
+                session.case_id,
+            )
+            return False
+        try:
+            dispatch_text_product_review_signal(
+                _redis,
+                session=session,
+                profile=profile,
+                request_id=req_id,
+                case_id=session.case_id,
+                client_id=cid,
+                message_id=req_id,
+                channel="",
+                collected_context=session.collected_context_summary,
+            )
+            dispatched = True
+        except RuntimeError as exc:
+            logger.warning(
+                "product auto-chain text dispatch failed: client_id=%s err=%s",
+                cid,
+                exc,
+            )
+            return False
+    else:
+        product_ref = session.images.get(IntakeImageCategory.PRODUCT.value)
+        if product_ref is None:
+            logger.warning(
+                "product auto-chain blocked; no product image registered: client_id=%s",
+                cid,
+            )
+            try:
+                save_intake_session_recomputed(session, profile, redis_client=_redis)
+            except IntakeSessionStoreError:
+                logger.exception(
+                    "product auto-chain: failed to persist session: client_id=%s",
+                    cid,
+                )
+            return False
+
+        dedupe_key = _audit_enqueued_dedupe_key(product_ref.request_id)
+        if _redis is not None and not _redis.set(
+            dedupe_key, "1", nx=True, ex=_AUDIT_ENQUEUED_TTL_SEC
+        ):
+            logger.info(
+                "product auto-chain skipped; product audit already dispatched: request_id=%s",
+                product_ref.request_id,
+            )
+            return False
+
+        image_envelope = _get_cached_ingress_envelope(product_ref.request_id)
+        if not image_envelope:
+            if _redis is not None:
+                _redis.delete(dedupe_key)
+            logger.warning(
+                "product auto-chain blocked; ingress cache missing: image_request_id=%s",
+                product_ref.request_id,
+            )
+            return False
+
+        image_url = str(product_ref.image_url or "").strip()
+        if not image_url:
+            try:
+                payload_obj: dict[str, Any] = json.loads(str(image_envelope.get("payload") or "{}"))
+            except Exception:
+                payload_obj = {}
+            image_url = _resolve_image_url_from_payload(payload_obj)
+
+        if not image_url:
+            if _redis is not None:
+                _redis.delete(dedupe_key)
+            logger.warning(
+                "product auto-chain blocked; product image url unresolved: request_id=%s",
+                product_ref.request_id,
+            )
+            return False
+
+        context_text = _build_audit_context_text(
+            session,
+            profile,
+            IntakeImageCategory.PRODUCT,
+            "",
+        )
+        try:
+            _dispatch_audit_image_ref(
+                request_id=product_ref.request_id,
+                case_id=str(image_envelope.get("case_id") or session.case_id),
+                client_id=str(image_envelope.get("client_id") or cid),
+                message_id=str(image_envelope.get("message_id") or product_ref.request_id),
+                channel=str(image_envelope.get("channel") or ""),
+                image_url=image_url,
+                context=context_text,
+            )
+            dispatched = True
+        except Exception:
+            if _redis is not None:
+                _redis.delete(dedupe_key)
+            logger.exception(
+                "product auto-chain image dispatch failed: client_id=%s case_id=%s",
+                cid,
+                session.case_id,
+            )
+            return False
+
+    if dispatched:
+        _mark_intake_awaiting_audit(session, profile)
+        logger.info(
+            "product review auto-chained after skin prerequisite: client_id=%s case_id=%s",
+            cid,
+            session.case_id,
+        )
+
+    return dispatched
 
 
 def ensure_ready_intake_dispatched(client_id: str, request_id: str) -> list[dict[str, Any]]:
@@ -2129,15 +2676,26 @@ def ensure_ready_intake_dispatched(client_id: str, request_id: str) -> list[dict
         return []
 
     profile = _load_skin_profile_mapping(cid)
-    session = recompute_session(session, profile)
-    if not is_ready_to_route(session, profile):
+    session = recompute_intake_session(session, profile)
+    if session.missing_for_routing:
         return []
 
     results: list[dict[str, Any]] = []
     for category in _required_audit_categories(session):
         image_ref = session.images.get(category.value)
-        if image_ref is not None and _is_audit_enqueued(image_ref.request_id):
+
+        if (
+            category == IntakeImageCategory.PRODUCT
+            and image_ref is None
+            and text_product_review_eligible(session)
+        ):
+            if is_text_product_review_enqueued(_redis, session.case_id):
+                continue
+        elif image_ref is not None and _is_audit_enqueued(image_ref.request_id):
             continue
+        elif image_ref is None:
+            continue
+
         logger.warning(
             "post-turn deterministic audit dispatch (model ended turn without enqueue): "
             "client_id=%s case_id=%s audit_type=%s",
@@ -2736,6 +3294,78 @@ def check_medgemma_health() -> dict[str, str]:
     }
 
 
+@tool
+def request_specialist_escalation(request_id: OrchestratorRequestIdArg) -> dict[str, Any]:
+    """
+    Dispatch a cached specialist escalation after explicit user consent.
+
+    Call only when the user clearly accepts the optional specialist review offer
+    (e.g. "yes connect me", "I'd like a specialist review") and a pending offer exists
+    for the active case.
+
+    Args:
+        request_id: Exact request_id from the current orchestrator turn.
+
+    Returns:
+        dict[str, Any]: Dispatch status and client-facing instruction.
+    """
+    logger.info("TOOL CALL: request_specialist_escalation: request_id=%s", request_id)
+
+    if not cosmetic_consent_escalation_active():
+        return {
+            "status": "disabled",
+            "request_id": request_id,
+            "instruction": (
+                "Consent-gated escalation is not enabled. Do NOT call this tool. "
+                "Continue the conversation normally."
+            ),
+        }
+
+    envelope, ingress_error = _require_ingress_envelope(request_id)
+    if ingress_error:
+        return ingress_error
+    assert envelope is not None
+
+    case_id = str(envelope.get("case_id") or "").strip()
+    client_id = str(envelope.get("client_id") or "anonymous").strip()
+    if not case_id:
+        return {
+            "status": "error",
+            "request_id": request_id,
+            "detail": "missing case_id in ingress envelope",
+        }
+
+    if not has_pending_consent_escalation_offer(case_id):
+        return {
+            "status": "no_pending_offer",
+            "request_id": request_id,
+            "case_id": case_id,
+            "instruction": (
+                "There is no pending specialist review offer for this case. "
+                "Do NOT call this tool again unless a new offer was just delivered."
+            ),
+        }
+
+    if not dispatch_consent_escalation(case_id):
+        return {
+            "status": "error",
+            "request_id": request_id,
+            "case_id": case_id,
+            "detail": "failed to dispatch consent escalation job",
+        }
+
+    return {
+        "status": "queued",
+        "request_id": request_id,
+        "case_id": case_id,
+        "client_id": client_id,
+        "client_message": ESCALATION_CLIENT_MESSAGE,
+        "instruction": (
+            "Tell the user a skin specialist has been contacted and will follow up. "
+            "Use the client_message text. Do NOT call this tool again for the same offer."
+        ),
+    }
+
 
 orchestrator_tools: list = [
     get_time,
@@ -2744,6 +3374,7 @@ orchestrator_tools: list = [
     update_intake,
     register_intake_image,
     enque_request_for_auditing_stream,
+    request_specialist_escalation,
     read_status_of_a_case,
     check_medgemma_health,
     read_soul_md,
