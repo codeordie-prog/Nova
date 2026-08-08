@@ -1,5 +1,255 @@
 # Changelog
 
+## 2026-08-08 — Cosmetic Intelligence Pivot (feature-flagged rollout)
+
+Incremental pivot from clinical diagnosis toward **cosmetic decision support**: skin snapshot first,
+product safety against CIR evidence, decision-confidence copy, and consent-gated escalation. Every
+change ships **behind feature flags that default OFF** — legacy diagnosis, combined-intent, and
+confidence-only escalation behavior is unchanged until flags are enabled.
+
+> Commits: `9442dc2..dfb9cd9` on `main`. Rollout guide: `dermascan/docs/cosmetic-pivot.md`.
+> Author: cursor + Kelvin(specs and logic).
+
+---
+
+### 1. What this feature does (overview)
+
+When cosmetic flags are enabled, the user flow becomes:
+
+1. Greet with cosmetic positioning (not medical diagnosis).
+2. Collect profile → optional skin snapshot → persist skin audit in Redis.
+3. Product check (image or text) → rules engine with personalization mode.
+4. Decision confidence shapes report tone; risk tier gates escalation (offer vs auto).
+
+```
+User message
+   → orchestrator (intake + routing)          [orchestrator_tools.py, orchestrator_prompt.py]
+       skin-first?  → require fresh skin audit before product enqueue
+       opt-out?       → personalization_mode=generic, relaxed routing
+   → MedGemma (vision)                         [medgemma_structured_output.py, app.py]
+       additive cosmetic fields: risk_tier, image_quality, avoid_for_now
+   → skin audit persisted                      [skin_audit_store.py]
+   → product signal rules flow                 [product_rules_signal_helper.py]
+       ingredient extraction → rules engine (CIR vector evidence)
+       decision confidence → guidance_mode (full / cautious / clarify)
+   → escalation routing                        [consent_escalation.py, escalation.py]
+       urgent → auto-escalate (legacy-compatible)
+       watch  → offer only; user accepts → request_specialist_escalation
+       cosmetic / product → no auto-escalate on confidence alone
+```
+
+---
+
+### 2. Feature flags (all default OFF)
+
+| Variable | Purpose |
+|----------|---------|
+| `COSMETIC_PIVOT_ENABLED` | Master switch for pivot routing/intake changes |
+| `COSMETIC_SKIN_FIRST_ROUTING` | Require fresh skin snapshot before product review |
+| `COSMETIC_TEXT_PRODUCT_REVIEW` | Product review from name/text without MedGemma |
+| `COSMETIC_GUIDANCE_MODE` | Apply decision-confidence `guidance_mode` to product reports |
+| `COSMETIC_CONSENT_ESCALATION` | Risk + consent escalation instead of confidence-only |
+
+Helpers: `dermascan/shared/cosmetic_feature_flags.py`.
+
+Child flags require `COSMETIC_PIVOT_ENABLED=true` to take effect.
+
+---
+
+### 3. Personalization modes
+
+| Mode | When used | Product report behavior |
+|------|-----------|-------------------------|
+| `personalized` | Fresh skin audit available (default) | Full skin + profile + CIR evidence |
+| `profile_only` | Text profile only | Goals/allergies context, no vision claims |
+| `generic` | User skipped skin snapshot | Ingredient safety only + generic disclaimer |
+
+Derivation: `dermascan/shared/cosmetic_profile.py` → `derive_personalization_mode()`.
+
+---
+
+### 4. Step-by-step changes (commit order)
+
+Each step is a separate commit so colleagues can review and enable incrementally.
+
+#### Step 0.1 — Feature flags, shared types, rollout doc (`9442dc2`)
+
+**Why:** Introduce the pivot without changing runtime behavior. All flags default off.
+
+**Added:**
+- `dermascan/shared/cosmetic_feature_flags.py` — flag helpers
+- `dermascan/shared/cosmetic_types.py` — `PersonalizationMode`, report disclaimers
+- `dermascan/docs/cosmetic-pivot.md` — implementation tracker + smoke tests
+- `dermascan/tests/unit/test_cosmetic_types.py`
+
+---
+
+#### Step 1.2 — Intake session extensions + RulesEngineRequest fields (`9cf128c`)
+
+**Why:** Intake must track opt-out, personalization mode, and skin-first prerequisites.
+
+**Changed:**
+- `dermascan/shared/intake_session.py` — `skin_snapshot_skipped`, `personalization_mode`, `pending_product_after_skin`, skin-first readiness
+- `dermascan/shared/intake_session_store.py` — persist new fields
+- `dermascan/rules_engine/engine/engine.py` — `personalization_mode`, cosmetic `SkinAudit` fields, `decision_confidence` on response
+- `dermascan/tests/unit/test_intake_session.py`
+
+---
+
+#### Step 1.3 — Personalization mode derivation (`08a3d49`)
+
+**Why:** Centralize when product reviews use personalized vs profile-only vs generic.
+
+**Added:**
+- `dermascan/shared/cosmetic_profile.py` — `derive_personalization_mode()`, skin snapshot freshness
+
+---
+
+#### Step 3.1 — MedGemma additive cosmetic schema (`82d0f3b`)
+
+**Why:** Vision model emits cosmetic observations alongside legacy diagnosis without breaking existing output.
+
+**Added/changed:**
+- `dermascan/ai_service/postprocessing/medgemma_structured_output.py` — cosmetic schema + parsers
+- `dermascan/ai_service/modal/medgemma_service/app.py` — structured output wiring
+- `dermascan/ai_service/modal/medgemma_service/confidence_score.py` — cosmetic field passthrough
+- `dermascan/tests/unit/test_medgemma_structured_output.py`
+
+---
+
+#### Steps 3.2–3.3 — Skin audit bridge + Redis persistence (`c42e4ec`)
+
+**Why:** Map MedGemma observations into rules-engine `SkinAudit` and reuse across product reviews.
+
+**Added:**
+- `dermascan/rules_engine/engine/skin_audit_bridge.py` — MedGemma → `SkinAudit` adapter
+- `dermascan/shared/skin_audit_store.py` — per-client Redis snapshot
+- `dermascan/tests/unit/test_skin_audit_bridge.py`
+- `dermascan/tests/unit/test_skin_audit_persistence.py`
+
+---
+
+#### Steps 2.3 / 7.1 base — Decision confidence scoring (`a9d8735`)
+
+**Why:** Score product-review certainty from CIR evidence, profile context, and vision confidence.
+
+**Added:**
+- `dermascan/rules_engine/confidence/decision_confidence.py` — composite score, `guidance_mode` bands
+- `dermascan/rules_engine/confidence/__init__.py`
+- `dermascan/tests/unit/test_decision_confidence.py`
+
+Weighting (personalized): 40% evidence coverage, 35% context, 25% vision confidence.
+Guidance bands: `full` (≥0.75), `cautious` (0.50–0.74), `clarify` (<0.50).
+
+---
+
+#### Fix — Rules engine cached ingredient IDs (`b0e36d5`)
+
+**Why:** Redis cache hits returned `indexed=True` without `ingredient_id`, so CIR safety/irritation
+vector queries received an empty ID list and returned no evidence.
+
+**Changed:**
+- `dermascan/rules_engine/engine/rules_engine.py` — read `ingredient_id` from Redis on cache hit;
+  attach `decision_confidence` to `assess_product_review` output
+
+---
+
+#### Steps 2.1–2.2 / 7.1 — Product signal flow wiring (`15ebca1`)
+
+**Why:** Pass personalization into rules engine, load persisted skin audits, apply disclaimers and guidance-mode copy.
+
+**Changed:**
+- `dermascan/backend/services/agents/product_rules_signal_helper.py` — mode-aware requests,
+  disclaimers, `guidance_mode` prompts/footers when `COSMETIC_GUIDANCE_MODE` active
+
+---
+
+#### Step 4.1 — Orchestrator cosmetic prompt (`8df53c1`)
+
+**Why:** Cosmetic positioning, skin-first intake guidance, and escalation consent copy when pivot flag is on.
+
+**Changed:**
+- `dermascan/backend/services/agents/prompts/orchestrator_prompt.py`
+- `dermascan/tests/unit/test_orchestrator_prompt.py`
+
+---
+
+#### Step 5.1 — Text-only product review (`a18dadc`)
+
+**Why:** Product safety from name/text when `COSMETIC_TEXT_PRODUCT_REVIEW` is enabled (no MedGemma label vision).
+
+**Added:**
+- `dermascan/backend/services/agents/text_product_review.py`
+- `dermascan/tests/unit/test_text_product_review.py`
+
+---
+
+#### Steps 4.2–4.3 / 6.1 / 6.1b / 8.1 tool — Intake tools (`11578a8`)
+
+**Why:** Enforce skin-first routing, capture opt-out, auto-chain product after skin prerequisite,
+expose consent escalation tool. Legacy combined-intent enqueue unchanged when flags off.
+
+**Changed:**
+- `dermascan/backend/services/tools/orchestrator/orchestrator_tools.py` — skin-first gate,
+  `skin_snapshot_skipped`, `continue_product_review_after_skin_prerequisite()`,
+  `request_specialist_escalation()`
+- `dermascan/tests/unit/test_intake_tools.py`
+
+---
+
+#### Steps 6.1b / 8.1 — Orchestrator worker skin chain (`b1f2ff9`)
+
+**Why:** After skin audit delivery, auto-dispatch pending product review; append specialist-offer suffix on skin replies.
+
+**Changed:**
+- `dermascan/backend/services/agents/orchestrator_worker.py` — `_finalize_intake_after_delivery()`,
+  escalation offer append
+
+---
+
+#### Step 8.1 — Risk-tier consent-gated escalation (`dfb9cd9`)
+
+**Why:** Replace confidence-only auto-escalation with risk-tier policy when consent flag is on.
+
+| Risk tier | Behavior |
+|-----------|----------|
+| `urgent` | Auto-escalate (unchanged) |
+| `watch` | Report + optional specialist offer; escalate only after user accepts |
+| `cosmetic` | Complete normally; low confidence does not auto-escalate |
+| `product_review` | Never auto-escalate on confidence alone |
+
+**Added/changed:**
+- `dermascan/ai_service/postprocessing/consent_escalation.py` — decision logic + offer copy
+- `dermascan/ai_service/postprocessing/escalation.py` — integrate consent policy, cache offers in Redis
+- `dermascan/tests/unit/test_consent_escalation.py`
+
+---
+
+### 5. Smoke tests (before enabling in staging)
+
+| Test | Flow |
+|------|------|
+| A | New user, skin photo → skin report |
+| B | User with skin audit, product image → personalized product report |
+| C | User skips skin, product name → generic disclaimer report |
+| D | Low confidence product → cautious/clarify copy, no auto-escalation |
+| E | Skin `watch` tier → offer only; user accepts → escalation job |
+
+---
+
+### 6. Operational notes
+
+- **Restart workers after enabling flags.** Orchestrator, MedGemma, and signal-rules workers read
+  flags at startup/import; `.env` changes require process restart.
+- **Flags are independent layers.** Enable `COSMETIC_PIVOT_ENABLED` first, then child flags one at a time.
+- **Legacy path preserved.** With all flags off, behavior matches pre-pivot diagnosis flows.
+- **Pending steps:** 6.2 (deprecate combined intent, optional), 9.x (legacy cleanup).
+- **INCI alias gap:** Bilingual names like `Aqua/Water` normalize to `aquawater` and may miss CIR
+  Postgres matches; common single-name ingredients (Niacinamide, Glycerin) resolve correctly after
+  the Redis cache fix.
+
+---
+
 ## 2026-06-29 — Dermatologist Escalation Feature (Nova ↔ qutis-escalation)
 
 Wires Nova to the **qutis-escalation dashboard** so low-confidence AI cases are handed to a human
