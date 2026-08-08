@@ -16,6 +16,8 @@ import psycopg2
 import redis
 from dotenv import load_dotenv
 
+from dermascan.rules_engine.confidence.decision_confidence import compute_product_decision_confidence
+from dermascan.rules_engine.engine.skin_audit_bridge import build_skin_audit_bridge
 from dermascan.rules_engine.engine.engine import (
     Engine,
     IngredientIndexResult,
@@ -173,6 +175,21 @@ class RulesEngine(Engine):
         return bool(normalized_name) and bool(
             self.redis.exists(self._cache_key(normalized_name))
         )
+
+    def _read_cached_entry(self, normalized_name: str) -> dict[str, str]:
+        """
+        Read a cached ingredient index entry from Redis.
+
+        Args:
+            normalized_name: Normalized ingredient lookup key.
+
+        Returns:
+            dict[str, str]: Cached hash fields, or an empty dict when absent.
+        """
+        if not normalized_name:
+            return {}
+        cached = self.redis.hgetall(self._cache_key(normalized_name))
+        return cached if isinstance(cached, dict) else {}
 
     def _mark_cached(self, normalized_name: str, ingredient_id: str) -> None:
         """
@@ -379,10 +396,12 @@ class RulesEngine(Engine):
             
             # If already indexed mark True and proceed
             if self._is_cached(normalized):
+                cached = self._read_cached_entry(normalized)
                 results.append(
                     IngredientIndexResult(
                         ingredient=ingredient,
                         normalized_name=normalized,
+                        ingredient_id=str(cached.get("ingredient_id") or ""),
                         indexed=True,
                         source="redis_cache",
                     )
@@ -729,41 +748,17 @@ class RulesEngine(Engine):
 
     def _build_skin_audit_bridge(self, request: RulesEngineRequest) -> SkinAudit:
         """
-        Build bridge SkinAudit from existing flat fields.
+        Build bridge SkinAudit from legacy and cosmetic MedGemma fields.
         Args:
             request (RulesEngineRequest): The request
 
         Returns:
             SkinAudit: The built skin audit
         """
-        concern = self._extract_primary_concern(request.diagnosis)
-        condition = self._extract_current_condition(request.summary)
-        needs = self._derive_skin_needs(
-            concern=concern,
-            treatment=request.treatment,
-            condition=condition,
-        )
-        completeness_score, missing_fields = self._score_skin_audit_completeness(
-            concern=concern,
-            condition=condition,
-            needs=needs,
-        )
-
-        contraindicated_approaches: list[str] = []
-        if condition.active_inflammation and needs.comedolytic:
-            contraindicated_approaches.append("avoid aggressive actives while inflamed")
-        if condition.barrier_status == "compromised":
-            contraindicated_approaches.append("avoid barrier-stripping routines")
-
-        confidence = max(0.0, min(1.0, float(request.skin_audit.confidence or 0.0)))
-        return SkinAudit(
-            primary_concern=concern,
-            current_condition=condition,
-            needs=needs,
-            contraindicated_approaches=contraindicated_approaches,
-            confidence=confidence,
-            completeness_score=completeness_score,
-            missing_fields=missing_fields,
+        return build_skin_audit_bridge(
+            request,
+            derive_skin_needs=self._derive_skin_needs,
+            score_skin_audit_completeness=self._score_skin_audit_completeness,
         )
 
     def evaluate_contraindications(self, ingredient_ids: list[str]) -> list[dict[str, Any]]:
@@ -844,6 +839,11 @@ class RulesEngine(Engine):
             f"Indexed {len(ingredient_ids)} ingredient report(s) for evidence retrieval."
         )
 
+        confidence = compute_product_decision_confidence(
+            request,
+            indexed_results=indexed_results,
+        )
+
         return RulesEngineResponse(
             request_id=request.request_id,
             case_id=request.case_id,
@@ -856,6 +856,10 @@ class RulesEngine(Engine):
             escalation_notes=request.escalation_notes,
             indexed_ingredients=indexed_results,
             report=report,
+            decision_confidence=confidence.decision_confidence,
+            confidence_tier=confidence.confidence_tier,
+            guidance_mode=confidence.guidance_mode,
+            confidence_components=confidence.components,
         )
 
     def assess_skin_review(self, request: RulesEngineRequest) -> RulesEngineResponse:
