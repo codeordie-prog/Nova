@@ -24,6 +24,9 @@ from dataclasses import dataclass
 
 from redis import Redis
 
+from dermascan.ai_service.postprocessing.consent_escalation import resolve_escalation_decision
+from dermascan.ai_service.postprocessing.medgemma_structured_output import extract_structured_fields
+from dermascan.shared.cosmetic_feature_flags import cosmetic_consent_escalation_active
 from dermascan.shared.stream_pipeline_tracing import enrich_stream_fields, record_stream_produce
 
 # load environment variables
@@ -39,6 +42,11 @@ _DIAGNOSE_CONFIDENCE_THRESHOLD: float = float(os.environ.get("DIAGNOSE_CONFIDENC
 _PRODUCT_REVIEW_CONFIDENCE_THRESHOLD: float = float(os.environ.get("PRODUCT_REVIEW_CONFIDENCE_THRESHOLD", "0.60"))
 _ESCALATION_DLQ_STREAM: str = os.environ.get("ESCALATION_DLQ_STREAM", "escalation:dlq")
 _EVENTS_DLQ_STREAM: str = os.environ.get("EVENTS_DLQ_STREAM","events:dlq")
+_CONSENT_OFFER_KEY_TEMPLATE: str = "escalation:consent_offer:{case_id}"
+_CONSENT_OFFER_TTL_SECONDS: int = max(
+    3600,
+    int(os.environ.get("ESCALATION_CONSENT_OFFER_TTL_SECONDS", str(7 * 24 * 3600))),
+)
 
 # Client-facing copy when inference is below threshold (orchestrator must not surface model output).
 ESCALATION_CLIENT_MESSAGE: str = os.environ.get(
@@ -129,6 +137,138 @@ def resolve_client_message_for_signal(fields: dict[str, Any]) -> str | None:
     return None
 
 
+def _consent_offer_key(case_id: str) -> str:
+    """
+    Build Redis key for a pending consent-gated escalation offer.
+
+    Args:
+        case_id: Case identifier.
+
+    Returns:
+        str: Redis key string.
+    """
+    normalized = str(case_id or "").strip() or "anonymous"
+    return _CONSENT_OFFER_KEY_TEMPLATE.format(case_id=normalized)
+
+
+def _cache_consent_escalation_offer(
+    entry: _JobEntry,
+    *,
+    mode: str,
+    confidence: float | None,
+    threshold_used: float,
+    base_fields: dict[str, str],
+    text: str,
+) -> None:
+    """
+    Cache escalation job fields until the user explicitly consents.
+
+    Args:
+        entry: Source inference job entry.
+        mode: Routing mode string.
+        confidence: MedGemma confidence score.
+        threshold_used: Threshold applied for the mode.
+        base_fields: Parsed structured fields from inference.
+        text: Raw model response text.
+    """
+    case_id = str(entry.case_id or "").strip()
+    if not case_id:
+        return
+    payload = {
+        "request_id": entry.request_id,
+        "case_id": case_id,
+        "client_id": entry.client_id,
+        "message_id": entry.message_id,
+        "channel": entry.channel,
+        "source_agent": "medgemma",
+        "mode": mode,
+        "reason": "risk_tier_watch_consent",
+        "confidence": "" if confidence is None else str(confidence),
+        "threshold": str(threshold_used),
+        "diagnosis_text": base_fields.get("diagnosis") or text,
+        "requires_human_review": "true",
+        "product_name": base_fields.get("product_name", ""),
+        "description": base_fields.get("description", ""),
+        "indications": base_fields.get("indications", ""),
+        "safety_in_pregnancy": base_fields.get("safety_in_pregnancy", ""),
+        "contraindications": base_fields.get("contraindications", ""),
+        "how_to_use": base_fields.get("how_to_use", ""),
+        "special_instructions": base_fields.get("special_instructions", ""),
+        "image_blob_path": entry.image_blob_path or "",
+        "review_type": base_fields.get("review_type", ""),
+        "rationale": base_fields.get("rationale", ""),
+        "summary": _stream_json(base_fields.get("summary")),
+        "treatment": _stream_json(base_fields.get("treatment")),
+        "risk_tier": base_fields.get("risk_tier", "watch"),
+    }
+    try:
+        _redis.setex(
+            _consent_offer_key(case_id),
+            _CONSENT_OFFER_TTL_SECONDS,
+            json.dumps(payload),
+        )
+    except Exception:
+        pass
+
+
+def dispatch_consent_escalation(case_id: str) -> bool:
+    """
+    Push a cached consent-offer escalation job after explicit user acceptance.
+
+    Args:
+        case_id: Case identifier tied to the pending offer.
+
+    Returns:
+        bool: True when a job was dispatched to ``escalation:jobs``.
+    """
+    case = str(case_id or "").strip()
+    if not case:
+        return False
+    key = _consent_offer_key(case)
+    try:
+        raw = _redis.get(key)
+    except Exception:
+        return False
+    if not raw:
+        return False
+    try:
+        fields = json.loads(str(raw))
+    except Exception:
+        return False
+    if not isinstance(fields, dict):
+        return False
+    try:
+        _redis.xadd(
+            _ESCALATION_STREAM,
+            {k: _to_str(v) for k, v in fields.items()},
+            maxlen=_EVENTS_STREAM_MAXLEN,
+            approximate=True,
+        )
+        _redis.delete(key)
+    except Exception:
+        return False
+    return True
+
+
+def has_pending_consent_escalation_offer(case_id: str) -> bool:
+    """
+    Return True when a consent-gated escalation offer is cached for the case.
+
+    Args:
+        case_id: Case identifier.
+
+    Returns:
+        bool: True when an offer key exists in Redis.
+    """
+    case = str(case_id or "").strip()
+    if not case:
+        return False
+    try:
+        return bool(_redis.get(_consent_offer_key(case)))
+    except Exception:
+        return False
+
+
 def _build_orchestrator_signal_payload(
     *,
     escalated: bool,
@@ -138,6 +278,8 @@ def _build_orchestrator_signal_payload(
     base_fields: dict[str, str],
     text: str,
     entry: _JobEntry,
+    escalation_offer: bool = False,
+    risk_tier: str = "cosmetic",
 ) -> dict[str, Any]:
     """
     Build orchestrator signal payload.
@@ -177,111 +319,23 @@ def _build_orchestrator_signal_payload(
         "contraindications": base_fields.get("contraindications", ""),
         "how_to_use": base_fields.get("how_to_use", ""),
         "special_instructions": base_fields.get("special_instructions", ""),
+        "risk_tier": risk_tier,
+        "escalation_offer": escalation_offer,
         "metadata": metadata,
     }
 
 
 def _extract_structured_fields(text: str) -> tuple[dict[str, Any], bool]:
     """
-    Parse MedGemma JSON output and extract diagnose/product fields.
+    Parse MedGemma JSON output and extract legacy + cosmetic fields.
 
     Args:
         text: The JSON text to parse
-        
+
     Returns:
         A tuple of (fields dictionary, parse_success)
     """
-    fields: dict[str, Any] = {
-        "review_type": "",
-        "diagnosis": "",
-        "rationale": "",
-        "summary": {
-            "severity": "",
-            "active_inflammation": "",
-            "barrier_status": "",
-            "observed_patterns": [],
-        },
-        "treatment": {
-            "needs": {
-                "barrier_repair": "",
-                "anti_inflammatory": "",
-                "comedolytic": "",
-                "hydration": "",
-                "sun_protection": "",
-            },
-            "contraindicated_approaches": [],
-        },
-        "product_name": "",
-        "description": "",
-        "indications": "",
-        "safety_in_pregnancy": "",
-        "contraindications": "",
-        "how_to_use": "",
-        "special_instructions": "",
-    }
-    try:
-        parsed: dict[str, Any] = json.loads(text)
-    except Exception:
-        return fields, False
-
-    for key in (
-        "review_type",
-        "diagnosis",
-        "rationale",
-        "product_name",
-        "description",
-        "indications",
-        "safety_in_pregnancy",
-        "contraindications",
-        "how_to_use",
-        "special_instructions",
-    ):
-        fields[key] = _to_str(parsed.get(key)).strip()
-
-    parsed_summary = parsed.get("summary")
-    if isinstance(parsed_summary, dict):
-        fields["summary"] = {
-            "severity": _to_str(parsed_summary.get("severity")).strip(),
-            "active_inflammation": _to_str(parsed_summary.get("active_inflammation")).strip(),
-            "barrier_status": _to_str(parsed_summary.get("barrier_status")).strip(),
-            "observed_patterns": [
-                _to_str(item).strip()
-                for item in (parsed_summary.get("observed_patterns") or [])
-                if _to_str(item).strip()
-            ]
-            if isinstance(parsed_summary.get("observed_patterns"), list)
-            else [],
-        }
-
-    parsed_treatment = parsed.get("treatment")
-    if isinstance(parsed_treatment, dict):
-        parsed_needs = parsed_treatment.get("needs")
-        needs_obj = {
-            "barrier_repair": "",
-            "anti_inflammatory": "",
-            "comedolytic": "",
-            "hydration": "",
-            "sun_protection": "",
-        }
-        if isinstance(parsed_needs, dict):
-            needs_obj = {
-                "barrier_repair": _to_str(parsed_needs.get("barrier_repair")).strip(),
-                "anti_inflammatory": _to_str(parsed_needs.get("anti_inflammatory")).strip(),
-                "comedolytic": _to_str(parsed_needs.get("comedolytic")).strip(),
-                "hydration": _to_str(parsed_needs.get("hydration")).strip(),
-                "sun_protection": _to_str(parsed_needs.get("sun_protection")).strip(),
-            }
-        fields["treatment"] = {
-            "needs": needs_obj,
-            "contraindicated_approaches": [
-                _to_str(item).strip()
-                for item in (parsed_treatment.get("contraindicated_approaches") or [])
-                if _to_str(item).strip()
-            ]
-            if isinstance(parsed_treatment.get("contraindicated_approaches"), list)
-            else [],
-        }
-    return fields, True
+    return extract_structured_fields(text)
 
 
 def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | None) -> bool:
@@ -308,7 +362,7 @@ def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | 
     )
 
     review_type = structured.get("review_type", "").strip().lower()
-    diagnosis_present = bool(structured["diagnosis"])
+    diagnosis_present = bool(structured.get("diagnosis")) or bool(structured.get("primary_observation"))
     product_present = any(bool(structured.get(k)) for k in product_fields)
 
     if review_type in ("product review", "product_review", "product", "hybrid review", "hybrid_review", "hybrid"):
@@ -328,23 +382,13 @@ def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | 
     threshold_used = (
         _PRODUCT_REVIEW_CONFIDENCE_THRESHOLD if mode == "product_review" else _DIAGNOSE_CONFIDENCE_THRESHOLD
     )
-    escalate: bool = confidence is None or confidence < threshold_used
-
-    if not parsed_ok:
-        escalate = True
-
-    completed_status = f"{mode}_inference_completed"
-    escalated_status = f"{mode}_escalated"
-    escalation_note = (
-        "Model response was not valid JSON"
-        if not parsed_ok
-        else ("Product review confidence fell below threshold" if mode == "product_review" and escalate
-              else ("Diagnosis confidence fell below threshold" if escalate else ""))
-    )
 
     base_fields = {
+        "schema_version": structured.get("schema_version", ""),
         "review_type": structured["review_type"],
         "rationale": structured["rationale"],
+        "primary_observation": structured.get("primary_observation", ""),
+        "observation_rationale": structured.get("observation_rationale", ""),
         "product_name": structured["product_name"],
         "description": structured["description"],
         "indications": structured["indications"],
@@ -354,8 +398,39 @@ def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | 
         "special_instructions": structured["special_instructions"],
         "diagnosis": structured["diagnosis"],
         "summary": structured["summary"] if isinstance(structured["summary"], dict) else _to_str(structured["summary"]).strip(),
+        "skin_state": structured.get("skin_state", structured["summary"])
+        if isinstance(structured.get("skin_state"), dict)
+        else structured["summary"],
         "treatment": structured["treatment"] if isinstance(structured["treatment"], dict) else _to_str(structured["treatment"]).strip(),
+        "cosmetic_implications": structured.get("cosmetic_implications", structured["treatment"])
+        if isinstance(structured.get("cosmetic_implications"), dict)
+        else structured["treatment"],
+        "risk_tier": structured.get("risk_tier", "cosmetic"),
+        "image_quality": structured.get("image_quality", "unknown"),
     }
+
+    decision = resolve_escalation_decision(
+        mode=mode,
+        confidence=confidence,
+        threshold=threshold_used,
+        parsed_ok=parsed_ok,
+        risk_tier=str(base_fields.get("risk_tier") or "cosmetic"),
+        consent_escalation_active=cosmetic_consent_escalation_active(),
+    )
+    escalate = decision.auto_escalate
+    escalation_offer = decision.offer_escalation
+
+    completed_status = f"{mode}_inference_completed"
+    escalated_status = f"{mode}_escalated"
+    escalation_note = decision.reason
+    if not parsed_ok:
+        escalation_note = "Model response was not valid JSON"
+    elif escalate and decision.reason == "legacy_confidence_threshold":
+        escalation_note = (
+            "Product review confidence fell below threshold"
+            if mode == "product_review"
+            else "Diagnosis confidence fell below threshold"
+        )
 
     # push case to EVENT stream - regardless of confidence threshold
     _push_event(
@@ -407,7 +482,18 @@ def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | 
         escalated=escalate,
         base_fields=base_fields,
         parsed_ok=parsed_ok,
+        escalation_offer=escalation_offer,
     )
+
+    if escalation_offer:
+        _cache_consent_escalation_offer(
+            entry,
+            mode=mode,
+            confidence=confidence,
+            threshold_used=threshold_used,
+            base_fields=base_fields,
+            text=text,
+        )
 
     return escalate
 
@@ -476,6 +562,7 @@ def _push_signal(
     escalated: bool,
     base_fields: dict[str, str],
     parsed_ok: bool,
+    escalation_offer: bool = False,
 ) -> None:
     """
     Push a completion/escalation signal to ORCHESTRATOR SIGNAL STREAM.
@@ -490,8 +577,12 @@ def _push_signal(
         notes = "The model response was not valid JSON"
     elif escalated:
         notes = f"The {mode} inference completed below confidence threshold"
+    elif escalation_offer:
+        notes = f"The {mode} inference completed with optional specialist review offered"
     else:
         notes = f"The {mode} inference completed above threshold"
+
+    risk_tier = str(base_fields.get("risk_tier") or "cosmetic")
 
     signal_envelope: dict[str, Any] = {
         "signal_type": signal_type,
@@ -511,6 +602,8 @@ def _push_signal(
                 base_fields=base_fields,
                 text=text,
                 entry=entry,
+                escalation_offer=escalation_offer,
+                risk_tier=risk_tier,
             )
         ),
         "notes": notes,
