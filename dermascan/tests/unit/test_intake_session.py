@@ -15,6 +15,7 @@ from dermascan.shared.intake_session import (
     MISSING_REPRODUCTIVE_STATUS,
     MISSING_SERVICE_INTENT,
     MISSING_SKIN_IMAGE,
+    MISSING_SKIN_SNAPSHOT,
     ServiceIntent,
     build_collected_context_summary,
     compute_missing_for_routing,
@@ -292,3 +293,208 @@ class TestRecomputeAndSummary:
         assert "Safe during pregnancy?" in summary
         assert "fragrance" in summary
         assert "Label visible" in summary
+
+
+@pytest.mark.unit
+class TestCosmeticIntakeFields:
+    """Cosmetic pivot fields on IntakeSession (Step 1.2)."""
+
+    def test_new_session_defaults(self) -> None:
+        session = new_intake_session("c1", "case-1")
+        assert session.skin_snapshot_skipped is False
+        assert session.personalization_mode == "personalized"
+        assert session.product_ref_text == ""
+
+    def test_legacy_session_deserializes_without_cosmetic_fields(self) -> None:
+        legacy = {
+            "client_id": "c1",
+            "case_id": "case-1",
+            "phase": "greeting",
+            "created_at_ms": 1,
+            "updated_at_ms": 1,
+        }
+        session = IntakeSession.model_validate(legacy)
+        assert session.skin_snapshot_skipped is False
+        assert session.personalization_mode == "personalized"
+        assert session.product_ref_text == ""
+
+
+@pytest.mark.unit
+class TestCosmeticPivotRouting:
+    """Relaxed routing when COSMETIC_PIVOT routing rules apply (Step 4.3)."""
+
+    def _product_ready_session(self) -> IntakeSession:
+        return IntakeSession(
+            client_id="c1",
+            case_id="case-1",
+            service_intent=ServiceIntent.PRODUCT_REVIEW,
+            primary_concern="Is this serum safe?",
+            reproductive_status_confirmed=True,
+            skin_snapshot_skipped=True,
+            personalization_mode="generic",
+        )
+
+    def _full_profile(self) -> dict[str, object]:
+        return {
+            "age": 25,
+            "gender": "female",
+            "location": "Nairobi",
+            "current_products": ["cleanser"],
+            "current_goals": ["hydration"],
+            "allergies": ["none reported"],
+        }
+
+    def test_legacy_requires_product_image_when_flag_off(self) -> None:
+        session = self._product_ready_session()
+        missing = compute_missing_for_routing(
+            session,
+            self._full_profile(),
+            cosmetic_pivot_enabled=False,
+        )
+        assert MISSING_PRODUCT_IMAGE in missing
+
+    def test_pivot_accepts_product_name_without_image(self) -> None:
+        session = self._product_ready_session()
+        session.product_ref_text = "CeraVe Hydrating Cleanser"
+        missing = compute_missing_for_routing(
+            session,
+            self._full_profile(),
+            cosmetic_pivot_enabled=True,
+        )
+        assert MISSING_PRODUCT_IMAGE not in missing
+        assert missing == []
+
+    def test_pivot_skipped_combined_does_not_require_skin_image(self) -> None:
+        session = IntakeSession(
+            client_id="c1",
+            case_id="case-1",
+            service_intent=ServiceIntent.COMBINED,
+            primary_concern="check product",
+            reproductive_status_confirmed=True,
+            skin_snapshot_skipped=True,
+            personalization_mode="generic",
+            product_ref_text="La Roche-Posay Anthelios SPF50",
+        )
+        missing = compute_missing_for_routing(
+            session,
+            self._full_profile(),
+            cosmetic_pivot_enabled=True,
+        )
+        assert MISSING_SKIN_IMAGE not in missing
+        assert MISSING_PRODUCT_IMAGE not in missing
+
+    def test_ready_to_route_with_product_name_and_skip(self) -> None:
+        session = self._product_ready_session()
+        session.product_ref_text = "Ordinary Niacinamide 10%"
+        assert is_ready_to_route(session, self._full_profile(), cosmetic_pivot_enabled=True)
+
+    def test_context_summary_includes_product_ref(self) -> None:
+        session = self._product_ready_session()
+        session.product_ref_text = "Test Moisturizer"
+        summary = build_collected_context_summary(session, {})
+        assert "Product reference: Test Moisturizer" in summary
+        assert "Skin snapshot: skipped" in summary
+
+
+@pytest.mark.unit
+class TestSkinFirstRouting:
+    """Require fresh skin audit before product review when skin-first is active (Step 6.1)."""
+
+    def _product_session(self) -> IntakeSession:
+        return IntakeSession(
+            client_id="c1",
+            case_id="case-1",
+            service_intent=ServiceIntent.PRODUCT_REVIEW,
+            primary_concern="Is this serum safe?",
+            reproductive_status_confirmed=True,
+            product_ref_text="Test Serum",
+        )
+
+    def _full_profile(self) -> dict[str, object]:
+        return {
+            "age": 25,
+            "gender": "female",
+            "location": "Nairobi",
+            "current_products": ["cleanser"],
+            "current_goals": ["hydration"],
+            "allergies": ["none reported"],
+        }
+
+    def test_blocks_product_review_without_fresh_audit(self) -> None:
+        session = self._product_session()
+        missing = compute_missing_for_routing(
+            session,
+            self._full_profile(),
+            cosmetic_pivot_enabled=True,
+            cosmetic_skin_first_routing=True,
+            skin_audit={},
+            now_ts=1_700_000_000,
+        )
+        assert MISSING_SKIN_SNAPSHOT in missing
+
+    def test_allows_product_review_with_fresh_audit(self) -> None:
+        session = self._product_session()
+        missing = compute_missing_for_routing(
+            session,
+            self._full_profile(),
+            cosmetic_pivot_enabled=True,
+            cosmetic_skin_first_routing=True,
+            skin_audit={"primary_concern": "visible dryness"},
+            skin_audit_updated_at_ts=1_700_000_000,
+            now_ts=1_700_000_000,
+        )
+        assert MISSING_SKIN_SNAPSHOT not in missing
+        assert missing == []
+
+    def test_skip_bypasses_skin_first_requirement(self) -> None:
+        session = self._product_session()
+        session.skin_snapshot_skipped = True
+        session.personalization_mode = "generic"
+        missing = compute_missing_for_routing(
+            session,
+            self._full_profile(),
+            cosmetic_pivot_enabled=True,
+            cosmetic_skin_first_routing=True,
+            skin_audit={},
+        )
+        assert MISSING_SKIN_SNAPSHOT not in missing
+        assert missing == []
+
+    def test_not_applied_to_combined_intent(self) -> None:
+        session = IntakeSession(
+            client_id="c1",
+            case_id="case-1",
+            service_intent=ServiceIntent.COMBINED,
+            primary_concern="check both",
+            reproductive_status_confirmed=True,
+            product_ref_text="Test Moisturizer",
+        )
+        missing = compute_missing_for_routing(
+            session,
+            self._full_profile(),
+            cosmetic_pivot_enabled=True,
+            cosmetic_skin_first_routing=True,
+            skin_audit={},
+        )
+        assert MISSING_SKIN_SNAPSHOT not in missing
+        assert MISSING_SKIN_IMAGE in missing
+
+    def test_stale_audit_blocks_routing(self) -> None:
+        session = self._product_session()
+        old_ts = 1_000_000_000
+        now_ts = old_ts + (91 * 86400)
+        missing = compute_missing_for_routing(
+            session,
+            self._full_profile(),
+            cosmetic_pivot_enabled=True,
+            cosmetic_skin_first_routing=True,
+            skin_audit={"primary_concern": "acne-prone appearance"},
+            skin_audit_updated_at_ts=old_ts,
+            now_ts=now_ts,
+        )
+        assert MISSING_SKIN_SNAPSHOT in missing
+
+    def test_infer_phase_image_intake_for_stale_snapshot(self) -> None:
+        session = self._product_session()
+        missing = [MISSING_SKIN_SNAPSHOT]
+        assert infer_phase(session, missing) == IntakePhase.IMAGE_INTAKE

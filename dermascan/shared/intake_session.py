@@ -21,6 +21,8 @@ from typing import Any, Final, Mapping, Optional
 
 from pydantic import BaseModel, Field
 
+from dermascan.shared.cosmetic_types import PersonalizationMode
+
 # --- Redis layout ----------------------------------------------------------------
 
 _ENV_INTAKE_TTL_S: Final[str] = "INTAKE_SESSION_TTL_S"
@@ -102,6 +104,7 @@ MISSING_PRODUCT_IMAGE: Final[str] = "product_image"
 MISSING_PRIMARY_CONCERN: Final[str] = "primary_concern"
 MISSING_PROFILE_MINIMUM: Final[str] = "profile_minimum"
 MISSING_REPRODUCTIVE_STATUS: Final[str] = "reproductive_status"
+MISSING_SKIN_SNAPSHOT: Final[str] = "skin_snapshot_stale"
 
 # Intents that require confirming pregnancy / breastfeeding status during intake.
 REPRODUCTIVE_STATUS_INTENTS: Final[frozenset[ServiceIntent]] = frozenset(
@@ -203,6 +206,10 @@ class IntakeSession(BaseModel):
     confirmed_none_fields: list[str] = Field(default_factory=list)
     profile_gaps: list[str] = Field(default_factory=list)
     missing_for_routing: list[str] = Field(default_factory=list)
+    skin_snapshot_skipped: bool = False
+    personalization_mode: PersonalizationMode = "personalized"
+    product_ref_text: str = ""
+    pending_product_after_skin: bool = False
     created_at_ms: int = 0
     updated_at_ms: int = 0
 
@@ -288,9 +295,75 @@ def compute_profile_gaps(
     return gaps
 
 
+def _resolve_cosmetic_pivot_routing_enabled(cosmetic_pivot_enabled: bool | None) -> bool:
+    """
+    Resolve whether cosmetic pivot routing rules apply.
+
+    Args:
+        cosmetic_pivot_enabled: Explicit override for tests; when None, read env flag.
+
+    Returns:
+        bool: True when relaxed product routing is active.
+    """
+    if cosmetic_pivot_enabled is not None:
+        return cosmetic_pivot_enabled
+    from dermascan.shared.cosmetic_feature_flags import cosmetic_pivot_enabled as pivot_flag
+
+    return pivot_flag()
+
+
+def _resolve_skin_first_routing_enabled(cosmetic_skin_first_routing: bool | None) -> bool:
+    """
+    Resolve whether skin-first product routing rules apply.
+
+    Args:
+        cosmetic_skin_first_routing: Explicit override for tests; when None, read env flags.
+
+    Returns:
+        bool: True when pivot and skin-first routing are both active.
+    """
+    if cosmetic_skin_first_routing is not None:
+        return cosmetic_skin_first_routing
+    from dermascan.shared.cosmetic_feature_flags import cosmetic_skin_first_routing_active
+
+    return cosmetic_skin_first_routing_active()
+
+
+def has_product_image(session: IntakeSession) -> bool:
+    """
+    Return True when a product-category intake image is registered.
+
+    Args:
+        session: Current intake session.
+
+    Returns:
+        bool: True when product image slot is filled.
+    """
+    return IntakeImageCategory.PRODUCT.value in session.images
+
+
+def has_product_reference(session: IntakeSession) -> bool:
+    """
+    Return True when the session has a product image or text reference.
+
+    Args:
+        session: Current intake session.
+
+    Returns:
+        bool: True when product image or ``product_ref_text`` is present.
+    """
+    return has_product_image(session) or bool(session.product_ref_text.strip())
+
+
 def compute_missing_for_routing(
     session: IntakeSession,
     profile: Mapping[str, Any],
+    *,
+    cosmetic_pivot_enabled: bool | None = None,
+    cosmetic_skin_first_routing: bool | None = None,
+    skin_audit: Mapping[str, Any] | None = None,
+    skin_audit_updated_at_ts: int | None = None,
+    now_ts: int | None = None,
 ) -> list[str]:
     """
     Derive missing routing prerequisites from session state and profile.
@@ -298,6 +371,11 @@ def compute_missing_for_routing(
     Args:
         session: Current intake session.
         profile: Current skin profile mapping.
+        cosmetic_pivot_enabled: Optional override for pivot routing rules.
+        cosmetic_skin_first_routing: Optional override for skin-first product gating.
+        skin_audit: Latest persisted skin audit for the client, if loaded.
+        skin_audit_updated_at_ts: Redis envelope timestamp for the skin audit.
+        now_ts: Optional unix timestamp override for freshness checks.
 
     Returns:
         list[str]: Stable missing tokens (see MISSING_* constants).
@@ -308,13 +386,25 @@ def compute_missing_for_routing(
         missing.append(MISSING_SERVICE_INTENT)
         return missing
 
+    pivot_routing = _resolve_cosmetic_pivot_routing_enabled(cosmetic_pivot_enabled)
+    skin_first = _resolve_skin_first_routing_enabled(cosmetic_skin_first_routing)
     requirements = ROUTING_REQUIREMENTS[session.service_intent]
 
     for category in requirements.required_image_categories:
-        if category.value not in session.images:
-            if category == IntakeImageCategory.SKIN:
+        if category == IntakeImageCategory.SKIN:
+            if (
+                pivot_routing
+                and session.skin_snapshot_skipped
+                and session.service_intent == ServiceIntent.COMBINED
+            ):
+                continue
+            if category.value not in session.images:
                 missing.append(MISSING_SKIN_IMAGE)
-            elif category == IntakeImageCategory.PRODUCT:
+        elif category == IntakeImageCategory.PRODUCT:
+            if pivot_routing:
+                if not has_product_reference(session):
+                    missing.append(MISSING_PRODUCT_IMAGE)
+            elif category.value not in session.images:
                 missing.append(MISSING_PRODUCT_IMAGE)
 
     if requirements.requires_primary_concern and not session.primary_concern.strip():
@@ -331,6 +421,21 @@ def compute_missing_for_routing(
         and not session.reproductive_status_confirmed
     ):
         missing.append(MISSING_REPRODUCTIVE_STATUS)
+
+    if (
+        skin_first
+        and pivot_routing
+        and session.service_intent == ServiceIntent.PRODUCT_REVIEW
+        and not session.skin_snapshot_skipped
+    ):
+        from dermascan.shared.cosmetic_profile import is_skin_snapshot_fresh
+
+        if not is_skin_snapshot_fresh(
+            skin_audit,
+            skin_audit_updated_at_ts,
+            now_ts=now_ts,
+        ):
+            missing.append(MISSING_SKIN_SNAPSHOT)
 
     return missing
 
@@ -363,6 +468,9 @@ def infer_phase(session: IntakeSession, missing_for_routing: list[str]) -> Intak
     if MISSING_SKIN_IMAGE in missing_for_routing or MISSING_PRODUCT_IMAGE in missing_for_routing:
         return IntakePhase.IMAGE_INTAKE
 
+    if MISSING_SKIN_SNAPSHOT in missing_for_routing:
+        return IntakePhase.IMAGE_INTAKE
+
     if (
         MISSING_PRIMARY_CONCERN in missing_for_routing
         or MISSING_REPRODUCTIVE_STATUS in missing_for_routing
@@ -377,6 +485,10 @@ def recompute_session(
     profile: Mapping[str, Any],
     *,
     now_ms: Optional[int] = None,
+    cosmetic_pivot_enabled: bool | None = None,
+    cosmetic_skin_first_routing: bool | None = None,
+    skin_audit: Mapping[str, Any] | None = None,
+    skin_audit_updated_at_ts: int | None = None,
 ) -> IntakeSession:
     """
     Refresh derived intake fields after a mutation.
@@ -391,7 +503,16 @@ def recompute_session(
     """
     timestamp = now_ms if now_ms is not None else int(time.time() * 1000)
     profile_gaps = compute_profile_gaps(profile, session.confirmed_none_fields)
-    missing = compute_missing_for_routing(session, profile)
+    now_ts = timestamp // 1000
+    missing = compute_missing_for_routing(
+        session,
+        profile,
+        cosmetic_pivot_enabled=cosmetic_pivot_enabled,
+        cosmetic_skin_first_routing=cosmetic_skin_first_routing,
+        skin_audit=skin_audit,
+        skin_audit_updated_at_ts=skin_audit_updated_at_ts,
+        now_ts=now_ts,
+    )
     phase = infer_phase(session, missing)
 
     updates: dict[str, Any] = {
@@ -406,18 +527,40 @@ def recompute_session(
     return session.model_copy(update=updates)
 
 
-def is_ready_to_route(session: IntakeSession, profile: Mapping[str, Any]) -> bool:
+def is_ready_to_route(
+    session: IntakeSession,
+    profile: Mapping[str, Any],
+    *,
+    cosmetic_pivot_enabled: bool | None = None,
+    cosmetic_skin_first_routing: bool | None = None,
+    skin_audit: Mapping[str, Any] | None = None,
+    skin_audit_updated_at_ts: int | None = None,
+    now_ts: int | None = None,
+) -> bool:
     """
     Return True when all routing prerequisites are satisfied.
 
     Args:
         session: Current intake session.
         profile: Current skin profile mapping.
+        cosmetic_pivot_enabled: Optional override for cosmetic pivot routing rules.
+        cosmetic_skin_first_routing: Optional override for skin-first product gating.
+        skin_audit: Latest persisted skin audit for the client, if loaded.
+        skin_audit_updated_at_ts: Redis envelope timestamp for the skin audit.
+        now_ts: Optional unix timestamp override for freshness checks.
 
     Returns:
         bool: True when ``missing_for_routing`` would be empty.
     """
-    return not compute_missing_for_routing(session, profile)
+    return not compute_missing_for_routing(
+        session,
+        profile,
+        cosmetic_pivot_enabled=cosmetic_pivot_enabled,
+        cosmetic_skin_first_routing=cosmetic_skin_first_routing,
+        skin_audit=skin_audit,
+        skin_audit_updated_at_ts=skin_audit_updated_at_ts,
+        now_ts=now_ts,
+    )
 
 
 def build_collected_context_summary(
@@ -439,6 +582,12 @@ def build_collected_context_summary(
 
     if session.primary_concern.strip():
         parts.append(f"Primary concern: {session.primary_concern.strip()}.")
+
+    if session.product_ref_text.strip():
+        parts.append(f"Product reference: {session.product_ref_text.strip()}.")
+
+    if session.skin_snapshot_skipped:
+        parts.append("Skin snapshot: skipped (generic product check).")
 
     goals = profile.get("current_goals") or []
     if isinstance(goals, list) and goals:

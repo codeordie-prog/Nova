@@ -12,8 +12,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from dermascan.shared.cosmetic_types import PersonalizationMode, has_skin_context
+
 
 ReviewType = Literal["product", "skin", "hybrid"]
+ConfidenceTier = Literal["high", "moderate", "low"]
+GuidanceMode = Literal["full", "cautious", "clarify"]
 
 
 class SkinContext(BaseModel):
@@ -55,6 +59,9 @@ class SkinAudit(BaseModel):
     confidence: float = 0.0
     completeness_score: float = 0.0
     missing_fields: list[str] = Field(default_factory=list)
+    risk_tier: str = "cosmetic"
+    image_quality: str = "unknown"
+    avoid_for_now: list[str] = Field(default_factory=list)
 
 
 class RulesEngineRequest(BaseModel):
@@ -67,10 +74,14 @@ class RulesEngineRequest(BaseModel):
     message_id: str
     channel: str
     review_type: ReviewType = "product"
+    personalization_mode: PersonalizationMode = "personalized"
     escalation_notes: str = ""
     ingredients: list[str] = Field(default_factory=list)
     skin_context: SkinContext = Field(default_factory=SkinContext)
     skin_audit: SkinAudit = Field(default_factory=SkinAudit)
+    primary_observation: str = ""
+    risk_tier: str = "cosmetic"
+    image_quality: str = "unknown"
     diagnosis: str = ""
     summary: str = ""
     treatment: str = ""
@@ -82,6 +93,15 @@ class RulesEngineRequest(BaseModel):
     how_to_use: str = ""
     special_instructions: str = ""
     raw_model_json: str = ""
+
+    def has_skin_context(self) -> bool:
+        """
+        Return True when product guidance may use vision-derived skin observations.
+
+        Returns:
+            bool: True only when ``personalization_mode`` is ``personalized``.
+        """
+        return has_skin_context(self.personalization_mode)
 
 
 class IngredientIndexResult(BaseModel):
@@ -109,6 +129,10 @@ class RulesEngineResponse(BaseModel):
     escalation_notes: str = ""
     indexed_ingredients: list[IngredientIndexResult] = Field(default_factory=list)
     report: dict[str, Any] = Field(default_factory=dict)
+    decision_confidence: float | None = None
+    confidence_tier: ConfidenceTier | None = None
+    guidance_mode: GuidanceMode | None = None
+    confidence_components: dict[str, float] = Field(default_factory=dict)
 
 
 class Engine(ABC):

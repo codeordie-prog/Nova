@@ -18,6 +18,10 @@ import os
 import time
 from typing import Any, Final, Mapping, Optional
 
+from dermascan.shared.cosmetic_feature_flags import (
+    cosmetic_pivot_enabled,
+    cosmetic_skin_first_routing_active,
+)
 from dermascan.shared.intake_session import (
     INTAKE_SESSION_TTL_S,
     IntakePhase,
@@ -28,6 +32,7 @@ from dermascan.shared.intake_session import (
     new_intake_session,
     recompute_session,
 )
+from dermascan.shared.skin_audit_store import load_latest_skin_audit
 from dermascan.shared.redis_stability import get_redis_client, run_with_redis_retries
 
 _LOGGER: Final[logging.Logger] = logging.getLogger("dermascan.intake_session_store")
@@ -309,6 +314,61 @@ def get_or_create_intake_session(
     return create_intake_session(cid, case, redis_client=redis_client)
 
 
+def _load_skin_audit_for_routing(client_id: str) -> tuple[dict[str, Any], int | None]:
+    """
+    Load latest skin audit when skin-first routing may apply.
+
+    Args:
+        client_id: Client identifier.
+
+    Returns:
+        tuple[dict[str, Any], int | None]: Skin audit mapping and update timestamp.
+    """
+    if not cosmetic_skin_first_routing_active():
+        return {}, None
+    try:
+        return load_latest_skin_audit(client_id)
+    except Exception:
+        _LOGGER.warning(
+            "failed to load skin audit for intake recompute: client_id=%s",
+            client_id,
+            exc_info=True,
+        )
+        return {}, None
+
+
+def recompute_intake_session(
+    session: IntakeSession,
+    profile: Mapping[str, Any],
+    *,
+    now_ms: Optional[int] = None,
+) -> IntakeSession:
+    """
+    Recompute derived intake fields with cosmetic routing context loaded.
+
+    Loads the latest skin audit from Redis when skin-first routing is active so
+    ``missing_for_routing`` reflects snapshot freshness without persisting.
+
+    Args:
+        session: Intake session to recompute.
+        profile: Current skin profile mapping.
+        now_ms: Optional timestamp override for tests.
+
+    Returns:
+        IntakeSession: Session with updated phase and missing_for_routing.
+    """
+    skin_audit, skin_audit_updated_at_ts = _load_skin_audit_for_routing(session.client_id)
+    return recompute_session(
+        session,
+        profile,
+        now_ms=now_ms,
+        cosmetic_pivot_enabled=cosmetic_pivot_enabled(),
+        cosmetic_skin_first_routing=cosmetic_skin_first_routing_active(),
+        skin_audit=skin_audit,
+        skin_audit_updated_at_ts=skin_audit_updated_at_ts,
+    )
+
+
 def save_intake_session_recomputed(
     session: IntakeSession,
     profile: Mapping[str, Any],
@@ -331,7 +391,7 @@ def save_intake_session_recomputed(
     Raises:
         IntakeSessionStoreError: When Redis is configured but the write fails.
     """
-    recomputed = recompute_session(session, profile, now_ms=now_ms)
+    recomputed = recompute_intake_session(session, profile, now_ms=now_ms)
     summary = build_collected_context_summary(recomputed, profile)
     final = recomputed.model_copy(update={"collected_context_summary": summary})
     save_intake_session(final, redis_client=redis_client)
