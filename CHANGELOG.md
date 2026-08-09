@@ -7,7 +7,7 @@ product safety against CIR evidence, decision-confidence copy, and consent-gated
 change ships **behind feature flags that default OFF** — legacy diagnosis, combined-intent, and
 confidence-only escalation behavior is unchanged until flags are enabled.
 
-> Commits: `9442dc2..dfb9cd9` on `main`. Rollout guide: `dermascan/docs/cosmetic-pivot.md`.
+> Commits: `9442dc2..cedc956` on `main`. Rollout guide: `dermascan/docs/cosmetic-pivot.md`.
 > Author: cursor + Kelvin(specs and logic).
 
 ---
@@ -225,6 +225,79 @@ expose consent escalation tool. Legacy combined-intent enqueue unchanged when fl
 
 ---
 
+#### Step 8.2a — Consent offer keyed by `client_id` (`95341e5`)
+
+**Why:** Users may accept a watch-tier specialist offer on a later turn than the one that delivered it.
+Legacy case-keyed offers expire when the turn ends.
+
+**Changed:**
+- `dermascan/ai_service/postprocessing/escalation.py` — primary Redis key
+  `escalation:consent_offer:client:{client_id}` with legacy case-key dual-write/fallback
+- `dermascan/backend/services/tools/orchestrator/orchestrator_tools.py` — consent tool resolves
+  `client_id` from ingress and looks up/dispatches by client
+- `dermascan/tests/unit/test_consent_escalation.py` — cross-turn acceptance coverage
+
+---
+
+#### Step 8.2b — Medications context gate + enriched audit summary (`1512e14`)
+
+**Why:** Watch-tier guardrails and specialist handoffs need treatment context (on Rx vs untreated)
+before skin snapshot review is enqueued.
+
+**Changed:**
+- `dermascan/shared/intake_session.py` — `MISSING_MEDICATIONS_CONTEXT` routing gate,
+  `build_collected_context_summary()` includes medications/products/conditions
+- `dermascan/shared/intake_session_store.py` — pass consent flag into session recompute
+- `dermascan/backend/services/tools/orchestrator/orchestrator_tools.py` — deterministic
+  intake guidance when medications context is missing
+- `dermascan/backend/services/agents/prompts/orchestrator_prompt.py` — collect
+  `current_medications` before skin enqueue
+- `dermascan/tests/unit/test_intake_session.py` — gate + summary tests
+
+---
+
+#### Step 8.2c — MedGemma watch rubric + deterministic guardrail (`c46afd9`)
+
+**Why:** Untreated moderate/severe inflammatory patterns should surface as watch-tier offers even
+when MedGemma returns `cosmetic`; treated users stay cosmetic.
+
+**Changed:**
+- `dermascan/ai_service/modal/medgemma_service/app.py` — expanded `risk_tier` rubric
+- `dermascan/ai_service/postprocessing/consent_escalation.py` — `should_apply_watch_tier_guardrail()`,
+  `resolve_consent_escalation_decision()` wrapper
+- `dermascan/ai_service/postprocessing/escalation.py` — route through consent decision wrapper
+- `dermascan/tests/unit/test_consent_escalation.py` — guardrail unit tests
+
+---
+
+#### Step 8.2d — User-initiated escalation builder (`2b9b627`)
+
+**Why:** Users can request specialist review after any skin snapshot review, not only when a watch-tier
+offer was delivered.
+
+**Added/changed:**
+- `dermascan/ai_service/postprocessing/escalation.py` — `resolve_user_escalation_context()`,
+  `dispatch_user_requested_escalation()` with dedupe key
+- `dermascan/shared/skin_audit_store.py` — `load_latest_skin_audit_envelope()`
+- `dermascan/backend/services/tools/orchestrator/orchestrator_tools.py` — on-demand path in
+  `request_specialist_escalation`; returns `missing_skin_context` / `already_queued`
+- `dermascan/backend/services/agents/prompts/orchestrator_prompt.py` — user-initiated escalation copy
+- `dermascan/tests/unit/test_consent_escalation.py` — on-demand builder tests
+
+---
+
+#### Fix — Redis consent-offer dispatch on real Redis (`cedc956`)
+
+**Why:** `_redis.get()` returned bytes without `decode_responses=True`; `json.loads(str(raw))` produced
+invalid JSON (`b'{"..."}'` repr) so `dispatch_consent_escalation` failed silently while
+`has_pending_consent_escalation_offer` still returned true.
+
+**Changed:**
+- `dermascan/ai_service/postprocessing/escalation.py` — `decode_responses=True`, parse via
+  `_to_str(raw)`, structured logging on dispatch failure
+
+---
+
 ### 5. Smoke tests (before enabling in staging)
 
 | Test | Flow |
@@ -234,6 +307,7 @@ expose consent escalation tool. Legacy combined-intent enqueue unchanged when fl
 | C | User skips skin, product name → generic disclaimer report |
 | D | Low confidence product → cautious/clarify copy, no auto-escalation |
 | E | Skin `watch` tier → offer only; user accepts → escalation job |
+| F | User requests specialist without prior offer → on-demand escalation when skin audit exists |
 
 ---
 
@@ -244,6 +318,8 @@ expose consent escalation tool. Legacy combined-intent enqueue unchanged when fl
 - **Flags are independent layers.** Enable `COSMETIC_PIVOT_ENABLED` first, then child flags one at a time.
 - **Legacy path preserved.** With all flags off, behavior matches pre-pivot diagnosis flows.
 - **Pending steps:** 6.2 (deprecate combined intent, optional), 9.x (legacy cleanup).
+- **Restart workers after deploy.** Orchestrator and MedGemma workers cache imported modules;
+  consent-offer dispatch fixes require an orchestrator worker restart.
 - **INCI alias gap:** Bilingual names like `Aqua/Water` normalize to `aquawater` and may miss CIR
   Postgres matches; common single-name ingredients (Niacinamide, Glycerin) resolve correctly after
   the Redis cache fix.
