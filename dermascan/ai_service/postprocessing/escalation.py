@@ -15,6 +15,7 @@ the Physician irregardless of the confidence score - This is purposefully to imp
 the quality of the product as time goes by.
 
 """
+import logging
 import os
 import json
 
@@ -72,8 +73,10 @@ ESCALATION_DEFERRED_CLIENT_MESSAGE: str = os.environ.get(
 )
 
 
+_LOGGER: logging.Logger = logging.getLogger("dermascan.ai_service.postprocessing.escalation")
+
 # Initialize REDIS client
-_redis: Redis = Redis.from_url(_REDIS_URL)
+_redis: Redis = Redis.from_url(_REDIS_URL, decode_responses=True)
 
 @dataclass
 class _JobEntry:
@@ -302,12 +305,27 @@ def dispatch_consent_escalation(
     """
     key, raw = _load_consent_offer_raw(client_id=client_id, case_id=case_id)
     if not key or not raw:
+        _LOGGER.warning(
+            "dispatch_consent_escalation: no cached offer for client_id=%s case_id=%s",
+            client_id,
+            case_id,
+        )
         return False
     try:
-        fields = json.loads(str(raw))
-    except Exception:
+        fields = json.loads(_to_str(raw))
+    except Exception as exc:
+        _LOGGER.exception(
+            "dispatch_consent_escalation: offer payload not valid JSON for key=%s: %s",
+            key,
+            exc,
+        )
         return False
     if not isinstance(fields, dict):
+        _LOGGER.warning(
+            "dispatch_consent_escalation: offer payload not a dict for key=%s (type=%s)",
+            key,
+            type(fields).__name__,
+        )
         return False
     try:
         _redis.xadd(
@@ -320,7 +338,12 @@ def dispatch_consent_escalation(
         legacy_case = str(fields.get("case_id") or "").strip()
         if legacy_case:
             _redis.delete(_consent_offer_key_legacy_case(legacy_case))
-    except Exception:
+    except Exception as exc:
+        _LOGGER.exception(
+            "dispatch_consent_escalation: xadd/delete failed for client_id=%s: %s",
+            client_id,
+            exc,
+        )
         return False
     return True
 
