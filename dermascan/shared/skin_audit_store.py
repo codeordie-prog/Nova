@@ -79,6 +79,37 @@ def parse_signal_confidence(raw: str) -> float:
     return max(0.0, min(1.0, value))
 
 
+def load_latest_skin_audit_envelope(client_id: str) -> dict[str, Any]:
+    """
+    Load the full persisted skin-audit Redis envelope for a client.
+
+    Args:
+        client_id: Client identifier.
+
+    Returns:
+        dict[str, Any]: Envelope mapping or empty dict when absent.
+    """
+    key = skin_audit_key(client_id)
+    try:
+        redis_client = get_redis_client(decode_responses=True)
+        raw_payload = run_with_redis_retries(
+            lambda: redis_client.get(key),
+            operation_name="skin_audit_get",
+        )
+    except Exception as exc:
+        logger.warning(
+            "failed to load skin audit envelope from redis: client_id=%s err=%s",
+            client_id,
+            exc,
+        )
+        return {}
+
+    if not raw_payload:
+        return {}
+    parsed = _safe_json_loads(str(raw_payload))
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def load_latest_skin_audit(client_id: str) -> tuple[dict[str, Any], int | None]:
     """
     Load latest persisted skin audit (+timestamp) from Redis for a client.
