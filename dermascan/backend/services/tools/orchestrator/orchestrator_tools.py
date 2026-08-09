@@ -33,6 +33,7 @@ from dermascan.shared.ingress_payload import (
 from dermascan.ai_service.postprocessing.escalation import (
     ESCALATION_CLIENT_MESSAGE,
     dispatch_consent_escalation,
+    dispatch_user_requested_escalation,
     has_pending_consent_escalation_offer,
 )
 from dermascan.shared.cosmetic_feature_flags import (
@@ -51,6 +52,7 @@ from dermascan.shared.intake_session import (
     MISSING_PRIMARY_CONCERN,
     MISSING_PRODUCT_IMAGE,
     MISSING_PROFILE_MINIMUM,
+    MISSING_MEDICATIONS_CONTEXT,
     MISSING_REPRODUCTIVE_STATUS,
     MISSING_SERVICE_INTENT,
     MISSING_SKIN_IMAGE,
@@ -1118,6 +1120,7 @@ def _derive_intake_next_action(session: IntakeSession, profile: dict[str, Any]) 
         MISSING_SERVICE_INTENT in missing
         or MISSING_PRIMARY_CONCERN in missing
         or MISSING_PROFILE_MINIMUM in missing
+        or MISSING_MEDICATIONS_CONTEXT in missing
         or MISSING_REPRODUCTIVE_STATUS in missing
     ):
         return "update_intake"
@@ -1187,6 +1190,15 @@ def _intake_instruction(session: IntakeSession, profile: dict[str, Any]) -> str:
             "Use values the user stated in their latest message. If the user said they "
             "have none for a list field (e.g. no products, no allergies), pass an empty "
             f"list [] for that field to record it.{stop}"
+        )
+
+    if MISSING_MEDICATIONS_CONTEXT in session.missing_for_routing:
+        return (
+            "Before skin snapshot review, ask whether the user is on any prescribed or "
+            "over-the-counter skin/acne medications (topical or oral). Call update_intake "
+            "with current_medications from their answer. If they have none, pass "
+            "current_medications=[] to record that explicitly."
+            f"{stop}"
         )
 
     if MISSING_REPRODUCTIVE_STATUS in session.missing_for_routing:
@@ -3297,11 +3309,11 @@ def check_medgemma_health() -> dict[str, str]:
 @tool
 def request_specialist_escalation(request_id: OrchestratorRequestIdArg) -> dict[str, Any]:
     """
-    Dispatch a cached specialist escalation after explicit user consent.
+    Dispatch specialist review after explicit user consent.
 
-    Call only when the user clearly accepts the optional specialist review offer
-    (e.g. "yes connect me", "I'd like a specialist review") and a pending offer exists
-    for the active case.
+    First tries a cached watch-tier consent offer. If none exists, builds an
+    on-demand escalation job from the client's latest skin audit and intake context
+    when a skin snapshot is already on file.
 
     Args:
         request_id: Exact request_id from the current orchestrator turn.
@@ -3328,42 +3340,99 @@ def request_specialist_escalation(request_id: OrchestratorRequestIdArg) -> dict[
 
     case_id = str(envelope.get("case_id") or "").strip()
     client_id = str(envelope.get("client_id") or "anonymous").strip()
-    if not case_id:
+    message_id = str(envelope.get("message_id") or request_id).strip()
+    channel = str(envelope.get("channel") or "").strip()
+    logger.info(
+        "request_specialist_escalation resolved ingress: request_id=%s client_id=%s case_id=%s",
+        request_id,
+        client_id,
+        case_id,
+    )
+    if not client_id:
         return {
             "status": "error",
             "request_id": request_id,
-            "detail": "missing case_id in ingress envelope",
+            "detail": "missing client_id in ingress envelope",
         }
 
-    if not has_pending_consent_escalation_offer(case_id):
+    if has_pending_consent_escalation_offer(client_id, case_id=case_id or None):
+        if not dispatch_consent_escalation(client_id, case_id=case_id or None):
+            return {
+                "status": "error",
+                "request_id": request_id,
+                "case_id": case_id,
+                "client_id": client_id,
+                "detail": "failed to dispatch consent escalation job",
+            }
         return {
-            "status": "no_pending_offer",
+            "status": "queued",
             "request_id": request_id,
             "case_id": case_id,
+            "client_id": client_id,
+            "client_message": ESCALATION_CLIENT_MESSAGE,
             "instruction": (
-                "There is no pending specialist review offer for this case. "
-                "Do NOT call this tool again unless a new offer was just delivered."
+                "Tell the user a skin specialist has been contacted and will follow up. "
+                "Use the client_message text. Do NOT call this tool again for the same offer."
             ),
         }
 
-    if not dispatch_consent_escalation(case_id):
+    intake_session = load_intake_session(client_id, redis_client=_redis)
+    profile = _load_skin_profile_mapping(client_id)
+    dispatch_status = dispatch_user_requested_escalation(
+        client_id,
+        current_request_id=request_id,
+        current_case_id=case_id,
+        message_id=message_id,
+        channel=channel,
+        intake_session=intake_session,
+        profile=profile,
+    )
+
+    if dispatch_status == "dispatched":
         return {
-            "status": "error",
+            "status": "queued",
             "request_id": request_id,
             "case_id": case_id,
-            "detail": "failed to dispatch consent escalation job",
+            "client_id": client_id,
+            "dispatch_path": "user_requested",
+            "client_message": ESCALATION_CLIENT_MESSAGE,
+            "instruction": (
+                "Tell the user a skin specialist has been contacted and will follow up. "
+                "Use the client_message text. Do NOT call this tool again for this request."
+            ),
+        }
+
+    if dispatch_status == "already_dispatched":
+        return {
+            "status": "already_queued",
+            "request_id": request_id,
+            "case_id": case_id,
+            "client_id": client_id,
+            "instruction": (
+                "Specialist review was already queued for this client recently. "
+                "Reassure the user and do NOT call this tool again."
+            ),
+        }
+
+    if dispatch_status == "missing_context":
+        return {
+            "status": "missing_skin_context",
+            "request_id": request_id,
+            "case_id": case_id,
+            "client_id": client_id,
+            "instruction": (
+                "There is no skin snapshot or recent skin audit on file to escalate. "
+                "Ask for a close-up skin photo, register it, and enqueue skin review first. "
+                "Do NOT call this tool again until a skin snapshot has been reviewed."
+            ),
         }
 
     return {
-        "status": "queued",
+        "status": "error",
         "request_id": request_id,
         "case_id": case_id,
         "client_id": client_id,
-        "client_message": ESCALATION_CLIENT_MESSAGE,
-        "instruction": (
-            "Tell the user a skin specialist has been contacted and will follow up. "
-            "Use the client_message text. Do NOT call this tool again for the same offer."
-        ),
+        "detail": "failed to dispatch user-requested escalation job",
     }
 
 

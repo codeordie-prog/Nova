@@ -59,6 +59,10 @@ Derivation helper: `dermascan.shared.cosmetic_profile.derive_personalization_mod
 | 6.2 | pending | Deprecate combined intent (optional) |
 | 7.1 | done | Guidance mode → product report prompts + footers |
 | 8.1 | done | Risk-tier + consent-gated escalation |
+| 8.2a | done | Consent offer keyed by `client_id` (cross-turn acceptance) |
+| 8.2b | done | Enrich audit context + orchestrator meds intake |
+| 8.2c | done | MedGemma risk rubric + deterministic watch bump |
+| 8.2d | done | User-initiated escalation builder |
 | 9.x | pending | Legacy cleanup |
 
 ## Smoke tests (run before enabling flags in staging)

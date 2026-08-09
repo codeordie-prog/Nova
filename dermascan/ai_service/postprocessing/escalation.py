@@ -19,14 +19,22 @@ import os
 import json
 
 from dotenv import load_dotenv
-from typing import Dict, Any
+from typing import Any, Mapping
 from dataclasses import dataclass
 
 from redis import Redis
 
-from dermascan.ai_service.postprocessing.consent_escalation import resolve_escalation_decision
+from dermascan.ai_service.postprocessing.consent_escalation import resolve_consent_escalation_decision
 from dermascan.ai_service.postprocessing.medgemma_structured_output import extract_structured_fields
 from dermascan.shared.cosmetic_feature_flags import cosmetic_consent_escalation_active
+from dermascan.shared.cosmetic_profile import _skin_audit_has_observations
+from dermascan.shared.escalation_image import cache_escalation_image_path, resolve_escalation_image_blob_path
+from dermascan.shared.intake_session import (
+    IntakeImageCategory,
+    IntakeSession,
+    build_collected_context_summary,
+)
+from dermascan.shared.skin_audit_store import load_latest_skin_audit_envelope
 from dermascan.shared.stream_pipeline_tracing import enrich_stream_fields, record_stream_produce
 
 # load environment variables
@@ -42,7 +50,10 @@ _DIAGNOSE_CONFIDENCE_THRESHOLD: float = float(os.environ.get("DIAGNOSE_CONFIDENC
 _PRODUCT_REVIEW_CONFIDENCE_THRESHOLD: float = float(os.environ.get("PRODUCT_REVIEW_CONFIDENCE_THRESHOLD", "0.60"))
 _ESCALATION_DLQ_STREAM: str = os.environ.get("ESCALATION_DLQ_STREAM", "escalation:dlq")
 _EVENTS_DLQ_STREAM: str = os.environ.get("EVENTS_DLQ_STREAM","events:dlq")
-_CONSENT_OFFER_KEY_TEMPLATE: str = "escalation:consent_offer:{case_id}"
+_CONSENT_OFFER_CLIENT_KEY_TEMPLATE: str = "escalation:consent_offer:client:{client_id}"
+_CONSENT_OFFER_LEGACY_CASE_KEY_TEMPLATE: str = "escalation:consent_offer:{case_id}"
+_USER_ESCALATION_DEDUPE_KEY_TEMPLATE: str = "escalation:user_requested:client:{client_id}"
+_INGRESS_PAYLOAD_CACHE_PREFIX: str = "orchestrator:ingress_payload"
 _CONSENT_OFFER_TTL_SECONDS: int = max(
     3600,
     int(os.environ.get("ESCALATION_CONSENT_OFFER_TTL_SECONDS", str(7 * 24 * 3600))),
@@ -137,18 +148,73 @@ def resolve_client_message_for_signal(fields: dict[str, Any]) -> str | None:
     return None
 
 
-def _consent_offer_key(case_id: str) -> str:
+def _consent_offer_key_for_client(client_id: str) -> str:
     """
-    Build Redis key for a pending consent-gated escalation offer.
+    Build Redis key for a pending consent-gated escalation offer for a client.
+
+    Offers are keyed by ``client_id`` because each inbound message receives a
+    new ``case_id``; consent acceptance arrives on a later turn.
 
     Args:
-        case_id: Case identifier.
+        client_id: Stable client identifier from ingress.
 
     Returns:
         str: Redis key string.
     """
+    normalized = str(client_id or "").strip() or "anonymous"
+    return _CONSENT_OFFER_CLIENT_KEY_TEMPLATE.format(client_id=normalized)
+
+
+def _consent_offer_key_legacy_case(case_id: str) -> str:
+    """
+    Build legacy Redis key keyed by skin-audit ``case_id`` (pre-8.2a).
+
+    Args:
+        case_id: Skin audit case identifier.
+
+    Returns:
+        str: Legacy Redis key string.
+    """
     normalized = str(case_id or "").strip() or "anonymous"
-    return _CONSENT_OFFER_KEY_TEMPLATE.format(case_id=normalized)
+    return _CONSENT_OFFER_LEGACY_CASE_KEY_TEMPLATE.format(case_id=normalized)
+
+
+def _load_consent_offer_raw(
+    *,
+    client_id: str,
+    case_id: str | None = None,
+) -> tuple[str | None, str | None]:
+    """
+    Load a cached consent offer, preferring the client key with legacy fallback.
+
+    Args:
+        client_id: Stable client identifier.
+        case_id: Optional current-turn case id for legacy key lookup.
+
+    Returns:
+        tuple[str | None, str | None]: Redis key and payload text when found.
+    """
+    client = str(client_id or "").strip()
+    if client:
+        client_key = _consent_offer_key_for_client(client)
+        try:
+            raw = _redis.get(client_key)
+        except Exception:
+            raw = None
+        if raw:
+            return client_key, str(raw)
+
+    legacy_case = str(case_id or "").strip()
+    if legacy_case:
+        legacy_key = _consent_offer_key_legacy_case(legacy_case)
+        try:
+            raw = _redis.get(legacy_key)
+        except Exception:
+            raw = None
+        if raw:
+            return legacy_key, str(raw)
+
+    return None, None
 
 
 def _cache_consent_escalation_offer(
@@ -172,7 +238,8 @@ def _cache_consent_escalation_offer(
         text: Raw model response text.
     """
     case_id = str(entry.case_id or "").strip()
-    if not case_id:
+    client_id = str(entry.client_id or "").strip()
+    if not client_id:
         return
     payload = {
         "request_id": entry.request_id,
@@ -202,34 +269,39 @@ def _cache_consent_escalation_offer(
         "risk_tier": base_fields.get("risk_tier", "watch"),
     }
     try:
+        serialized = json.dumps(payload)
         _redis.setex(
-            _consent_offer_key(case_id),
+            _consent_offer_key_for_client(client_id),
             _CONSENT_OFFER_TTL_SECONDS,
-            json.dumps(payload),
+            serialized,
         )
+        if case_id:
+            _redis.setex(
+                _consent_offer_key_legacy_case(case_id),
+                _CONSENT_OFFER_TTL_SECONDS,
+                serialized,
+            )
     except Exception:
         pass
 
 
-def dispatch_consent_escalation(case_id: str) -> bool:
+def dispatch_consent_escalation(
+    client_id: str,
+    *,
+    case_id: str | None = None,
+) -> bool:
     """
     Push a cached consent-offer escalation job after explicit user acceptance.
 
     Args:
-        case_id: Case identifier tied to the pending offer.
+        client_id: Stable client identifier tied to the pending offer.
+        case_id: Optional current-turn case id for legacy offer lookup.
 
     Returns:
         bool: True when a job was dispatched to ``escalation:jobs``.
     """
-    case = str(case_id or "").strip()
-    if not case:
-        return False
-    key = _consent_offer_key(case)
-    try:
-        raw = _redis.get(key)
-    except Exception:
-        return False
-    if not raw:
+    key, raw = _load_consent_offer_raw(client_id=client_id, case_id=case_id)
+    if not key or not raw:
         return False
     try:
         fields = json.loads(str(raw))
@@ -245,28 +317,328 @@ def dispatch_consent_escalation(case_id: str) -> bool:
             approximate=True,
         )
         _redis.delete(key)
+        legacy_case = str(fields.get("case_id") or "").strip()
+        if legacy_case:
+            _redis.delete(_consent_offer_key_legacy_case(legacy_case))
     except Exception:
         return False
     return True
 
 
-def has_pending_consent_escalation_offer(case_id: str) -> bool:
+def has_pending_consent_escalation_offer(
+    client_id: str,
+    *,
+    case_id: str | None = None,
+) -> bool:
     """
-    Return True when a consent-gated escalation offer is cached for the case.
+    Return True when a consent-gated escalation offer is cached for the client.
 
     Args:
-        case_id: Case identifier.
+        client_id: Stable client identifier.
+        case_id: Optional current-turn case id for legacy key lookup.
 
     Returns:
         bool: True when an offer key exists in Redis.
     """
-    case = str(case_id or "").strip()
-    if not case:
-        return False
+    key, _ = _load_consent_offer_raw(client_id=client_id, case_id=case_id)
+    return bool(key)
+
+
+@dataclass(frozen=True)
+class UserEscalationContext:
+    """
+    Resolved client context for on-demand specialist escalation.
+
+    Attributes:
+        audit_case_id: Skin-audit case id used for dashboard/image lookup.
+        audit_request_id: MedGemma audit request id for image resolution.
+        message_id: Current-turn message id for relay tracking.
+        channel: Ingress channel for the current turn.
+        image_blob_path: Durable Firebase blob path when resolved.
+        diagnosis_text: Primary skin observation or concern text.
+        escalation_context: Intake/profile summary for specialist review.
+        risk_tier: Normalized risk tier from the latest skin audit.
+        summary: Structured summary fragment when available.
+        treatment: Structured treatment fragment when available.
+        confidence: Vision confidence from the latest skin audit, if known.
+    """
+
+    audit_case_id: str
+    audit_request_id: str
+    message_id: str
+    channel: str
+    image_blob_path: str
+    diagnosis_text: str
+    escalation_context: str
+    risk_tier: str
+    summary: Any
+    treatment: Any
+    confidence: float | None
+
+
+def _load_ingress_envelope(request_id: str) -> dict[str, Any]:
+    """
+    Load a cached orchestrator ingress envelope by request id.
+
+    Args:
+        request_id: Ingress request identifier.
+
+    Returns:
+        dict[str, Any]: Parsed envelope or empty dict.
+    """
+    rid = str(request_id or "").strip()
+    if not rid:
+        return {}
     try:
-        return bool(_redis.get(_consent_offer_key(case)))
+        raw = _redis.get(f"{_INGRESS_PAYLOAD_CACHE_PREFIX}:{rid}")
     except Exception:
-        return False
+        return {}
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(str(raw))
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _ingress_case_id(request_id: str) -> str:
+    """
+    Resolve case_id from a cached ingress envelope.
+
+    Args:
+        request_id: Ingress request identifier.
+
+    Returns:
+        str: Case id or empty string.
+    """
+    envelope = _load_ingress_envelope(request_id)
+    return str(envelope.get("case_id") or envelope.get("request_id") or request_id).strip()
+
+
+def _user_escalation_dedupe_key(client_id: str) -> str:
+    """
+    Build Redis dedupe key for user-requested specialist escalation.
+
+    Args:
+        client_id: Stable client identifier.
+
+    Returns:
+        str: Redis key string.
+    """
+    normalized = str(client_id or "").strip() or "anonymous"
+    return _USER_ESCALATION_DEDUPE_KEY_TEMPLATE.format(client_id=normalized)
+
+
+def resolve_user_escalation_context(
+    client_id: str,
+    *,
+    intake_session: IntakeSession | None = None,
+    profile: Mapping[str, Any] | None = None,
+    message_id: str = "",
+    channel: str = "",
+) -> UserEscalationContext | None:
+    """
+    Build specialist escalation context from persisted skin audit and intake state.
+
+    Requires a persisted skin audit snapshot and/or a registered skin intake image.
+
+    Args:
+        client_id: Stable client identifier.
+        intake_session: Optional active intake session.
+        profile: Optional skin profile mapping.
+        message_id: Current-turn message id for relay tracking.
+        channel: Current ingress channel.
+
+    Returns:
+        UserEscalationContext | None: Resolved context, or None when prerequisites missing.
+    """
+    normalized_client = str(client_id or "").strip()
+    if not normalized_client:
+        return None
+
+    envelope = load_latest_skin_audit_envelope(normalized_client)
+    skin_audit = envelope.get("skin_audit") if isinstance(envelope.get("skin_audit"), dict) else {}
+    audit_request_id = str(envelope.get("request_id") or "").strip()
+
+    session = intake_session
+    if session is None:
+        try:
+            from dermascan.shared.intake_session_store import load_intake_session
+
+            session = load_intake_session(normalized_client, redis_client=_redis)
+        except Exception:
+            session = None
+
+    profile_map: dict[str, Any] = dict(profile or {})
+    skin_ref = None
+    if session is not None:
+        skin_ref = session.images.get(IntakeImageCategory.SKIN.value)
+
+    has_audit = _skin_audit_has_observations(skin_audit) or bool(
+        str(skin_audit.get("primary_observation") or "").strip()
+    )
+    has_skin_image = skin_ref is not None
+    if not has_audit and not has_skin_image:
+        return None
+
+    audit_case_id = ""
+    for candidate in (audit_request_id, skin_ref.request_id if skin_ref else ""):
+        case_id = _ingress_case_id(candidate)
+        if case_id:
+            audit_case_id = case_id
+            break
+    if not audit_case_id and session is not None:
+        audit_case_id = str(session.case_id or "").strip()
+
+    image_blob_path = resolve_escalation_image_blob_path(
+        _redis,
+        request_id=audit_request_id,
+        case_id=audit_case_id,
+    )
+    if not image_blob_path and skin_ref is not None:
+        image_blob_path = resolve_escalation_image_blob_path(
+            _redis,
+            request_id=skin_ref.request_id,
+            case_id=_ingress_case_id(skin_ref.request_id),
+        )
+
+    diagnosis_text = (
+        str(skin_audit.get("primary_observation") or "").strip()
+        or str(skin_audit.get("primary_concern") or "").strip()
+        or (str(session.primary_concern).strip() if session is not None else "")
+    )
+    escalation_context = ""
+    if session is not None:
+        escalation_context = build_collected_context_summary(session, profile_map).strip()
+    if not escalation_context:
+        escalation_context = diagnosis_text
+
+    confidence_raw = skin_audit.get("confidence")
+    confidence: float | None
+    try:
+        confidence = float(confidence_raw) if confidence_raw is not None else None
+    except (TypeError, ValueError):
+        confidence = None
+
+    current_condition = skin_audit.get("current_condition")
+    summary = current_condition if isinstance(current_condition, dict) else {}
+    treatment = skin_audit.get("treatment") if isinstance(skin_audit.get("treatment"), dict) else {}
+
+    return UserEscalationContext(
+        audit_case_id=audit_case_id,
+        audit_request_id=audit_request_id or (skin_ref.request_id if skin_ref else ""),
+        message_id=str(message_id or "").strip(),
+        channel=str(channel or "").strip(),
+        image_blob_path=image_blob_path,
+        diagnosis_text=diagnosis_text,
+        escalation_context=escalation_context,
+        risk_tier=str(skin_audit.get("risk_tier") or "cosmetic"),
+        summary=summary,
+        treatment=treatment,
+        confidence=confidence,
+    )
+
+
+def dispatch_user_requested_escalation(
+    client_id: str,
+    *,
+    current_request_id: str,
+    current_case_id: str,
+    message_id: str,
+    channel: str,
+    intake_session: IntakeSession | None = None,
+    profile: Mapping[str, Any] | None = None,
+) -> str:
+    """
+    Queue a specialist escalation job built from persisted client context.
+
+    Used when the user explicitly requests specialist review without a cached
+    watch-tier consent offer (for example after a cosmetic-tier skin report).
+
+    Args:
+        client_id: Stable client identifier.
+        current_request_id: Current orchestrator turn request id.
+        current_case_id: Current turn case id (tracking only).
+        message_id: Current-turn message id.
+        channel: Ingress channel for the current turn.
+        intake_session: Optional active intake session.
+        profile: Optional skin profile mapping.
+
+    Returns:
+        str: ``dispatched``, ``missing_context``, ``already_dispatched``, or ``failed``.
+    """
+    normalized_client = str(client_id or "").strip()
+    if not normalized_client:
+        return "failed"
+
+    dedupe_key = _user_escalation_dedupe_key(normalized_client)
+    try:
+        if _redis.get(dedupe_key):
+            return "already_dispatched"
+    except Exception:
+        pass
+
+    context = resolve_user_escalation_context(
+        normalized_client,
+        intake_session=intake_session,
+        profile=profile,
+        message_id=message_id,
+        channel=channel,
+    )
+    if context is None or not context.audit_case_id:
+        return "missing_context"
+
+    payload = {
+        "request_id": context.audit_request_id or current_request_id,
+        "case_id": context.audit_case_id,
+        "client_id": normalized_client,
+        "message_id": context.message_id or message_id or current_request_id,
+        "channel": context.channel or channel,
+        "source_agent": "orchestrator",
+        "mode": "diagnose",
+        "reason": "user_requested_specialist",
+        "confidence": "" if context.confidence is None else str(context.confidence),
+        "threshold": "",
+        "diagnosis_text": context.diagnosis_text,
+        "requires_human_review": "true",
+        "product_name": "",
+        "description": "",
+        "indications": "",
+        "safety_in_pregnancy": "",
+        "contraindications": "",
+        "how_to_use": "",
+        "special_instructions": "",
+        "image_blob_path": context.image_blob_path,
+        "review_type": "Skin review",
+        "rationale": context.escalation_context,
+        "summary": _stream_json(context.summary),
+        "treatment": _stream_json(context.treatment),
+        "risk_tier": context.risk_tier,
+        "user_request_id": current_request_id,
+        "user_case_id": current_case_id,
+    }
+    try:
+        _redis.xadd(
+            _ESCALATION_STREAM,
+            {k: _to_str(v) for k, v in payload.items()},
+            maxlen=_EVENTS_STREAM_MAXLEN,
+            approximate=True,
+        )
+        _redis.setex(dedupe_key, _CONSENT_OFFER_TTL_SECONDS, current_request_id or "1")
+        client_offer_key = _consent_offer_key_for_client(normalized_client)
+        _redis.delete(client_offer_key)
+        if context.audit_case_id:
+            _redis.delete(_consent_offer_key_legacy_case(context.audit_case_id))
+        if context.image_blob_path and context.audit_case_id:
+            cache_escalation_image_path(
+                _redis,
+                case_id=context.audit_case_id,
+                blob_path=context.image_blob_path,
+            )
+    except Exception:
+        return "failed"
+    return "dispatched"
 
 
 def _build_orchestrator_signal_payload(
@@ -409,16 +781,20 @@ def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | 
         "image_quality": structured.get("image_quality", "unknown"),
     }
 
-    decision = resolve_escalation_decision(
+    decision = resolve_consent_escalation_decision(
         mode=mode,
         confidence=confidence,
         threshold=threshold_used,
         parsed_ok=parsed_ok,
         risk_tier=str(base_fields.get("risk_tier") or "cosmetic"),
         consent_escalation_active=cosmetic_consent_escalation_active(),
+        base_fields=base_fields,
+        audit_context=entry.prompt,
     )
     escalate = decision.auto_escalate
     escalation_offer = decision.offer_escalation
+    if decision.reason == "watch_guardrail_inflammatory_untreated":
+        base_fields["risk_tier"] = "watch"
 
     completed_status = f"{mode}_inference_completed"
     escalated_status = f"{mode}_escalated"
@@ -636,7 +1012,7 @@ def _push_signal(
     )
 
 
-def _push_event(fields: Dict[str, Any]) -> None:
+def _push_event(fields: dict[str, Any]) -> None:
     """
     Push a case to EVENT STREAM.
 
