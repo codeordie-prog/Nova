@@ -12,6 +12,7 @@ from dermascan.shared.intake_session import (
     MISSING_PRIMARY_CONCERN,
     MISSING_PRODUCT_IMAGE,
     MISSING_PROFILE_MINIMUM,
+    MISSING_MEDICATIONS_CONTEXT,
     MISSING_REPRODUCTIVE_STATUS,
     MISSING_SERVICE_INTENT,
     MISSING_SKIN_IMAGE,
@@ -27,6 +28,15 @@ from dermascan.shared.intake_session import (
     new_intake_session,
     recompute_session,
 )
+
+
+@pytest.fixture(autouse=True)
+def _disable_cosmetic_consent_escalation_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep legacy routing unless a test explicitly enables consent escalation."""
+    monkeypatch.setenv("COSMETIC_PIVOT_ENABLED", "false")
+    monkeypatch.setenv("COSMETIC_CONSENT_ESCALATION", "false")
 
 
 @pytest.mark.unit
@@ -294,6 +304,30 @@ class TestRecomputeAndSummary:
         assert "fragrance" in summary
         assert "Label visible" in summary
 
+    def test_context_summary_includes_medications_products_conditions(self) -> None:
+        session = IntakeSession(
+            client_id="c1",
+            case_id="case-1",
+            service_intent=ServiceIntent.SKIN_REVIEW,
+            primary_concern="Acne on cheeks",
+            confirmed_none_fields=["current_products"],
+        )
+        profile = {
+            "skin_type": "oily",
+            "current_products": [],
+            "current_medications": ["tretinoin"],
+            "current_conditions": ["acne"],
+            "current_goals": ["clear bumps"],
+            "allergies": ["fragrance"],
+            "notes": "Started breakouts 2 months ago",
+        }
+        summary = build_collected_context_summary(session, profile)
+        assert "Skin type: oily" in summary
+        assert "Current products: none" in summary
+        assert "Current medications: tretinoin" in summary
+        assert "Current conditions: acne" in summary
+        assert "Profile notes: Started breakouts 2 months ago" in summary
+
 
 @pytest.mark.unit
 class TestCosmeticIntakeFields:
@@ -498,3 +532,74 @@ class TestSkinFirstRouting:
         session = self._product_session()
         missing = [MISSING_SKIN_SNAPSHOT]
         assert infer_phase(session, missing) == IntakePhase.IMAGE_INTAKE
+
+
+@pytest.mark.unit
+class TestMedicationsContextGate:
+    """Require medications context before skin enqueue when consent escalation is active."""
+
+    def _skin_ready_profile(self) -> dict[str, object]:
+        return {
+            "age": 25,
+            "gender": "female",
+            "location": "Nairobi",
+            "current_products": ["cleanser"],
+            "current_goals": ["reduce bumps"],
+            "allergies": ["none reported"],
+        }
+
+    def _skin_session(self) -> IntakeSession:
+        return IntakeSession(
+            client_id="c1",
+            case_id="case-1",
+            service_intent=ServiceIntent.SKIN_REVIEW,
+            primary_concern="Acne on cheeks",
+            reproductive_status_confirmed=True,
+            images={
+                IntakeImageCategory.SKIN.value: IntakeImageRef(
+                    request_id="req-skin",
+                    image_url="https://example.com/skin.jpg",
+                ),
+            },
+        )
+
+    def test_blocks_skin_enqueue_without_medications_when_flag_on(self) -> None:
+        missing = compute_missing_for_routing(
+            self._skin_session(),
+            self._skin_ready_profile(),
+            cosmetic_pivot_enabled=True,
+            cosmetic_consent_escalation_active=True,
+        )
+        assert MISSING_MEDICATIONS_CONTEXT in missing
+
+    def test_allows_enqueue_when_medications_confirmed_none(self) -> None:
+        session = self._skin_session()
+        session = session.model_copy(update={"confirmed_none_fields": ["current_medications"]})
+        missing = compute_missing_for_routing(
+            session,
+            self._skin_ready_profile(),
+            cosmetic_pivot_enabled=True,
+            cosmetic_consent_escalation_active=True,
+        )
+        assert MISSING_MEDICATIONS_CONTEXT not in missing
+        assert missing == []
+
+    def test_skips_gate_when_consent_escalation_off(self) -> None:
+        missing = compute_missing_for_routing(
+            self._skin_session(),
+            self._skin_ready_profile(),
+            cosmetic_pivot_enabled=True,
+            cosmetic_consent_escalation_active=False,
+        )
+        assert MISSING_MEDICATIONS_CONTEXT not in missing
+
+    def test_recompute_adds_medications_to_profile_gaps(self) -> None:
+        updated = recompute_session(
+            self._skin_session(),
+            self._skin_ready_profile(),
+            cosmetic_pivot_enabled=True,
+            cosmetic_consent_escalation_active=True,
+            now_ms=1000,
+        )
+        assert "current_medications" in updated.profile_gaps
+        assert MISSING_MEDICATIONS_CONTEXT in updated.missing_for_routing

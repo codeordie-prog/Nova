@@ -105,6 +105,7 @@ MISSING_PRIMARY_CONCERN: Final[str] = "primary_concern"
 MISSING_PROFILE_MINIMUM: Final[str] = "profile_minimum"
 MISSING_REPRODUCTIVE_STATUS: Final[str] = "reproductive_status"
 MISSING_SKIN_SNAPSHOT: Final[str] = "skin_snapshot_stale"
+MISSING_MEDICATIONS_CONTEXT: Final[str] = "medications_context"
 
 # Intents that require confirming pregnancy / breastfeeding status during intake.
 REPRODUCTIVE_STATUS_INTENTS: Final[frozenset[ServiceIntent]] = frozenset(
@@ -329,6 +330,95 @@ def _resolve_skin_first_routing_enabled(cosmetic_skin_first_routing: bool | None
     return cosmetic_skin_first_routing_active()
 
 
+def _resolve_consent_escalation_routing_enabled(
+    cosmetic_consent_escalation_active: bool | None,
+) -> bool:
+    """
+    Resolve whether consent-gated escalation intake rules apply.
+
+    Args:
+        cosmetic_consent_escalation_active: Explicit override for tests.
+
+    Returns:
+        bool: True when medications context is required before skin enqueue.
+    """
+    if cosmetic_consent_escalation_active is not None:
+        return cosmetic_consent_escalation_active
+    from dermascan.shared.cosmetic_feature_flags import cosmetic_consent_escalation_active as flag
+
+    return flag()
+
+
+def _requires_medications_context_for_skin_audit(session: IntakeSession) -> bool:
+    """
+    Return True when a skin audit enqueue should include treatment/medication context.
+
+    Args:
+        session: Current intake session.
+
+    Returns:
+        bool: True for skin-review paths that feed consent escalation routing.
+    """
+    if session.service_intent == ServiceIntent.SKIN_REVIEW:
+        return True
+    if session.service_intent == ServiceIntent.COMBINED and not session.skin_snapshot_skipped:
+        return True
+    if (
+        session.service_intent == ServiceIntent.PRODUCT_REVIEW
+        and not session.skin_snapshot_skipped
+    ):
+        return True
+    return False
+
+
+def _medications_context_is_gap(
+    profile: Mapping[str, Any],
+    confirmed_none_fields: tuple[str, ...] | list[str],
+) -> bool:
+    """
+    Return True when current medications are unknown for audit context.
+
+    Args:
+        profile: Skin profile mapping.
+        confirmed_none_fields: Fields explicitly confirmed as none by the user.
+
+    Returns:
+        bool: True when medications must still be collected or confirmed none.
+    """
+    if "current_medications" in confirmed_none_fields:
+        return False
+    return _profile_field_is_gap("current_medications", profile)
+
+
+def _format_profile_list_summary(
+    field_name: str,
+    label: str,
+    profile: Mapping[str, Any],
+    confirmed_none_fields: tuple[str, ...] | list[str],
+) -> str | None:
+    """
+    Format a list-valued profile field for audit context summaries.
+
+    Args:
+        field_name: Skin profile field name.
+        label: Human-readable label prefix.
+        profile: Skin profile mapping.
+        confirmed_none_fields: Fields explicitly confirmed as none by the user.
+
+    Returns:
+        str | None: Summary fragment, or None when the field is unset.
+    """
+    if field_name in confirmed_none_fields:
+        return f"{label}: none."
+    value = profile.get(field_name)
+    if not isinstance(value, list):
+        return None
+    items = [str(item).strip() for item in value if str(item).strip()]
+    if items:
+        return f"{label}: {', '.join(items)}."
+    return None
+
+
 def has_product_image(session: IntakeSession) -> bool:
     """
     Return True when a product-category intake image is registered.
@@ -361,6 +451,7 @@ def compute_missing_for_routing(
     *,
     cosmetic_pivot_enabled: bool | None = None,
     cosmetic_skin_first_routing: bool | None = None,
+    cosmetic_consent_escalation_active: bool | None = None,
     skin_audit: Mapping[str, Any] | None = None,
     skin_audit_updated_at_ts: int | None = None,
     now_ts: int | None = None,
@@ -373,6 +464,7 @@ def compute_missing_for_routing(
         profile: Current skin profile mapping.
         cosmetic_pivot_enabled: Optional override for pivot routing rules.
         cosmetic_skin_first_routing: Optional override for skin-first product gating.
+        cosmetic_consent_escalation_active: Optional override for medications intake gate.
         skin_audit: Latest persisted skin audit for the client, if loaded.
         skin_audit_updated_at_ts: Redis envelope timestamp for the skin audit.
         now_ts: Optional unix timestamp override for freshness checks.
@@ -388,6 +480,9 @@ def compute_missing_for_routing(
 
     pivot_routing = _resolve_cosmetic_pivot_routing_enabled(cosmetic_pivot_enabled)
     skin_first = _resolve_skin_first_routing_enabled(cosmetic_skin_first_routing)
+    consent_escalation = _resolve_consent_escalation_routing_enabled(
+        cosmetic_consent_escalation_active
+    )
     requirements = ROUTING_REQUIREMENTS[session.service_intent]
 
     for category in requirements.required_image_categories:
@@ -414,6 +509,14 @@ def compute_missing_for_routing(
         profile_gaps = compute_profile_gaps(profile, session.confirmed_none_fields)
         if profile_gaps:
             missing.append(MISSING_PROFILE_MINIMUM)
+
+    if (
+        consent_escalation
+        and pivot_routing
+        and _requires_medications_context_for_skin_audit(session)
+        and _medications_context_is_gap(profile, session.confirmed_none_fields)
+    ):
+        missing.append(MISSING_MEDICATIONS_CONTEXT)
 
     if (
         requirements.requires_reproductive_status
@@ -465,6 +568,9 @@ def infer_phase(session: IntakeSession, missing_for_routing: list[str]) -> Intak
     if MISSING_PROFILE_MINIMUM in missing_for_routing:
         return IntakePhase.PROFILE_ONBOARDING
 
+    if MISSING_MEDICATIONS_CONTEXT in missing_for_routing:
+        return IntakePhase.PROFILE_ONBOARDING
+
     if MISSING_SKIN_IMAGE in missing_for_routing or MISSING_PRODUCT_IMAGE in missing_for_routing:
         return IntakePhase.IMAGE_INTAKE
 
@@ -487,6 +593,7 @@ def recompute_session(
     now_ms: Optional[int] = None,
     cosmetic_pivot_enabled: bool | None = None,
     cosmetic_skin_first_routing: bool | None = None,
+    cosmetic_consent_escalation_active: bool | None = None,
     skin_audit: Mapping[str, Any] | None = None,
     skin_audit_updated_at_ts: int | None = None,
 ) -> IntakeSession:
@@ -502,17 +609,23 @@ def recompute_session(
         IntakeSession: New session instance with gaps, missing, and phase updated.
     """
     timestamp = now_ms if now_ms is not None else int(time.time() * 1000)
-    profile_gaps = compute_profile_gaps(profile, session.confirmed_none_fields)
+    profile_gaps = list(compute_profile_gaps(profile, session.confirmed_none_fields))
     now_ts = timestamp // 1000
     missing = compute_missing_for_routing(
         session,
         profile,
         cosmetic_pivot_enabled=cosmetic_pivot_enabled,
         cosmetic_skin_first_routing=cosmetic_skin_first_routing,
+        cosmetic_consent_escalation_active=cosmetic_consent_escalation_active,
         skin_audit=skin_audit,
         skin_audit_updated_at_ts=skin_audit_updated_at_ts,
         now_ts=now_ts,
     )
+    if (
+        MISSING_MEDICATIONS_CONTEXT in missing
+        and "current_medications" not in profile_gaps
+    ):
+        profile_gaps.append("current_medications")
     phase = infer_phase(session, missing)
 
     updates: dict[str, Any] = {
@@ -533,6 +646,7 @@ def is_ready_to_route(
     *,
     cosmetic_pivot_enabled: bool | None = None,
     cosmetic_skin_first_routing: bool | None = None,
+    cosmetic_consent_escalation_active: bool | None = None,
     skin_audit: Mapping[str, Any] | None = None,
     skin_audit_updated_at_ts: int | None = None,
     now_ts: int | None = None,
@@ -545,6 +659,7 @@ def is_ready_to_route(
         profile: Current skin profile mapping.
         cosmetic_pivot_enabled: Optional override for cosmetic pivot routing rules.
         cosmetic_skin_first_routing: Optional override for skin-first product gating.
+        cosmetic_consent_escalation_active: Optional override for medications intake gate.
         skin_audit: Latest persisted skin audit for the client, if loaded.
         skin_audit_updated_at_ts: Redis envelope timestamp for the skin audit.
         now_ts: Optional unix timestamp override for freshness checks.
@@ -557,6 +672,7 @@ def is_ready_to_route(
         profile,
         cosmetic_pivot_enabled=cosmetic_pivot_enabled,
         cosmetic_skin_first_routing=cosmetic_skin_first_routing,
+        cosmetic_consent_escalation_active=cosmetic_consent_escalation_active,
         skin_audit=skin_audit,
         skin_audit_updated_at_ts=skin_audit_updated_at_ts,
         now_ts=now_ts,
@@ -579,6 +695,7 @@ def build_collected_context_summary(
     """
     intent_label = session.service_intent.value if session.service_intent else "unknown"
     parts: list[str] = [f"Service: {intent_label}."]
+    confirmed_none = session.confirmed_none_fields
 
     if session.primary_concern.strip():
         parts.append(f"Primary concern: {session.primary_concern.strip()}.")
@@ -589,6 +706,19 @@ def build_collected_context_summary(
     if session.skin_snapshot_skipped:
         parts.append("Skin snapshot: skipped (generic product check).")
 
+    skin_type = str(profile.get("skin_type") or "").strip()
+    if skin_type:
+        parts.append(f"Skin type: {skin_type}.")
+
+    for field_name, label in (
+        ("current_products", "Current products"),
+        ("current_medications", "Current medications"),
+        ("current_conditions", "Current conditions"),
+    ):
+        line = _format_profile_list_summary(field_name, label, profile, confirmed_none)
+        if line:
+            parts.append(line)
+
     goals = profile.get("current_goals") or []
     if isinstance(goals, list) and goals:
         parts.append(f"Goals: {', '.join(str(g) for g in goals if str(g).strip())}.")
@@ -596,6 +726,10 @@ def build_collected_context_summary(
     allergies = profile.get("allergies") or []
     if isinstance(allergies, list) and allergies:
         parts.append(f"Allergies: {', '.join(str(a) for a in allergies if str(a).strip())}.")
+
+    profile_notes = str(profile.get("notes") or "").strip()
+    if profile_notes:
+        parts.append(f"Profile notes: {profile_notes}.")
 
     if session.reproductive_status_confirmed:
         pregnancy = profile.get("pregnancy")

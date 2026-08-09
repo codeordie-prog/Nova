@@ -19,6 +19,7 @@ import time
 from typing import Any, Final, Mapping, Optional
 
 from dermascan.shared.cosmetic_feature_flags import (
+    cosmetic_consent_escalation_active,
     cosmetic_pivot_enabled,
     cosmetic_skin_first_routing_active,
 )
@@ -364,6 +365,7 @@ def recompute_intake_session(
         now_ms=now_ms,
         cosmetic_pivot_enabled=cosmetic_pivot_enabled(),
         cosmetic_skin_first_routing=cosmetic_skin_first_routing_active(),
+        cosmetic_consent_escalation_active=cosmetic_consent_escalation_active(),
         skin_audit=skin_audit,
         skin_audit_updated_at_ts=skin_audit_updated_at_ts,
     )
