@@ -161,7 +161,7 @@ class TestEscalationOfferCopy:
 
     def test_appends_offer_suffix(self) -> None:
         result = append_escalation_offer_to_reply("Your skin looks dry.")
-        assert "skin specialist" in result.lower()
+        assert "specialist review" in result.lower()
         assert "Reply yes" in result
 
     def test_idempotent_when_already_present(self) -> None:

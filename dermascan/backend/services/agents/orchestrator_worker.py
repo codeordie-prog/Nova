@@ -45,6 +45,7 @@ from dermascan.backend.services.agents.product_rules_signal_helper import (
     run_skin_signal_rules_flow,
 )
 from dermascan.ai_service.postprocessing.consent_escalation import append_escalation_offer_to_reply
+from dermascan.shared.concise_report_format import dermatologist_connection_guidance
 from dermascan.ai_service.postprocessing.escalation import resolve_client_message_for_signal
 from dermascan.backend.services.agents.group_report_aggregator import (
     collect_and_compile_if_ready,
@@ -1811,6 +1812,7 @@ def _build_signal_input(
         "If the signal provided a diagnosis in the signal payload, state that diagnosis clearly to the user.",
         "Do not deny or withhold condition information from the internal signal payload.",
         "Use non-definitive framing, such as 'the model suggests' or 'this appears consistent with'.",
+        dermatologist_connection_guidance(),
         "This is proactive communication flow. Respond for the client as needed.",
         "Format the response in plain, easy-to-read text using short sections and concise bullets.",
         "Do not use markdown emphasis markers such as **, __, or * for styling.",

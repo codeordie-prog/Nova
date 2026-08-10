@@ -19,6 +19,13 @@ from langchain.tools import tool
 from pydantic import BaseModel, Field
 from tavily import TavilyClient
 
+from dermascan.shared.concise_report_format import (
+    MicroReportFields,
+    build_static_micro_report,
+    dermatologist_connection_guidance,
+    micro_report_format_instructions,
+    render_micro_report,
+)
 from dermascan.ai_service.postprocessing.medgemma_structured_output import resolve_skin_observation_text
 from dermascan.backend.services.agents.model_fallback_chain import (
     AGENT_INVOKE_MAX_RETRIES,
@@ -94,7 +101,6 @@ GOOGLE_PROJECT_ID = str(
 )
 GOOGLE_LOCATION = str(os.getenv("GOOGLE_CLOUD_LOCATION", "global"))
 _REPORT_MAX_SOURCES = max(1, int(os.getenv("SIGNAL_RULES_MAX_SOURCES", "2")))
-_FINAL_REPORT_MAX_SENTENCES = max(3, int(os.getenv("SIGNAL_RULES_MAX_SENTENCES", "5")))
 REPORT_AGENT_RECURSION_LIMIT: int = max(
     4, int(os.getenv("REPORT_AGENT_RECURSION_LIMIT", "8"))
 )
@@ -132,16 +138,12 @@ class IngredientExtractionResponse(BaseModel):
     sources: list[str] = Field(default_factory=list)
 
 
-class UserFriendlyReportResponse(BaseModel):
+class UserFriendlyReportResponse(MicroReportFields):
     """User-friendly final report for outbound delivery."""
 
-    report_text: str = ""
 
-
-class SkinReviewResponse(BaseModel):
+class SkinReviewResponse(MicroReportFields):
     """Structured output from skin-review research agent."""
-
-    report_text: str = ""
 
 # Global rules engine instance.
 _rules_engine_singleton: RulesEngine | None = None
@@ -417,43 +419,17 @@ def _coerce_treatment_payload(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _strip_markdown_formatting(text: str) -> str:
+def _render_report_response(structured: MicroReportFields) -> str:
     """
-    Strip down Markdown formating.
+    Render a structured micro-report for outbound delivery.
 
     Args:
-        text (str): text to strip
+        structured: Report fields from the model.
 
     Returns:
-        str: cleaned up string.
+        str: Assembled plain-text report.
     """
-    cleaned = str(text or "")
-    cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
-    cleaned = re.sub(r"__(.*?)__", r"\1", cleaned)
-    cleaned = re.sub(r"`([^`]*)`", r"\1", cleaned)
-    cleaned = re.sub(r"^\s{0,3}#{1,6}\s*", "", cleaned, flags=re.MULTILINE)
-    return cleaned.strip()
-
-
-def _enforce_max_sentences(text: str, max_sentences: int = _FINAL_REPORT_MAX_SENTENCES) -> str:
-    """
-    Trim a report to at most ``max_sentences`` complete sentences.
-
-    Args:
-        text: Report body to trim.
-        max_sentences: Maximum number of sentences to keep.
-
-    Returns:
-        str: Trimmed report text.
-    """
-    cleaned = _strip_markdown_formatting(text)
-    if not cleaned:
-        return cleaned
-
-    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
-    if len(sentences) <= max_sentences:
-        return cleaned
-    return " ".join(sentences[:max_sentences])
+    return render_micro_report(structured)
 
 
 def _limit_sources(sources: list[str], limit: int = _REPORT_MAX_SOURCES) -> list[str]:
@@ -725,15 +701,14 @@ def _product_report_system_prompt(
         "Convert structured product safety evidence into a brief audit for a non-technical user. "
         "Do not claim medical diagnosis and do not prescribe treatment. "
         "Use report_internet_search only when it meaningfully strengthens unclear or missing safety points. "
-        "Compress the report into at most 5 short sentences in total, use bullet points if needed. "
-        "Do NOT use markdown formatting. "
+        f"{micro_report_format_instructions()}\n"
+        f"{dermatologist_connection_guidance()}\n"
         f"{personalization_clause}"
         "Do NOT mention filler or low-risk ingredients (water, aqua, glycerin, basic emollients, "
         "common preservatives) unless they are the main safety issue. "
         "Synthesize across the formula into a few safety themes only (contraindications, pregnancy/lactation, "
         "irritation/sensitization, photosensitivity, actives to introduce slowly). "
-        "Include the product name in sentence 1 when known. "
-        "End with one short educational disclaimer: not medical advice; consult a professional when unsure. "
+        "Put the product name in the headline when known. "
         "Do not include URLs in the report body (sources are appended separately). "
         f"{mode_guidance}\n"
         f"{guidance_line}\n"
@@ -775,11 +750,11 @@ def _product_report_user_prompt(
         guidance_line = product_report_guidance_mode_instructions(guidance_mode)
     return (
         "Generate the final product audit using the inputs below.\n"
-        f"Hard limit: at most {_FINAL_REPORT_MAX_SENTENCES} sentences in one paragraph; no section labels.\n"
+        f"{micro_report_format_instructions()}\n"
         f"{mode_line}\n"
         f"{guidance_line}\n"
-        "Include the product name in sentence 1 when available.\n"
-        "If a field is missing, state 'unknown' briefly and continue.\n"
+        "Put the product name in headline when available.\n"
+        "If a field is missing, state 'unknown' briefly in the nearest field and continue.\n"
         f"product_name: {product_name}\n"
         f"description: {description}\n"
         f"ingredients: {json.dumps(ingredients, default=str)}\n"
@@ -806,24 +781,33 @@ def _product_report_fallback_message(
         str: Short fallback message for the user.
     """
     if mode == "generic":
-        base = (
-            "General product safety review completed. "
+        headline = "General product safety review completed"
+        disclaimer = (
             f"{GENERIC_PRODUCT_REPORT_DISCLAIMER} "
             "Please follow product caution guidance and consult a professional when unsure."
         )
     elif mode == "profile_only":
-        base = (
-            "Product safety review completed based on your stated profile. "
+        headline = "Product safety review completed for your stated profile"
+        disclaimer = (
             f"{PROFILE_ONLY_PRODUCT_REPORT_DISCLAIMER} "
             "Please follow product caution guidance and consult a professional when unsure."
         )
     else:
-        base = (
-            "Safety review completed. Please consult the detailed report and follow product "
-            "caution guidance."
+        headline = "Safety review completed"
+        disclaimer = "Please follow product caution guidance and consult a professional when unsure."
+
+    report_text = _render_report_response(
+        MicroReportFields(
+            headline=headline,
+            bullets=[
+                "Check label cautions for your main actives and allergens.",
+                "Patch-test new products if your skin is easily irritated.",
+            ],
+            disclaimer=disclaimer,
         )
+    )
     return finalize_product_report_text(
-        base,
+        report_text,
         personalization_mode=mode,
         guidance_mode=guidance_mode,
         apply_guidance_mode=apply_guidance_mode,
@@ -846,21 +830,17 @@ def _skin_review_system_prompt(
     """
     return (
         "You are a dermatology skin-audit assistant. "
-        "Produce a brief image-based skin pattern review from the candidate pattern, condition summary, "
+        "Produce a brief image-based skin pattern review from the visible appearance summary, condition summary, "
         "and needs/treatment context. "
         "Use skin_review_search only when it materially improves uncertain or thin evidence. "
-        "Compress the report into at most 5 short sentences in total, use bullet points if needed. "
-        "Do NOT use markdown formatting. "
+        f"{micro_report_format_instructions()}\n"
+        f"{dermatologist_connection_guidance()}\n"
         "Do not prescribe medications, dosages, or definitive treatment plans. "
-        "Treat the candidate pattern as an internal hypothesis, not a confirmed diagnosis. "
         "Use cautious language such as 'appears consistent with', 'may suggest', 'could reflect', "
         "and 'image-based review cannot confirm'. "
         "Avoid definitive phrasing such as 'has', 'is', 'diagnosis is', or 'confirms'. "
-        "If evidence is limited, state uncertainty explicitly. "
-        "Suggested flow (still one paragraph, no labels): what the image may show; what that could mean; "
-        "one practical care consideration personalized to allergies, pregnancy/breastfeeding, skin type, "
-        "and primary concern when provided; when to seek in-person review; one short educational disclaimer "
-        "(not a diagnosis or prescription; image review cannot confirm a condition). "
+        "If evidence is limited, state uncertainty in the headline and use seek_care to offer "
+        "in-chat dermatologist connection — not an external referral. "
         "Do not include URLs in the report body (sources are appended separately). "
         f"last_conversation_entries: {json.dumps(context, default=str)}\n"
         f"{delivery_prompt}\n"
@@ -882,13 +862,13 @@ def build_skin_review_report(
     system_prompt = _skin_review_system_prompt(context, delivery_prompt)
     prompt = (
         "Generate the final image-based skin pattern review using the inputs below.\n"
-        f"Hard limit: at most {_FINAL_REPORT_MAX_SENTENCES} sentences in one paragraph; no section labels.\n"
-        "If a field is missing, state 'unknown' briefly and continue.\n"
+        f"{micro_report_format_instructions()}\n"
+        "If a field is missing, state 'unknown' briefly in the nearest field and continue.\n"
         "Personalize using client context when allergies, pregnancy, or goals are present.\n"
-        f"candidate_pattern: {diagnosis}\n"
+        f"visible_appearance_summary: {diagnosis}\n"
         f"skin_condition_summary: {summary}\n"
         f"needs_and_treatment: {treatment}\n"
-        f"internet_research_on_candidate_pattern: {internet_research}\n"
+        f"internet_research_on_visible_pattern: {internet_research}\n"
     )
     if delivery_prompt:
         prompt = f"{prompt}\n{delivery_prompt}\n"
@@ -902,12 +882,18 @@ def build_skin_review_report(
             invoke_config=invoke_config,
         )
         structured = response.get("structured_response") if isinstance(response, dict) else None
-        if isinstance(structured, SkinReviewResponse) and structured.report_text.strip():
-            return _enforce_max_sentences(structured.report_text)
+        if isinstance(structured, SkinReviewResponse) and structured.headline.strip():
+            return _render_report_response(structured)
     except Exception:
         logger.exception("failed to build skin review report")
 
-    return "Skin research completed. This information is educational and not a medical diagnosis or prescription."
+    return build_static_micro_report(
+        headline="Image review complete — limited detail from this photo",
+        bullets=[
+            "Send a clearer, well-lit close-up for a stronger read.",
+            "Reply yes anytime if you'd like us to connect you with a dermatologist.",
+        ],
+    )
 
 def build_user_friendly_report(
     *,
@@ -972,8 +958,8 @@ def build_user_friendly_report(
             invoke_config=invoke_config,
         )
         structured = response.get("structured_response") if isinstance(response, dict) else None
-        if isinstance(structured, UserFriendlyReportResponse) and structured.report_text.strip():
-            report_text = _enforce_max_sentences(structured.report_text)
+        if isinstance(structured, UserFriendlyReportResponse) and structured.headline.strip():
+            report_text = _render_report_response(structured)
             return finalize_product_report_text(
                 report_text,
                 personalization_mode=mode,
@@ -1226,11 +1212,12 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
             case_id,
             client_id,
         )
-        user_friendly_report = (
-            "Thanks for sharing the image. The current image-based review does not provide enough clear visual evidence "
-            "for a reliable skin pattern assessment. Please share a clearer, well-lit close-up image, or seek an "
-            "in-person dermatology review if symptoms are worsening or concerning. This information is educational "
-            "and not a medical diagnosis or prescription."
+        user_friendly_report = build_static_micro_report(
+            headline="Not enough clear detail for a reliable skin read",
+            bullets=[
+                "Send a clearer, well-lit close-up of the affected area.",
+                "Reply yes if you'd like us to connect you with a dermatologist.",
+            ],
         )
         return {
             "summary": "Image-based skin review is uncertain due to limited visual evidence.",
@@ -1282,7 +1269,7 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
         )
 
     user_friendly_report = build_skin_review_report(
-        diagnosis=str(report.get("diagnosis") or diagnosis),
+        diagnosis=str(primary_observation or observation or report.get("primary_observation") or ""),
         summary=str(report.get("summary") or summary),
         treatment=str(report.get("treatment") or treatment),
         internet_research=str(report.get("internet_research") or ""),

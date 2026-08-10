@@ -321,6 +321,25 @@ hypothesis, while user-facing reports stay cosmetic and non-definitive.
 
 ---
 
+#### Step 8.2f — Concise mobile micro-reports for skin and product audits
+
+**Why:** Long paragraph reports were hard to read on WhatsApp/Telegram; users need a short headline,
+two actionable bullets, and optional seek-care/disclaimer lines.
+
+**Changed:**
+- `dermascan/shared/concise_report_format.py` — structured `MicroReportFields` (headline, bullets,
+  seek_care, disclaimer) with join-only assembly; prompt budgets via `SIGNAL_REPORT_MAX_CHARS` (600)
+- `dermascan/backend/services/agents/product_rules_signal_helper.py` — report subagents return
+  structured fields; removed deterministic sentence-flattening/truncation post-processors
+- `dermascan/backend/services/agents/group_report_aggregator.py` — grouped compile uses the same
+  structured shape
+- `dermascan/ai_service/postprocessing/consent_escalation.py` — shorter, descriptive escalation offer
+- Orchestrator, report subagents, knowledge agent, and `soul.md` — offer in-chat dermatologist
+  connection instead of external "see a dermatologist" referrals (MedGemma unchanged)
+- `dermascan/tests/unit/test_concise_report_format.py`
+
+---
+
 ### 5. Smoke tests (before enabling in staging)
 
 | Test | Flow |

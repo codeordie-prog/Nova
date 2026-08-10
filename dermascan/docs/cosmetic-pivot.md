@@ -64,6 +64,7 @@ Derivation helper: `dermascan.shared.cosmetic_profile.derive_personalization_mod
 | 8.2c | done | MedGemma risk rubric + deterministic watch bump |
 | 8.2d | done | User-initiated escalation builder |
 | 8.2e | done | Split diagnosis (internal) vs primary_observation (user-facing) |
+| 8.2f | done | Concise mobile micro-reports (headline + bullets + seek-care) |
 | 9.x | pending | Legacy cleanup |
 
 ## Smoke tests (run before enabling flags in staging)

@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 import redis
 
+from dermascan.shared.concise_report_format import DERMATOLOGIST_CONNECTION_OFFER
 from dermascan.shared.logger import get_logger
 from dermascan.shared.langsmith_observability import (
     build_invoke_config,
@@ -457,8 +458,9 @@ def _build_degraded_research_message(payload: KnowledgeJobPayload) -> str:
     subject = payload.diagnosis or "your condition"
     return (
         f"I couldn't complete live web research right now for {subject}. "
-        "Please treat this as general guidance only and seek a licensed clinician for diagnosis and treatment decisions. "
-        "If symptoms are severe, worsening, or urgent, seek immediate care.\n\n"
+        "Please treat this as general guidance only. "
+        f"{DERMATOLOGIST_CONNECTION_OFFER} "
+        "If symptoms are severe, worsening, or urgent, seek immediate emergency care.\n\n"
         "Sources\n"
         "- Live sources unavailable at this time."
     )

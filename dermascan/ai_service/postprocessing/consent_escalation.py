@@ -35,9 +35,8 @@ class EscalationDecision:
 
 
 ESCALATION_OFFER_SUFFIX: str = (
-    "Some patterns in your skin snapshot may benefit from optional input from a skin "
-    "specialist. Reply yes if you'd like us to connect you for a professional review — "
-    "or continue with the guidance above if you prefer."
+    "Optional specialist review: a dermatologist can review your skin snapshot and suggest "
+    "personalized next steps. Reply yes to connect, or continue with the guidance above."
 )
 
 _INFLAMMATORY_MARKERS: tuple[str, ...] = (
@@ -332,6 +331,6 @@ def append_escalation_offer_to_reply(reply: str) -> str:
     if not body:
         return ESCALATION_OFFER_SUFFIX
     lowered = body.lower()
-    if "skin specialist" in lowered and "reply yes" in lowered:
+    if "reply yes" in lowered and "specialist review" in lowered:
         return body
     return f"{body}\n\n{ESCALATION_OFFER_SUFFIX}"
