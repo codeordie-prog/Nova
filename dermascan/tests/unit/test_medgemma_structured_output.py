@@ -9,6 +9,7 @@ import pytest
 from dermascan.ai_service.postprocessing.medgemma_structured_output import (
     extract_structured_fields,
     resolve_confidence_span_target,
+    resolve_internal_diagnosis_text,
     resolve_skin_observation_text,
 )
 
@@ -40,8 +41,8 @@ _LEGACY_PAYLOAD = {
 _COSMETIC_PAYLOAD = {
     "schema_version": "cosmetic_v1",
     "review_type": "Skin review",
-    "diagnosis": "acne-prone appearance",
-    "primary_observation": "acne-prone appearance",
+    "diagnosis": "inflammatory acne",
+    "primary_observation": "acne-prone appearance with visible bumps",
     "rationale": "Visible bumps on cheek",
     "observation_rationale": "Visible bumps on cheek",
     "summary": {
@@ -99,23 +100,58 @@ class TestMedGemmaStructuredOutput:
         fields, ok = extract_structured_fields(json.dumps(_COSMETIC_PAYLOAD))
         assert ok is True
         assert fields["schema_version"] == "cosmetic_v1"
-        assert fields["primary_observation"] == "acne-prone appearance"
+        assert fields["primary_observation"] == "acne-prone appearance with visible bumps"
+        assert fields["diagnosis"] == "inflammatory acne"
         assert fields["risk_tier"] == "watch"
         assert fields["image_quality"] == "good"
         assert fields["cosmetic_implications"]["avoid_for_now"] == ["harsh exfoliants"]
-        assert resolve_skin_observation_text(fields) == "acne-prone appearance"
+        assert resolve_skin_observation_text(fields) == "acne-prone appearance with visible bumps"
+        assert resolve_internal_diagnosis_text(fields) == "inflammatory acne"
 
     def test_invalid_json_returns_defaults(self) -> None:
         fields, ok = extract_structured_fields("{not-json")
         assert ok is False
         assert fields["diagnosis"] == ""
 
-    def test_confidence_span_prefers_primary_observation(self) -> None:
+    def test_confidence_span_prefers_diagnosis(self) -> None:
         text, field = resolve_confidence_span_target(_COSMETIC_PAYLOAD)
-        assert text == "acne-prone appearance"
+        assert text == "inflammatory acne"
+        assert field == "diagnosis"
+
+    def test_confidence_span_falls_back_to_primary_observation(self) -> None:
+        payload = dict(_COSMETIC_PAYLOAD)
+        payload["diagnosis"] = ""
+        text, field = resolve_confidence_span_target(payload)
+        assert text == "acne-prone appearance with visible bumps"
         assert field == "primary_observation"
 
-    def test_confidence_span_falls_back_to_diagnosis(self) -> None:
+    def test_confidence_span_falls_back_to_legacy_diagnosis(self) -> None:
         text, field = resolve_confidence_span_target(_LEGACY_PAYLOAD)
         assert text == "Acne vulgaris"
         assert field == "diagnosis"
+
+    def test_skin_review_backfills_missing_diagnosis_from_patterns(self) -> None:
+        payload = {
+            "schema_version": "cosmetic_v1",
+            "review_type": "Skin review",
+            "diagnosis": "",
+            "primary_observation": "visible redness on cheeks",
+            "skin_state": {
+                "severity": "moderate",
+                "active_inflammation": "true",
+                "barrier_status": "unknown",
+                "observed_patterns": ["erythema", "papules"],
+            },
+            "summary": {
+                "severity": "moderate",
+                "active_inflammation": "true",
+                "barrier_status": "unknown",
+                "observed_patterns": ["erythema", "papules"],
+            },
+            "risk_tier": "watch",
+            "image_quality": "good",
+        }
+        fields, ok = extract_structured_fields(json.dumps(payload))
+        assert ok is True
+        assert fields["diagnosis"] == "erythema, papules"
+        assert resolve_internal_diagnosis_text(fields) == "erythema, papules"

@@ -154,6 +154,7 @@ def persist_skin_audit_snapshot(
     skin_audit: Mapping[str, Any],
     request_id: str,
     primary_observation: str = "",
+    diagnosis: str = "",
     risk_tier: str = "cosmetic",
     image_quality: str = "unknown",
     signal_confidence: str = "",
@@ -169,6 +170,7 @@ def persist_skin_audit_snapshot(
         skin_audit: Bridge skin audit mapping from rules engine report.
         request_id: Signal request id for idempotent retries.
         primary_observation: Cosmetic observation label from MedGemma.
+        diagnosis: Internal clinical hypothesis from MedGemma (specialist/research use).
         risk_tier: Normalized risk tier.
         image_quality: Normalized image quality label.
         signal_confidence: MedGemma vision confidence string from signal fields.
@@ -190,6 +192,8 @@ def persist_skin_audit_snapshot(
 
     if primary_observation.strip():
         audit_payload["primary_observation"] = primary_observation.strip()
+    if diagnosis.strip():
+        audit_payload["diagnosis"] = diagnosis.strip()
     audit_payload["risk_tier"] = str(risk_tier or audit_payload.get("risk_tier") or "cosmetic")
     audit_payload["image_quality"] = str(
         image_quality or audit_payload.get("image_quality") or "unknown"

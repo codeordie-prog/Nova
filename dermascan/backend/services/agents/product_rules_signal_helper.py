@@ -1275,6 +1275,7 @@ def run_skin_signal_rules_flow(fields: dict[str, Any], context: list[dict[str, A
             skin_audit=skin_audit_payload,
             request_id=request_id,
             primary_observation=primary_observation or observation,
+            diagnosis=diagnosis,
             risk_tier=str(payload.get("risk_tier") or "cosmetic"),
             image_quality=str(payload.get("image_quality") or "unknown"),
             signal_confidence=signal_confidence,

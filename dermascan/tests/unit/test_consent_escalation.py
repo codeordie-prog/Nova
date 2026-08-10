@@ -417,6 +417,7 @@ class TestOrchestratorConsentTool:
                     "request_id": "req-skin-audit",
                     "updated_at_ts": 1_700_000_000,
                     "skin_audit": {
+                        "diagnosis": "inflammatory acne",
                         "primary_observation": "moderate inflammatory acne appearance",
                         "primary_concern": "moderate inflammatory acne appearance",
                         "risk_tier": "cosmetic",
@@ -466,7 +467,7 @@ class TestOrchestratorConsentTool:
         assert len(jobs) == 1
         assert jobs[0][1]["case_id"] == "case-skin-audit"
         assert jobs[0][1]["reason"] == "user_requested_specialist"
-        assert "inflammatory acne" in jobs[0][1]["diagnosis_text"]
+        assert jobs[0][1]["diagnosis_text"] == "inflammatory acne"
 
     def test_user_requested_missing_skin_context(
         self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch
@@ -524,6 +525,7 @@ class TestUserRequestedEscalationBuilder:
                 {
                     "request_id": "req-audit",
                     "skin_audit": {
+                        "diagnosis": "atopic dermatitis",
                         "primary_observation": "dry patches",
                         "risk_tier": "cosmetic",
                     },
@@ -539,7 +541,7 @@ class TestUserRequestedEscalationBuilder:
         context = resolve_user_escalation_context("client-builder")
         assert context is not None
         assert context.audit_case_id == "case-audit"
-        assert context.diagnosis_text == "dry patches"
+        assert context.diagnosis_text == "atopic dermatitis"
 
     def test_dispatch_is_idempotent(
         self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch

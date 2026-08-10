@@ -26,7 +26,10 @@ from dataclasses import dataclass
 from redis import Redis
 
 from dermascan.ai_service.postprocessing.consent_escalation import resolve_consent_escalation_decision
-from dermascan.ai_service.postprocessing.medgemma_structured_output import extract_structured_fields
+from dermascan.ai_service.postprocessing.medgemma_structured_output import (
+    extract_structured_fields,
+    resolve_internal_diagnosis_text,
+)
 from dermascan.shared.cosmetic_feature_flags import cosmetic_consent_escalation_active
 from dermascan.shared.cosmetic_profile import _skin_audit_has_observations
 from dermascan.shared.escalation_image import cache_escalation_image_path, resolve_escalation_image_blob_path
@@ -255,7 +258,7 @@ def _cache_consent_escalation_offer(
         "reason": "risk_tier_watch_consent",
         "confidence": "" if confidence is None else str(confidence),
         "threshold": str(threshold_used),
-        "diagnosis_text": base_fields.get("diagnosis") or text,
+        "diagnosis_text": resolve_internal_diagnosis_text(base_fields) or text,
         "requires_human_review": "true",
         "product_name": base_fields.get("product_name", ""),
         "description": base_fields.get("description", ""),
@@ -378,7 +381,7 @@ class UserEscalationContext:
         message_id: Current-turn message id for relay tracking.
         channel: Ingress channel for the current turn.
         image_blob_path: Durable Firebase blob path when resolved.
-        diagnosis_text: Primary skin observation or concern text.
+        diagnosis_text: Internal clinical hypothesis or concern text for specialists.
         escalation_context: Intake/profile summary for specialist review.
         risk_tier: Normalized risk tier from the latest skin audit.
         summary: Structured summary fragment when available.
@@ -527,7 +530,7 @@ def resolve_user_escalation_context(
         )
 
     diagnosis_text = (
-        str(skin_audit.get("primary_observation") or "").strip()
+        resolve_internal_diagnosis_text(skin_audit)
         or str(skin_audit.get("primary_concern") or "").strip()
         or (str(session.primary_concern).strip() if session is not None else "")
     )
@@ -698,8 +701,8 @@ def _build_orchestrator_signal_payload(
         }
     return {
         "review_type": base_fields.get("review_type", ""),
-        "diagnosis": base_fields.get("diagnosis") or "",
-        "diagnosis_text": base_fields.get("diagnosis") or text,
+        "diagnosis": resolve_internal_diagnosis_text(base_fields),
+        "diagnosis_text": resolve_internal_diagnosis_text(base_fields) or text,
         "rationale": base_fields.get("rationale", ""),
         "summary": base_fields.get("summary", {}),
         "treatment": base_fields.get("treatment", {}),
@@ -930,7 +933,7 @@ def _push_escalation(
             "reason": "low_confidence",
             "confidence": "" if confidence is None else str(confidence),
             "threshold": str(threshold_used),
-            "diagnosis_text": base_fields.get("diagnosis") or text,
+            "diagnosis_text": resolve_internal_diagnosis_text(base_fields) or text,
             "requires_human_review": "true",
             "product_name": base_fields.get("product_name", ""),
             "description": base_fields.get("description", ""),

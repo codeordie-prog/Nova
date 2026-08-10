@@ -298,6 +298,29 @@ invalid JSON (`b'{"..."}'` repr) so `dispatch_consent_escalation` failed silentl
 
 ---
 
+#### Step 8.2e — Split internal diagnosis from user-facing observation
+
+**Why:** Specialists, research subagents, and confidence scoring need the most likely clinical
+hypothesis, while user-facing reports stay cosmetic and non-definitive.
+
+| Field | Audience | Content |
+|-------|----------|---------|
+| `primary_observation` | User-facing report | Cosmetic/appearance language |
+| `diagnosis` | Research, escalation, confidence | Internal clinical hypothesis |
+
+**Changed:**
+- `dermascan/ai_service/modal/medgemma_service/app.py` — decouple field rules; stop mirroring
+- `dermascan/ai_service/postprocessing/medgemma_structured_output.py` — `resolve_internal_diagnosis_text()`;
+  confidence span prefers `diagnosis`
+- `dermascan/ai_service/postprocessing/escalation.py` — specialist `diagnosis_text` uses internal diagnosis
+- `dermascan/shared/skin_audit_store.py` — persist `diagnosis` on skin audit snapshot
+- `dermascan/backend/services/agents/product_rules_signal_helper.py` — pass diagnosis into snapshot
+- `dermascan/ai_service/modal/model_config/config.json` — raise `max_model_len` 2048 → 3072 so the
+  enlarged dual-role prompt + 512 output tokens fit within vLLM context on L4
+- `dermascan/tests/unit/test_medgemma_structured_output.py`, `test_consent_escalation.py`
+
+---
+
 ### 5. Smoke tests (before enabling in staging)
 
 | Test | Flow |

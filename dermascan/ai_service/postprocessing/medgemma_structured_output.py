@@ -282,8 +282,43 @@ def extract_structured_fields(text: str) -> tuple[dict[str, Any], bool]:
     )
     fields["risk_tier"] = normalize_risk_tier(_to_str(parsed.get("risk_tier")))
     fields["image_quality"] = normalize_image_quality(_to_str(parsed.get("image_quality")))
+    _ensure_skin_diagnosis_populated(fields)
 
     return fields, True
+
+
+def _ensure_skin_diagnosis_populated(fields: dict[str, Any]) -> None:
+    """
+    Guarantee ``diagnosis`` is set for skin/hybrid reviews when the model omits it.
+
+    Args:
+        fields: Parsed structured fields (mutated in place).
+    """
+    review_type = _to_str(fields.get("review_type")).strip().lower()
+    if review_type not in {"skin review", "hybrid review"}:
+        return
+
+    diagnosis = _to_str(fields.get("diagnosis")).strip()
+    if diagnosis:
+        return
+
+    primary = _to_str(fields.get("primary_observation")).strip()
+    skin_state = fields.get("skin_state")
+    if not isinstance(skin_state, dict):
+        skin_state = fields.get("summary") if isinstance(fields.get("summary"), dict) else {}
+    observed_raw = skin_state.get("observed_patterns") if isinstance(skin_state, dict) else []
+    observed = [
+        _to_str(item).strip()
+        for item in (observed_raw if isinstance(observed_raw, list) else [])
+        if _to_str(item).strip()
+    ]
+
+    if observed:
+        fields["diagnosis"] = ", ".join(observed[:4])
+    elif primary:
+        fields["diagnosis"] = primary if primary.lower() == "uncertain" else f"likely {primary}"
+    else:
+        fields["diagnosis"] = "uncertain"
 
 
 def resolve_skin_observation_text(fields: dict[str, Any]) -> str:
@@ -291,6 +326,7 @@ def resolve_skin_observation_text(fields: dict[str, Any]) -> str:
     Return the best available skin observation label from parsed fields.
 
     Prefers cosmetic ``primary_observation``, then legacy ``diagnosis``.
+    Use for user-facing copy only.
 
     Args:
         fields: Output of :func:`extract_structured_fields`.
@@ -304,9 +340,31 @@ def resolve_skin_observation_text(fields: dict[str, Any]) -> str:
     return _to_str(fields.get("diagnosis")).strip()
 
 
+def resolve_internal_diagnosis_text(fields: dict[str, Any]) -> str:
+    """
+    Return the internal clinical hypothesis from parsed fields.
+
+    Prefers ``diagnosis``, then falls back to ``primary_observation`` for legacy
+    payloads that only populated diagnosis.
+
+    Args:
+        fields: Output of :func:`extract_structured_fields`.
+
+    Returns:
+        str: Internal diagnosis text or empty string.
+    """
+    diagnosis = _to_str(fields.get("diagnosis")).strip()
+    if diagnosis:
+        return diagnosis
+    return _to_str(fields.get("primary_observation")).strip()
+
+
 def resolve_confidence_span_target(parsed: dict[str, Any]) -> tuple[str, str]:
     """
     Choose the JSON field and text span used for vision confidence logprobs.
+
+    Prefers internal ``diagnosis`` when populated so confidence tracks the
+    clinical hypothesis used for escalation and research.
 
     Args:
         parsed: Parsed model JSON object.
@@ -314,10 +372,10 @@ def resolve_confidence_span_target(parsed: dict[str, Any]) -> tuple[str, str]:
     Returns:
         tuple[str, str]: ``(field_text, json_field_name)`` for span alignment.
     """
-    primary = _to_str(parsed.get("primary_observation")).strip()
-    if primary:
-        return primary, "primary_observation"
     diagnosis = _to_str(parsed.get("diagnosis")).strip()
     if diagnosis:
         return diagnosis, "diagnosis"
+    primary = _to_str(parsed.get("primary_observation")).strip()
+    if primary:
+        return primary, "primary_observation"
     return "", ""
