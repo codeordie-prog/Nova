@@ -35,7 +35,7 @@ class EscalationDecision:
 
 
 ESCALATION_OFFER_SUFFIX: str = (
-    "Optional specialist review: a dermatologist can review your skin snapshot and suggest "
+    "We highly recommend our dermatologist to review your skin snapshot and suggest "
     "personalized next steps. Reply yes to connect, or continue with the guidance above."
 )
 

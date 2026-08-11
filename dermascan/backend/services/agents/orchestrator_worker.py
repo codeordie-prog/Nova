@@ -37,6 +37,7 @@ from dermascan.backend.services.tools.orchestrator.orchestrator_tools import (
 )
 from dermascan.backend.services.agents.loader import load_agent_configurations
 from dermascan.backend.services.agents.build import (
+    _use_vertex_ai,
     open_checkpointer_url,
     compute_summarization_trigger_tokens,
 )
@@ -82,6 +83,7 @@ from dermascan.backend.services.agents.model_fallback_chain import (
     is_recursion_error,
     is_tool_protocol_error,
     orchestrator_model_chain_spec,
+    parse_model_chain_spec,
     serial_tool_calls_middleware,
     should_retry_agent_invoke,
     summarization_model_chain_spec,
@@ -123,10 +125,10 @@ REDIS_URL: str = os.getenv("REDIS_URL", "")
 BASE_DIR: str = os.path.dirname(__file__)
 CONFIG_PATH: str = os.path.join(BASE_DIR, "configurations", "agents_config.json")
 
-# Orchestrator LLM chain: OpenAI GPT-4o (primary, tool calling) -> Gemini (fallback).
+# Orchestrator LLM chain: Gemini (primary, cost-optimized) -> OpenAI (fallback).
 ORCHESTRATOR_MAX_MODEL_LEN: int = int(os.getenv("ORCHESTRATOR_MAX_MODEL_LEN", "128000"))
 ORCHESTRATOR_MAX_TOKENS: int = int(os.getenv("ORCHESTRATOR_MAX_TOKENS", "2048"))
-# Cap summarization trigger so OpenAI primary stays under typical TPM / context limits.
+# Cap summarization trigger so the primary model stays under typical context limits.
 ORCHESTRATOR_OPENAI_SUMMARIZATION_TRIGGER_TOKENS: int = max(
     1500,
     int(os.getenv("ORCHESTRATOR_OPENAI_SUMMARIZATION_TRIGGER_TOKENS", "24000")),
@@ -1268,7 +1270,7 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
     """
     Build a dynamic agent with an ordered per-model fallback chain.
 
-    OpenAI models are tried in order, then Gemini models. Each model has its
+    Gemini models are tried first, then OpenAI models. Each model has its
     own circuit breaker. When every model fails, the full chain is retried
     after a configurable delay.
 
@@ -1279,17 +1281,31 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         Any: A LangChain agent backed by the fallback chain.
 
     Raises:
-        RuntimeError: If OpenAI is not configured.
+        RuntimeError: If required provider credentials are missing for the chain.
     """
     google_cfg = get_config_file(CONFIG_PATH, "google")
     openai_cfg = get_config_file(CONFIG_PATH, "openai")
 
-    if not OPENAI_API_KEY:
+    chain_spec = orchestrator_model_chain_spec()
+    chain_entries = parse_model_chain_spec(chain_spec)
+    providers_in_chain = {provider for provider, _ in chain_entries}
+
+    if "gemini" in providers_in_chain:
+        if _use_vertex_ai():
+            if not CRED_PATH:
+                raise RuntimeError(
+                    "Google primary provider required: set GOOGLE_APPLICATION_CREDENTIALS_QUTIS"
+                )
+        elif not GEMINI_API_KEY:
+            raise RuntimeError(
+                "Google primary provider required: set GEMINI_API_KEY_QUTIS"
+            )
+
+    if "openai" in providers_in_chain and not OPENAI_API_KEY:
         raise RuntimeError(
-            "OpenAI primary provider required: set OPENAI_API_KEY_QUTIS"
+            "OpenAI fallback required: set OPENAI_API_KEY_QUTIS"
         )
 
-    chain_spec = orchestrator_model_chain_spec()
     model_chain = build_model_chain_from_spec(
         chain_spec=chain_spec,
         openai_api_key=OPENAI_API_KEY,

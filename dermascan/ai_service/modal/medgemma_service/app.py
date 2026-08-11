@@ -212,9 +212,9 @@ _STRUCTURED_SYSTEM_PROMPT: str = (
     gpu="L4",
     image=image,
     secrets=[hf_secret],
-    max_containers=1,
-    min_containers=1,
-    scaledown_window=600,
+    max_containers=2,
+    min_containers=0,
+    scaledown_window=1200,
     timeout=_CLS_TIMEOUT_S,
     startup_timeout=_CLS_STARTUP_TIMEOUT_S,
     # Image already mounts dermascan via add_local_python_source (.py only).

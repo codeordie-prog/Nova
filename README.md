@@ -45,13 +45,13 @@ The orchestrator and report subagents no longer use a single primary/fallback pa
 
 On each model call the worker walks the chain left to right. If a model returns 429, times out, hits a length limit, or its **per-model circuit breaker** is open, the next entry is tried. When every model in the chain fails, the worker waits (`MODEL_CHAIN_RETRY_DELAY_S`) and re-walks the full chain up to `MODEL_CHAIN_MAX_RETRIES` times.
 
-### Orchestrator (OpenAI first, then Gemini)
+### Orchestrator (Gemini first, then OpenAI)
 
 Used for conversational tool calling in `orchestrator_worker.py`:
 
 ```
-openai:gpt-4o → openai:gpt-4o-mini → openai:gpt-5-mini → openai:gpt-5
-    → gemini:gemini-3.5-flash → gemini:gemini-3.1-flash-lite
+gemini:gemini-3.5-flash → gemini:gemini-3.1-flash-lite
+    → openai:gpt-4o → openai:gpt-5
 ```
 
 Configure with `ORCHESTRATOR_MODEL_CHAIN` (comma-separated `provider:model_id` entries).

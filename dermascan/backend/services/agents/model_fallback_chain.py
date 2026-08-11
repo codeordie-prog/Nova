@@ -7,7 +7,8 @@ Description:
 Per-model LLM fallback chain with circuit breakers and full-chain retries.
 
 Orchestrator middleware and report subagents share this module so each model
-is tried in order (OpenAI variants, then Gemini variants) before giving up.
+is tried in order (Gemini variants first for orchestrator/reports, then OpenAI
+fallback) before giving up.
 """
 
 from __future__ import annotations
@@ -34,12 +35,12 @@ from dermascan.shared.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Define the default model chain for the orchestrator and report agent
+# Cost-optimized: Gemini primary, OpenAI fallback for orchestrator tool calling.
 _DEFAULT_ORCHESTRATOR_MODEL_CHAIN: str = (
-    "openai:gpt-5,"
-    "openai:gpt-4o,"
     "gemini:gemini-3.5-flash,"
-    "gemini:gemini-3.1-flash-lite"
+    "gemini:gemini-3.1-flash-lite,"
+    "openai:gpt-4o,"
+    "openai:gpt-5"
 )
 
 # Cost-optimized: Gemini primary, OpenAI fallback for report subagents.
