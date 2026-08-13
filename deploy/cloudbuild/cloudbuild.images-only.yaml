@@ -1,0 +1,67 @@
+# Build and push all backend images (no Cloud Run deploy).
+# Use this first to validate Docker builds before wiring secrets/deploy.
+#
+#   gcloud builds submit --config deploy/cloudbuild/cloudbuild.images-only.yaml .
+
+substitutions:
+  _REGION: europe-west1
+  _REPO: dermascan
+  _TAG: latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+  diskSizeGb: 100
+
+steps:
+  - id: build-api
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --target=api
+      - --file=deploy/docker/Dockerfile
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-api:${_TAG}
+      - .
+
+  - id: build-workers
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --target=workers
+      - --file=deploy/docker/Dockerfile
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-workers:${_TAG}
+      - .
+
+  - id: build-telegram-bridge
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --target=telegram-bridge
+      - --file=deploy/docker/Dockerfile
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-telegram-bridge:${_TAG}
+      - .
+
+  - id: build-medgemma-gateway
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --target=medgemma-gateway
+      - --file=deploy/docker/Dockerfile
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-medgemma-gateway:${_TAG}
+      - .
+
+  - id: build-medgemma-worker
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --target=medgemma-worker
+      - --file=deploy/docker/Dockerfile
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-medgemma-worker:${_TAG}
+      - .
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-api:${_TAG}
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-workers:${_TAG}
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-telegram-bridge:${_TAG}
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-medgemma-gateway:${_TAG}
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-medgemma-worker:${_TAG}

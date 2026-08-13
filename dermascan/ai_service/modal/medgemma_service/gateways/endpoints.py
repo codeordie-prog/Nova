@@ -26,6 +26,10 @@ import uuid
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 import redis
 
+from dermascan.shared.load_env import bootstrap_env
+
+bootstrap_env()
+
 from dermascan.shared.logger import get_logger
 from dermascan.shared.stream_pipeline_tracing import record_stream_produce
 from dermascan.ai_service.modal.medgemma_service.schemas import (

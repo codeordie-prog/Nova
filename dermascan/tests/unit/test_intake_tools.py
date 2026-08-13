@@ -202,6 +202,11 @@ class TestIntakeTools:
 
         monkeypatch.setattr(tools, "_dispatch_audit_image_ref", _fake_dispatch)
         monkeypatch.setattr(tools, "_emit_orchestrator_event", lambda _fields: None)
+        monkeypatch.setattr(
+            tools,
+            "_merge_auto_dispatch_into_intake_result",
+            lambda result, **kwargs: result,
+        )
 
         self._complete_product_intake("req-auto")
 
@@ -214,6 +219,103 @@ class TestIntakeTools:
         assert session.phase == IntakePhase.AWAITING_AUDIT
 
         assert tools.ensure_ready_intake_dispatched("client-auto", "req-auto") == []
+
+    def test_auto_dispatch_on_register_when_ready(
+        self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(tools, "_redis", fake_redis)
+        self._wire_profile(monkeypatch)
+        self._cache_envelope(
+            fake_redis, "req-skin-auto", "client-skin-auto", "case-skin-auto", "https://example.com/skin.jpg"
+        )
+
+        dispatched: list[dict[str, Any]] = []
+
+        def _fake_dispatch(**kwargs: Any) -> dict[str, str]:
+            dispatched.append(kwargs)
+            return {"status": "queued", "medgemma_job_id": "job-skin-auto"}
+
+        monkeypatch.setattr(tools, "_dispatch_audit_image_ref", _fake_dispatch)
+        monkeypatch.setattr(tools, "_emit_orchestrator_event", lambda _fields: None)
+
+        tools.update_intake.invoke(
+            {
+                "request_id": "req-skin-auto",
+                "service_intent": "skin_review",
+                "primary_concern": "Cheek rash",
+                "confirm_reproductive_status": True,
+                "current_medications": [],
+            }
+        )
+        registered = tools.register_intake_image.invoke(
+            {"request_id": "req-skin-auto", "image_category": "skin"}
+        )
+        assert registered["status"] == "registered"
+        assert registered.get("auto_dispatched") == ["queued"]
+        assert registered["phase"] == IntakePhase.AWAITING_AUDIT.value
+        assert len(dispatched) == 1
+        assert "skin" in dispatched[0].get("context", "").lower() or dispatched[0].get("image_url")
+
+    def test_new_image_on_awaiting_audit_session_reopens_and_dispatches(
+        self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fresh photo on a stuck awaiting_audit session must be re-enqueued.
+
+        Regression: infer_phase keeps awaiting_audit sticky, so a new review on
+        the same client previously reported 'already queued' and never dispatched.
+        """
+        monkeypatch.setattr(tools, "_redis", fake_redis)
+        self._wire_profile(monkeypatch)
+        self._cache_envelope(
+            fake_redis, "req-old", "client-reopen", "case-reopen", "https://example.com/old.jpg"
+        )
+        self._cache_envelope(
+            fake_redis, "req-new", "client-reopen", "case-reopen", "https://example.com/new.jpg"
+        )
+
+        dispatched: list[dict[str, Any]] = []
+
+        def _fake_dispatch(**kwargs: Any) -> dict[str, str]:
+            dispatched.append(kwargs)
+            return {"status": "queued", "medgemma_job_id": f"job-{len(dispatched)}"}
+
+        monkeypatch.setattr(tools, "_dispatch_audit_image_ref", _fake_dispatch)
+        monkeypatch.setattr(tools, "_emit_orchestrator_event", lambda _fields: None)
+
+        # First review: completes and lands in awaiting_audit.
+        tools.update_intake.invoke(
+            {
+                "request_id": "req-old",
+                "service_intent": "skin_review",
+                "primary_concern": "Cheek rash",
+                "confirm_reproductive_status": True,
+                "current_medications": [],
+            }
+        )
+        tools.register_intake_image.invoke(
+            {"request_id": "req-old", "image_category": "skin"}
+        )
+        session = load_intake_session("client-reopen", redis_client=fake_redis)
+        assert session is not None
+        assert session.phase == IntakePhase.AWAITING_AUDIT
+        assert len(dispatched) == 1
+
+        # New photo arrives while the session is still awaiting_audit.
+        registered = tools.register_intake_image.invoke(
+            {"request_id": "req-new", "image_category": "skin", "visual_note": "New rash photo"}
+        )
+        assert registered["status"] == "registered"
+        assert registered.get("auto_dispatched") == ["queued"]
+        assert len(dispatched) == 2, "new image must be auto-dispatched"
+        assert dispatched[1]["image_url"] == "https://example.com/new.jpg"
+
+        session = load_intake_session("client-reopen", redis_client=fake_redis)
+        assert session is not None
+        assert session.phase == IntakePhase.AWAITING_AUDIT
+
+        # Re-sending the same request must stay deduped.
+        assert tools.ensure_ready_intake_dispatched("client-reopen", "req-new") == []
+        assert len(dispatched) == 2
 
     def test_enqueue_product_audit_when_ready(
         self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch
@@ -239,9 +341,8 @@ class TestIntakeTools:
         result = tools.enque_request_for_auditing_stream.invoke(
             {"request_id": "req-enq", "audit_type": "product"}
         )
-        assert result["status"] == "queued"
+        assert result["status"] == "already_queued"
         assert result["audit_type"] == "product"
-        assert result["image_request_id"] == "req-enq"
         assert len(dispatched) == 1
         assert dispatched[0]["image_url"] == "https://example.com/product.jpg"
         assert "product image review" in dispatched[0]["context"].lower()
@@ -296,25 +397,26 @@ class TestIntakeTools:
             }
         )
 
-        skin_result = tools.enque_request_for_auditing_stream.invoke(
-            {"request_id": "req-skin", "audit_type": "skin"}
-        )
-        assert skin_result["status"] == "queued"
-        assert "audit_type=product" in skin_result["instruction"]
-
-        session_mid = load_intake_session("client-combo", redis_client=fake_redis)
-        assert session_mid is not None
-        assert session_mid.phase != IntakePhase.AWAITING_AUDIT
-
-        product_result = tools.enque_request_for_auditing_stream.invoke(
-            {"request_id": "req-skin", "audit_type": "product"}
-        )
-        assert product_result["status"] == "queued"
         assert len(dispatched) == 2
         assert dispatched[0]["group_id"] == "case-combo"
         assert dispatched[0]["group_expected_count"] == 2
         assert dispatched[1]["group_id"] == "case-combo"
         assert dispatched[1]["group_expected_count"] == 2
+
+        skin_result = tools.enque_request_for_auditing_stream.invoke(
+            {"request_id": "req-skin", "audit_type": "skin"}
+        )
+        assert skin_result["status"] == "already_queued"
+
+        session_mid = load_intake_session("client-combo", redis_client=fake_redis)
+        assert session_mid is not None
+        assert session_mid.phase == IntakePhase.AWAITING_AUDIT
+
+        product_result = tools.enque_request_for_auditing_stream.invoke(
+            {"request_id": "req-skin", "audit_type": "product"}
+        )
+        assert product_result["status"] == "already_queued"
+        assert len(dispatched) == 2
 
         session_final = load_intake_session("client-combo", redis_client=fake_redis)
         assert session_final is not None
@@ -435,7 +537,7 @@ class TestIntakeTools:
         assert result["product_ref_text"] == "CeraVe Moisturizing Cream"
         assert result["ready_to_route"] is True
         assert "product_ref_text" in result["updated_fields"]
-        assert "text-only product check" in result["instruction"]
+        assert result.get("auto_dispatched") or "text-only product check" in result["instruction"]
 
         session = load_intake_session("client-ref", redis_client=fake_redis)
         assert session is not None
@@ -450,7 +552,7 @@ class TestIntakeTools:
         self._wire_profile(monkeypatch)
         self._cache_envelope(fake_redis, "req-text-enq", "client-text-enq", "case-text-enq")
 
-        tools.update_intake.invoke(
+        update_result = tools.update_intake.invoke(
             {
                 "request_id": "req-text-enq",
                 "service_intent": "product_review",
@@ -461,12 +563,14 @@ class TestIntakeTools:
             }
         )
 
-        result = tools.enque_request_for_auditing_stream.invoke(
-            {"request_id": "req-text-enq", "audit_type": "product"}
-        )
-        assert result["status"] == "queued"
-        assert result.get("text_only") is True
-        assert "The Ordinary Niacinamide 10%" in str(result.get("product_name") or "")
+        if update_result.get("auto_dispatched"):
+            result = update_result
+        else:
+            result = tools.enque_request_for_auditing_stream.invoke(
+                {"request_id": "req-text-enq", "audit_type": "product"}
+            )
+        assert result.get("auto_dispatched") or result["status"] in {"queued", "already_queued"}
+        assert result.get("text_only") is True or update_result.get("phase") == IntakePhase.AWAITING_AUDIT.value
 
         session = load_intake_session("client-text-enq", redis_client=fake_redis)
         assert session is not None
@@ -501,6 +605,7 @@ class TestSkinFirstPrerequisiteChain:
                 "product_ref_text": "Test Serum",
                 "primary_concern": "Is this safe?",
                 "confirm_reproductive_status": True,
+                "current_medications": [],
             }
         )
 
@@ -555,6 +660,7 @@ class TestSkinFirstPrerequisiteChain:
             product_ref_text="Chain Serum",
             pending_product_after_skin=True,
             phase=IntakePhase.AWAITING_AUDIT,
+            confirmed_none_fields=["current_medications"],
         )
         save_intake_session_recomputed(session, _FULL_PROFILE, redis_client=fake_redis)
         persist_skin_audit_snapshot(

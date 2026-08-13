@@ -13,9 +13,9 @@ import os
 import uuid
 from typing import Any, Dict
 
-from dotenv import load_dotenv
+from dermascan.shared.load_env import bootstrap_env
 
-load_dotenv()
+bootstrap_env()
 
 from fastapi import APIRouter, Body, File, Header, HTTPException, Request, Response, UploadFile
 import redis

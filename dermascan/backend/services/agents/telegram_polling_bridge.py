@@ -13,11 +13,11 @@ import time
 from typing import Any
 
 import requests
-from dotenv import load_dotenv
 
+from dermascan.shared.load_env import bootstrap_env
 from dermascan.shared.logger import get_logger
 
-load_dotenv()
+bootstrap_env()
 
 logger = get_logger("agents")
 

@@ -983,13 +983,29 @@ def _mark_intake_awaiting_audit(
         _archive_intake_for_signal_delivery(updated)
 
 
-def _intake_stop_suffix() -> str:
+def _intake_stop_suffix(session: IntakeSession | None = None) -> str:
     """
     Standard instruction suffix to prevent tool-call loops within one turn.
 
+    When intake is ready to route but not yet enqueued, require enqueue before reply.
+
+    Args:
+        session: Current intake session, if known.
+
     Returns:
-        str: Anti-loop guidance for tool responses.
+        str: Anti-loop or enqueue-first guidance for tool responses.
     """
+    if (
+        session is not None
+        and not session.missing_for_routing
+        and session.phase not in (IntakePhase.AWAITING_AUDIT, IntakePhase.DELIVERED)
+    ):
+        return (
+            " Do NOT send your final reply yet. "
+            "You MUST call enque_request_for_auditing_stream first (see instruction above). "
+            "Only after enqueue returns queued or already_queued may you tell the user "
+            "their review is in progress and compose your final reply."
+        )
     return (
         " Then compose your final reply to the user in this turn. "
         "The latest intake status is included in this tool result and in the turn context; "
@@ -1138,7 +1154,7 @@ def _intake_instruction(session: IntakeSession, profile: dict[str, Any]) -> str:
     Returns:
         str - The instruction
     """
-    stop = _intake_stop_suffix()
+    stop = _intake_stop_suffix(session)
     next_tool = _derive_intake_next_action(session, profile)
     skip_suffix = ""
     if session.skin_snapshot_skipped:
@@ -1148,10 +1164,13 @@ def _intake_instruction(session: IntakeSession, profile: dict[str, Any]) -> str:
         )
 
     if session.phase == IntakePhase.AWAITING_AUDIT:
-        return (
-            "Audits are already queued. Tell the user their photo is being reviewed. "
-            "Do NOT call enque_request_for_auditing_stream again."
-        )
+        if session.pending_product_after_skin or _all_required_audits_enqueued(session):
+            return (
+                "Audits are already queued. Tell the user their photo is being reviewed. "
+                "Do NOT call enque_request_for_auditing_stream again."
+            )
+        # Stale terminal phase (e.g. a new photo replaced an audited slot):
+        # fall through to normal routing guidance so the audit gets dispatched.
 
     if not session.missing_for_routing:
         if _needs_product_label_photo_for_enqueue(session):
@@ -1291,6 +1310,9 @@ def _format_intake_status(
         "profile_gaps": list(session.profile_gaps),
         "missing_for_routing": list(session.missing_for_routing),
         "ready_to_route": ready,
+        "must_enqueue_before_reply": (
+            ready and session.phase not in (IntakePhase.AWAITING_AUDIT, IntakePhase.DELIVERED)
+        ),
         "collected_context_summary": session.collected_context_summary,
         "skin_snapshot_skipped": session.skin_snapshot_skipped,
         "personalization_mode": session.personalization_mode,
@@ -2053,7 +2075,12 @@ def update_intake(
     result = _format_intake_status(updated, profile, request_id=request_id)
     result["status"] = "saved" if changed else "unchanged"
     result["updated_fields"] = changed
-    return result
+    return _merge_auto_dispatch_into_intake_result(
+        result,
+        client_id=client_id,
+        request_id=request_id,
+        source="update_intake",
+    )
 
 
 @tool
@@ -2082,6 +2109,10 @@ def register_intake_image(
 
     Call once per image after visually classifying it. The returned status includes the
     next_recommended_tool and instruction to follow.
+
+    When ready_to_route is true after registration, you MUST call enque_request_for_auditing_stream
+    (audit_type skin or product per service_intent) before your final reply. The server may
+    auto-dispatch if you skip this, but always follow the instruction field.
     """
     logger.info(
         "TOOL CALL: register_intake_image: request_id=%s category=%s attachment_id=%s",
@@ -2140,7 +2171,26 @@ def register_intake_image(
         registered_at_ms=int(time.time() * 1000),
         visual_note=str(visual_note or "").strip(),
     )
-    session = session.model_copy(update={"images": images})
+    session_updates: dict[str, Any] = {"images": images}
+    if (
+        session.phase in (IntakePhase.AWAITING_AUDIT, IntakePhase.DELIVERED)
+        and not session.pending_product_after_skin
+        and not _is_audit_enqueued(image_request_id)
+    ):
+        # A brand-new (never dispatched) photo on a terminal-phase session means the
+        # user is starting a fresh review; reopen so the audit can be enqueued.
+        # infer_phase treats awaiting_audit/delivered as sticky, so without this
+        # reset the new image would be reported as "already queued" forever.
+        session_updates["phase"] = IntakePhase.IMAGE_INTAKE
+        logger.info(
+            "reopening intake session for new image: client_id=%s case_id=%s "
+            "category=%s prior_phase=%s",
+            client_id,
+            case_id,
+            image_category.value,
+            session.phase.value,
+        )
+    session = session.model_copy(update=session_updates)
 
     updated, persist_error = _persist_intake_session(session, profile)
     if persist_error:
@@ -2151,7 +2201,12 @@ def register_intake_image(
     result["status"] = "registered"
     result["registered_category"] = image_category.value
     result["registered_image_request_id"] = image_request_id
-    return result
+    return _merge_auto_dispatch_into_intake_result(
+        result,
+        client_id=client_id,
+        request_id=request_id,
+        source="register_intake_image",
+    )
 
 
 @tool
@@ -2209,7 +2264,9 @@ def enque_request_for_auditing_stream(
     assert updated is not None
     session = updated
 
-    if session.phase == IntakePhase.AWAITING_AUDIT:
+    if session.phase == IntakePhase.AWAITING_AUDIT and (
+        session.pending_product_after_skin or _all_required_audits_enqueued(session)
+    ):
         return {
             "status": "already_queued",
             "request_id": request_id,
@@ -2657,34 +2714,46 @@ def continue_product_review_after_skin_prerequisite(
     return dispatched
 
 
-def ensure_ready_intake_dispatched(client_id: str, request_id: str) -> list[dict[str, Any]]:
+def _dispatch_required_audits_if_ready(
+    client_id: str,
+    request_id: str,
+    *,
+    source: str,
+) -> list[dict[str, Any]]:
     """
-    Deterministically enqueue required audits when the model skipped the tool call.
-
-    Called by the orchestrator worker after an agent turn ends. When the intake
-    session is ready_to_route but not yet awaiting_audit, the model finished its
-    turn without calling enque_request_for_auditing_stream (e.g. it claimed the
-    case was sent without dispatching it). This dispatches every still-missing
-    required audit; the tool's dedupe and phase checks make repeat calls no-ops.
+    Enqueue every required audit when intake is ready but not yet awaiting_audit.
 
     Args:
         client_id: Client identifier for the intake session.
-        request_id: Current turn's ingress request id (must be in the ingress cache).
+        request_id: Orchestrator ingress request id (current turn or image message).
+        source: Caller label for logs (tool name or post-turn).
 
     Returns:
         list[dict[str, Any]]: Tool results for each dispatch attempted; empty when
         nothing needed dispatching.
     """
     cid = _normalize_client_id(client_id)
-    if not cid or not str(request_id or "").strip():
+    rid = str(request_id or "").strip()
+    if not cid or not rid:
         return []
 
     try:
         session = load_intake_session(cid, redis_client=_redis)
     except IntakeSessionStoreError:
-        logger.exception("post-turn dispatch: failed to load intake session: client_id=%s", cid)
+        logger.exception(
+            "audit auto-dispatch: failed to load intake session: client_id=%s source=%s",
+            cid,
+            source,
+        )
         return []
-    if session is None or session.phase in (IntakePhase.AWAITING_AUDIT, IntakePhase.DELIVERED):
+    if session is None or session.phase == IntakePhase.DELIVERED:
+        return []
+    if session.phase == IntakePhase.AWAITING_AUDIT and (
+        session.pending_product_after_skin or _all_required_audits_enqueued(session)
+    ):
+        # Only skip when the audits are verifiably dispatched (Redis dedupe markers)
+        # or a product chain is intentionally waiting on the skin result. A sticky
+        # awaiting_audit phase with un-dispatched images must NOT block dispatch.
         return []
 
     profile = _load_skin_profile_mapping(cid)
@@ -2708,18 +2777,109 @@ def ensure_ready_intake_dispatched(client_id: str, request_id: str) -> list[dict
         elif image_ref is None:
             continue
 
-        logger.warning(
-            "post-turn deterministic audit dispatch (model ended turn without enqueue): "
-            "client_id=%s case_id=%s audit_type=%s",
+        logger.info(
+            "deterministic audit dispatch (%s): client_id=%s case_id=%s audit_type=%s",
+            source,
             cid,
             session.case_id,
             category.value,
         )
         results.append(
             enque_request_for_auditing_stream.func(
-                request_id=request_id,
+                request_id=rid,
                 audit_type=category,
             )
+        )
+    return results
+
+
+def _merge_auto_dispatch_into_intake_result(
+    result: dict[str, Any],
+    *,
+    client_id: str,
+    request_id: str,
+    source: str,
+) -> dict[str, Any]:
+    """
+    Auto-enqueue required audits when a tool left intake ready but not yet routed.
+
+    Args:
+        result: Tool response dict to augment.
+        client_id: Client identifier.
+        request_id: Ingress request id for enqueue resolution.
+        source: Caller label for logs.
+
+    Returns:
+        dict[str, Any]: Updated tool result with refreshed intake status when dispatch ran.
+    """
+    if not result.get("ready_to_route"):
+        return result
+    if result.get("phase") == IntakePhase.DELIVERED.value:
+        return result
+    # awaiting_audit is NOT skipped here: _dispatch_required_audits_if_ready
+    # verifies actual dedupe state and no-ops when everything is dispatched.
+
+    dispatched = _dispatch_required_audits_if_ready(
+        client_id,
+        request_id,
+        source=source,
+    )
+    if not dispatched:
+        return result
+
+    result["auto_dispatched"] = [str(item.get("status") or "") for item in dispatched]
+    try:
+        session = load_intake_session(client_id, redis_client=_redis)
+    except IntakeSessionStoreError:
+        return result
+    if session is None:
+        return result
+    profile = _load_skin_profile_mapping(client_id)
+    session = recompute_intake_session(session, profile)
+    refreshed = _format_intake_status(session, profile, request_id=request_id)
+    refreshed["auto_dispatched"] = result["auto_dispatched"]
+    for key in (
+        "status",
+        "registered_category",
+        "registered_image_request_id",
+        "updated_fields",
+    ):
+        if key in result:
+            refreshed[key] = result[key]
+    return refreshed
+
+
+def ensure_ready_intake_dispatched(client_id: str, request_id: str) -> list[dict[str, Any]]:
+    """
+    Deterministically enqueue required audits when the model skipped the tool call.
+
+    Called by the orchestrator worker after an agent turn ends. When the intake
+    session is ready_to_route but not yet awaiting_audit, the model finished its
+    turn without calling enque_request_for_auditing_stream (e.g. it claimed the
+    case was sent without dispatching it). This dispatches every still-missing
+    required audit; the tool's dedupe and phase checks make repeat calls no-ops.
+
+    Args:
+        client_id: Client identifier for the intake session.
+        request_id: Current turn's ingress request id (must be in the ingress cache).
+
+    Returns:
+        list[dict[str, Any]]: Tool results for each dispatch attempted; empty when
+        nothing needed dispatching.
+    """
+    results = _dispatch_required_audits_if_ready(
+        client_id,
+        request_id,
+        source="post_turn",
+    )
+    if results:
+        cid = _normalize_client_id(client_id)
+        logger.warning(
+            "post-turn deterministic audit dispatch (model ended turn without enqueue): "
+            "client_id=%s request_id=%s statuses=%s",
+            cid,
+            request_id,
+            [str(item.get("status") or "") for item in results],
         )
     return results
 

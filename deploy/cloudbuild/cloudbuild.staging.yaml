@@ -1,0 +1,127 @@
+# Build, push, and deploy all backend services to Cloud Run (staging).
+#
+# BEFORE running: sync full .env to Secret Manager (required):
+#   python deploy/scripts/sync_staging_secrets.py --project qutisai
+#
+#   gcloud builds submit --config=deploy/cloudbuild/cloudbuild.staging.yaml \
+#     --substitutions=_REGION=europe-west1,_TAG=latest,_POSTGRES_HOST=<postgres-ip>
+
+substitutions:
+  _REGION: europe-west1
+  _REPO: dermascan
+  _TAG: latest
+  # Leave empty to default to dermascan-cloud-run@<project>.iam.gserviceaccount.com
+  # (Cloud Build does NOT expand $PROJECT_ID inside substitution defaults).
+  _RUN_SA: ''
+  _POSTGRES_HOST: '34.79.111.107'
+  # Optional override; default secret list is in deploy/scripts/deploy-staging-services.sh
+  _SECRETS_SPEC: ''
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+  diskSizeGb: 100
+
+steps:
+  # --- Build & push (same as cloudbuild.images-only.yaml) ---
+  - id: build-api
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --target=api
+      - --file=deploy/docker/Dockerfile
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-api:${_TAG}
+      - .
+
+  - id: build-workers
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --target=workers
+      - --file=deploy/docker/Dockerfile
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-workers:${_TAG}
+      - .
+
+  - id: build-telegram-bridge
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --target=telegram-bridge
+      - --file=deploy/docker/Dockerfile
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-telegram-bridge:${_TAG}
+      - .
+
+  - id: build-medgemma-gateway
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --target=medgemma-gateway
+      - --file=deploy/docker/Dockerfile
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-medgemma-gateway:${_TAG}
+      - .
+
+  - id: build-medgemma-worker
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --target=medgemma-worker
+      - --file=deploy/docker/Dockerfile
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-medgemma-worker:${_TAG}
+      - .
+
+  # --- Push images BEFORE deploy so Cloud Run picks up this build, not a stale :latest ---
+  - id: push-api
+    name: gcr.io/cloud-builders/docker
+    args: [push, '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-api:${_TAG}']
+    waitFor: [build-api]
+
+  - id: push-workers
+    name: gcr.io/cloud-builders/docker
+    args: [push, '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-workers:${_TAG}']
+    waitFor: [build-workers]
+
+  - id: push-telegram-bridge
+    name: gcr.io/cloud-builders/docker
+    args: [push, '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-telegram-bridge:${_TAG}']
+    waitFor: [build-telegram-bridge]
+
+  - id: push-medgemma-gateway
+    name: gcr.io/cloud-builders/docker
+    args: [push, '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-medgemma-gateway:${_TAG}']
+    waitFor: [build-medgemma-gateway]
+
+  - id: push-medgemma-worker
+    name: gcr.io/cloud-builders/docker
+    args: [push, '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-medgemma-worker:${_TAG}']
+    waitFor: [build-medgemma-worker]
+
+  # --- Deploy Cloud Run services (API URL wired into telegram bridge automatically) ---
+  - id: deploy-staging
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        sed -i 's/\r$//' deploy/scripts/deploy-staging-services.sh
+        bash deploy/scripts/deploy-staging-services.sh
+    env:
+      - REGION=${_REGION}
+      - PROJECT_ID=$PROJECT_ID
+      - REPO=${_REPO}
+      - TAG=${_TAG}
+      - RUN_SA=${_RUN_SA}
+      - SECRETS_SPEC=${_SECRETS_SPEC}
+      - POSTGRES_HOST=${_POSTGRES_HOST}
+    waitFor:
+      - push-api
+      - push-workers
+      - push-telegram-bridge
+      - push-medgemma-gateway
+      - push-medgemma-worker
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-api:${_TAG}
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-workers:${_TAG}
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-telegram-bridge:${_TAG}
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-medgemma-gateway:${_TAG}
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dermascan-medgemma-worker:${_TAG}

@@ -20,7 +20,7 @@ import re
 import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dotenv import load_dotenv
+from dermascan.shared.load_env import bootstrap_env
 from typing import List, Dict, Any, Callable, Optional
 from pydantic import BaseModel
 import redis
@@ -108,7 +108,7 @@ from dermascan.shared.stream_pipeline_tracing import (
 
 
 # Load environment variables
-load_dotenv()
+bootstrap_env()
 configure_worker_project("orchestrator")
 
 # Get env variables
