@@ -36,6 +36,7 @@ from dermascan.backend.api.group_media_helper import (
     wait_for_media_batch_quiet,
 )
 from dermascan.shared.escalation_image import (
+    DEFAULT_IMAGE_PATH_TTL_SEC,
     cache_escalation_image_path,
     resolve_escalation_image_blob_path,
 )
@@ -58,6 +59,7 @@ _REDIS_URL: str = os.getenv("REDIS_URL", "")
 _ORCHESTRATOR_JOB_STREAM: str = os.getenv("ORCHESTRATOR_JOB_STREAM", "orchestrator:jobs")
 _WORKERS_STREAM_MAXLEN: int = int(os.getenv("WORKERS_STREAM_MAXLEN", "5000"))
 _MEDIA_TTL_S: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"))
+_MEDIA_BLOB_TTL_S: int = int(os.getenv("MEDIA_BLOB_TTL_S", str(DEFAULT_IMAGE_PATH_TTL_SEC)))
 _MAX_IMAGE_BYTES: int = 5 * 1024 * 1024
 _TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _TELEGRAM_HTTP_TIMEOUT_S: float = float(os.getenv("TELEGRAM_HTTP_TIMEOUT_S", "30"))
@@ -107,19 +109,35 @@ def _validate_image_bytes(image_bytes: bytes) -> None:
         raise HTTPException(status_code=400, detail="Unsupported or invalid image format")
 
 
-def _store_whatsapp_image_attachment(
+def _store_uploaded_client_image(
     *,
+    channel: str,
     client_id: str,
     message_id: str,
     image_bytes: bytes,
     mime_type: str,
-) -> tuple[AttachmentSource, int]:
-    """Upload WhatsApp image bytes to Firebase and return a URL attachment source."""
+) -> tuple[AttachmentSource, str, int]:
+    """
+    Upload a client image and cache its durable blob path in Redis.
+
+    Args:
+        channel: Ingress channel label (``telegram`` or ``whatsapp``).
+        client_id: End-user identifier.
+        message_id: Source message id for logging.
+        image_bytes: Validated image bytes.
+        mime_type: Image MIME type.
+
+    Returns:
+        Tuple of attachment source, media ref key, and byte length.
+
+    Raises:
+        HTTPException: When Firebase upload or Redis cache fails.
+    """
     if _redis is None:
         raise HTTPException(status_code=500, detail="REDIS_URL is not configured")
 
     try:
-        download_url = upload_client_image(
+        uploaded = upload_client_image(
             client_id=client_id,
             image_bytes=image_bytes,
             mime_type=mime_type,
@@ -132,18 +150,36 @@ def _store_whatsapp_image_attachment(
         )
         raise HTTPException(status_code=502, detail="Failed to store image") from exc
 
-    media_ref = f"media:whatsapp:{client_id}:{uuid.uuid4().hex}"
+    media_ref = f"media:{channel}:{client_id}:{uuid.uuid4().hex}"
     try:
-        _redis.setex(media_ref, _MEDIA_TTL_S, download_url)
+        _redis.setex(media_ref, _MEDIA_BLOB_TTL_S, uploaded.blob_path)
     except redis.RedisError as exc:
         logger.exception(
-            "Redis media URL cache failed: media_ref=%s client_id=%s",
+            "Redis media blob cache failed: media_ref=%s client_id=%s",
             media_ref,
             client_id,
         )
         raise HTTPException(status_code=503, detail="Redis unavailable") from exc
 
-    return AttachmentSource(kind="url", value=download_url), len(image_bytes)
+    return AttachmentSource(kind="blob_ref", value=media_ref), media_ref, len(image_bytes)
+
+
+def _store_whatsapp_image_attachment(
+    *,
+    client_id: str,
+    message_id: str,
+    image_bytes: bytes,
+    mime_type: str,
+) -> tuple[AttachmentSource, int]:
+    """Upload WhatsApp image bytes to Firebase and return a blob_ref attachment source."""
+    source, _, size_bytes = _store_uploaded_client_image(
+        channel="whatsapp",
+        client_id=client_id,
+        message_id=message_id,
+        image_bytes=image_bytes,
+        mime_type=mime_type,
+    )
+    return source, size_bytes
 
 
 async def _enforce_ingress_capacity(*, cost: int = 1) -> None:
@@ -569,36 +605,13 @@ def _normalize_telegram_message(message: Dict[str, Any]) -> OrchestratorIngressR
                 image_bytes, mime_type = _download_telegram_file(file_id)
                 _validate_image_bytes(image_bytes)
 
-                try:
-                    download_url = upload_client_image(
-                        client_id=client_id,
-                        image_bytes=image_bytes,
-                        mime_type=mime_type,
-                    )
-                except Exception as exc:
-                    logger.exception(
-                        "Firebase client image upload failed: client_id=%s message_id=%s",
-                        client_id,
-                        message_id,
-                    )
-                    raise HTTPException(
-                        status_code=502,
-                        detail="Failed to store image",
-                    ) from exc
-
-                media_ref = f"media:telegram:{client_id}:{uuid.uuid4().hex}"
-                try:
-                    _redis.setex(media_ref, _MEDIA_TTL_S, download_url)
-                except redis.RedisError as exc:
-                    logger.exception(
-                        "Redis media URL cache failed: media_ref=%s client_id=%s",
-                        media_ref,
-                        client_id,
-                    )
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Redis unavailable",
-                    ) from exc
+                source, media_ref, _ = _store_uploaded_client_image(
+                    channel="telegram",
+                    client_id=client_id,
+                    message_id=message_id,
+                    image_bytes=image_bytes,
+                    mime_type=mime_type,
+                )
 
                 metadata_extras["telegram_media_ref"] = media_ref
 
@@ -609,7 +622,7 @@ def _normalize_telegram_message(message: Dict[str, Any]) -> OrchestratorIngressR
                         mime_type=mime_type,
                         filename=None,
                         size_bytes=len(image_bytes),
-                        source=AttachmentSource(kind="url", value=download_url),
+                        source=source,
                     )
                 )
 

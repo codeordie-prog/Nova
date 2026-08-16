@@ -32,6 +32,10 @@ from dermascan.backend.services.agents.provider_circuit_breaker import (
     load_model_circuit_breaker,
 )
 from dermascan.shared.logger import get_logger
+from dermascan.shared.vision_image_urls import (
+    is_invalid_image_url_error,
+    refresh_messages_vision_urls,
+)
 
 logger = get_logger(__name__)
 
@@ -82,6 +86,10 @@ OPENAI_REASONING_EFFORT: str = str(
 AGENT_DISABLE_PARALLEL_TOOL_CALLS: bool = os.getenv(
     "AGENT_DISABLE_PARALLEL_TOOL_CALLS",
     os.getenv("ORCHESTRATOR_DISABLE_PARALLEL_TOOL_CALLS", "true"),
+).strip().lower() in {"1", "true", "yes", "on"}
+# Re-sign expired Firebase client-media URLs before each vision model call.
+VISION_REFRESH_URLS_ENABLED: bool = os.getenv(
+    "VISION_REFRESH_URLS_ENABLED", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -189,6 +197,58 @@ def enforce_serial_tool_call_response(
         result=truncated_messages,
         structured_response=response.structured_response,
     )
+
+
+def apply_vision_url_refresh_request(request: ModelRequest) -> ModelRequest:
+    """
+    Re-sign client-media image URLs in the outbound model request.
+
+    LangGraph checkpoints replay prior multimodal turns with expired signed URLs.
+    Refresh happens only on the ephemeral request; checkpoint state is unchanged.
+
+    Args:
+        request: Incoming model request.
+
+    Returns:
+        ModelRequest: Original or overridden request with fresh image URLs.
+    """
+    if not VISION_REFRESH_URLS_ENABLED:
+        return request
+
+    overrides: dict[str, Any] = {}
+    refreshed_messages = refresh_messages_vision_urls(request.messages)
+    if refreshed_messages is not request.messages:
+        overrides["messages"] = refreshed_messages
+
+    state = request.state
+    state_messages = state.get("messages") if isinstance(state, dict) else None
+    if isinstance(state_messages, list):
+        refreshed_state_messages = refresh_messages_vision_urls(state_messages)
+        if refreshed_state_messages is not state_messages:
+            overrides["state"] = {**state, "messages": refreshed_state_messages}
+
+    if not overrides:
+        return request
+    return request.override(**overrides)
+
+
+@wrap_model_call
+def refresh_vision_urls_middleware(
+    request: ModelRequest,
+    handler: Callable[[ModelRequest], Any],
+) -> Any:
+    """
+    Refresh expired client-media signed URLs immediately before model invocation.
+
+    Args:
+        request: Model request about to invoke the LLM.
+        handler: Next middleware/model handler.
+
+    Returns:
+        ModelResponse | AIMessage | ExtendedModelResponse: Handler result.
+    """
+    adjusted = apply_vision_url_refresh_request(request)
+    return handler(adjusted)
 
 
 @wrap_model_call
@@ -497,6 +557,8 @@ def should_retry_agent_invoke(exc: Exception) -> bool:
         return True
     if is_tool_protocol_error(exc):
         return True
+    if is_invalid_image_url_error(exc):
+        return True
     return should_fallback_to_next_model(exc)
 
 
@@ -523,6 +585,7 @@ def is_provider_health_error(exc: Exception) -> bool:
         or is_structured_output_error(exc)
         or is_length_limit_error(exc)
         or is_tool_protocol_error(exc)
+        or is_invalid_image_url_error(exc)
         or is_model_unavailable_error(exc)
     ):
         return False

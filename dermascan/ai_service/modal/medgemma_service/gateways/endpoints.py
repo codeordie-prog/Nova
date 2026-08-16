@@ -31,6 +31,7 @@ from dermascan.shared.load_env import bootstrap_env
 bootstrap_env()
 
 from dermascan.shared.logger import get_logger
+from dermascan.shared.escalation_image import normalize_image_blob_path
 from dermascan.shared.stream_pipeline_tracing import record_stream_produce
 from dermascan.ai_service.modal.medgemma_service.schemas import (
     BatchEnqueueResponse,
@@ -693,17 +694,23 @@ async def audit_image_ref(
         await _enforce_global_rate_limit(cost=1)
 
         context: str = payload.context.strip()
-        image_url: str = payload.image_url.strip()
         mime_type: str = str(payload.mime_type or "image/jpeg").strip()
+        image_blob_path: str = normalize_image_blob_path(str(payload.image_blob_path or "").strip())
+        image_url: str = str(payload.image_url or "").strip()
 
         if not context:
             raise HTTPException(status_code=400, detail="Audit context cannot be empty")
 
-        if not image_url:
-            raise HTTPException(status_code=400, detail="Image URL cannot be empty")
-
-        if not image_url.lower().startswith(("http://", "https://")):
-            raise HTTPException(status_code=400, detail="Image URL must use http or https")
+        if image_blob_path:
+            image_source_kind = "blob_path"
+            image_source_value = image_blob_path
+        elif image_url:
+            if not image_url.lower().startswith(("http://", "https://")):
+                raise HTTPException(status_code=400, detail="Image URL must use http or https")
+            image_source_kind = "url"
+            image_source_value = image_url
+        else:
+            raise HTTPException(status_code=400, detail="image_blob_path or image_url is required")
 
         state, _ = await _wait_for_capacity_with_retry()
         if state == "red":
@@ -715,8 +722,8 @@ async def audit_image_ref(
 
         job_id: str = await _enqueue_with_retry(
             _enqueue_ref_job,
-            "url",
-            image_url,
+            image_source_kind,
+            image_source_value,
             context,
             mime_type,
             payload.request_id,

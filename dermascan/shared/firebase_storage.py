@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from dataclasses import dataclass
 from datetime import timedelta
 from urllib.parse import unquote, urlparse
 
@@ -31,6 +32,20 @@ logger = get_logger(__name__)
 # Set client's media prefix
 CLIENT_MEDIA_PREFIX = "client-media"
 _SIGNED_URL_TTL_S: int = int(os.getenv("WORKERS_JOB_TTL_S", "86400"))
+
+
+@dataclass(frozen=True, slots=True)
+class ClientImageUpload:
+    """
+    Result of uploading one client image to Firebase Storage.
+
+    Attributes:
+        blob_path: Durable object path under ``client-media/``.
+        signed_url: Ephemeral HTTPS URL valid for ``WORKERS_JOB_TTL_S``.
+    """
+
+    blob_path: str
+    signed_url: str
 
 
 def _resolve_credentials_path() -> str | None:
@@ -175,9 +190,32 @@ def extract_blob_path_from_url(url: str) -> str:
         parts = raw_path.split("/", 1)
         if len(parts) < 2 or not parts[1]:
             raise ValueError(f"Could not parse object path from url: {url}")
-        return parts[1]
+        return unquote(parts[1])
 
     raise ValueError(f"Unsupported Firebase/Google storage URL format: {url}")
+
+
+def normalize_image_blob_path(raw: str) -> str:
+    """
+    Normalize an image reference to a durable ``client-media/...`` blob path.
+
+    Args:
+        raw: ``client-media/...`` path or HTTPS Firebase/GCS URL.
+
+    Returns:
+        Normalized blob path, or empty string when not resolvable.
+    """
+    normalized = str(raw or "").strip()
+    if not normalized:
+        return ""
+    if normalized.startswith(f"{CLIENT_MEDIA_PREFIX}/"):
+        return normalized
+    if normalized.lower().startswith(("http://", "https://")):
+        try:
+            return extract_blob_path_from_url(normalized)
+        except ValueError:
+            return ""
+    return ""
 
 
 def download_client_image_bytes_by_path(blob_path: str) -> bytes:
@@ -207,6 +245,44 @@ def download_client_image_bytes_by_path(blob_path: str) -> bytes:
     return blob.download_as_bytes()
 
 
+def sign_client_image_blob_path(blob_path: str) -> str:
+    """
+    Generate a fresh signed HTTPS URL for a durable client-media blob path.
+
+    Args:
+        blob_path: Object path inside the configured bucket (``client-media/...``).
+
+    Returns:
+        Signed download URL valid for ``WORKERS_JOB_TTL_S`` seconds.
+
+    Raises:
+        ValueError: If ``blob_path`` is empty or outside the client-media prefix.
+        FileNotFoundError: If the blob does not exist in the bucket.
+    """
+    normalized = str(blob_path or "").strip()
+    if not normalized:
+        raise ValueError("blob_path is required")
+    if not normalized.startswith(f"{CLIENT_MEDIA_PREFIX}/"):
+        raise ValueError("blob_path outside client media prefix")
+
+    bucket = get_storage_bucket()
+    blob = bucket.blob(normalized)
+    if not blob.exists():
+        raise FileNotFoundError(f"Blob not found: {normalized}")
+
+    signed_url = blob.generate_signed_url(
+        version="v4",
+        expiration=timedelta(seconds=_SIGNED_URL_TTL_S),
+        method="GET",
+    )
+    logger.debug(
+        "Signed client image URL: path=%s ttl_s=%s",
+        normalized,
+        _SIGNED_URL_TTL_S,
+    )
+    return signed_url
+
+
 def download_client_image_bytes(*, url: str) -> bytes:
     """
     Download a client image using Firebase Admin credentials (private buckets).
@@ -234,9 +310,9 @@ def upload_client_image(
     client_id: str,
     image_bytes: bytes,
     mime_type: str,
-) -> str:
+) -> ClientImageUpload:
     """
-    Upload a client image to Firebase Storage and return a signed HTTPS URL.
+    Upload a client image to Firebase Storage.
 
     Objects are stored at: client-media/{client_id}/{uuid}.{ext}
     A new UUID is used for every upload.
@@ -247,7 +323,7 @@ def upload_client_image(
         mime_type: Image MIME type (e.g. image/jpeg).
 
     Returns:
-        Signed download URL for the uploaded object (valid for WORKERS_JOB_TTL_S).
+        ClientImageUpload with durable ``blob_path`` and ephemeral ``signed_url``.
     """
     normalized_client_id = str(client_id or "").strip()
     if not normalized_client_id:
@@ -276,4 +352,4 @@ def upload_client_image(
         len(image_bytes),
         _SIGNED_URL_TTL_S,
     )
-    return download_url
+    return ClientImageUpload(blob_path=remote_path, signed_url=download_url)

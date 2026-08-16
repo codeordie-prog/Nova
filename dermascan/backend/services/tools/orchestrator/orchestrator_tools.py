@@ -25,8 +25,11 @@ from datetime import datetime
 
 from dermascan.shared.logger import get_logger
 from dermascan.shared.redis_stability import get_redis_client, run_with_redis_retries
+from dermascan.shared.escalation_image import normalize_image_blob_path
+from dermascan.shared.firebase_storage import sign_client_image_blob_path
 from dermascan.shared.ingress_payload import (
     payload_has_image_attachment,
+    resolve_first_image_blob_path_from_payload,
     resolve_first_image_url_from_payload,
     resolve_image_urls_from_payload,
 )
@@ -1364,14 +1367,14 @@ def _resolve_registration_image(
     attachment_id: Optional[str] = None,
 ) -> tuple[str, str, str] | None:
     """
-    Resolve one image URL from an ingress envelope for intake registration.
+    Resolve one image blob path from an ingress envelope for intake registration.
 
     Args:
         envelope (dict[str, str]): The ingress envelope
         attachment_id (Optional[str]): The attachment id
 
     Returns:
-        tuple[str, str, str] | None - The image url
+        tuple[str, str, str] | None: request_id, attachment_id, blob_path
     """
     try:
         payload_obj: dict[str, Any] = json.loads(str(envelope.get("payload") or "{}"))
@@ -1386,18 +1389,28 @@ def _resolve_registration_image(
     if target_attachment:
         for image in resolved_images:
             if image.attachment_id == target_attachment:
+                blob_path = str(image.blob_path or "").strip()
+                if not blob_path:
+                    blob_path = normalize_image_blob_path(image.image_url)
+                if not blob_path:
+                    return None
                 return (
                     str(envelope.get("request_id") or "").strip(),
                     image.attachment_id,
-                    image.image_url,
+                    blob_path,
                 )
         return None
 
     first = resolved_images[0]
+    blob_path = str(first.blob_path or "").strip()
+    if not blob_path:
+        blob_path = normalize_image_blob_path(first.image_url)
+    if not blob_path:
+        return None
     return (
         str(envelope.get("request_id") or "").strip(),
         first.attachment_id,
-        first.image_url,
+        blob_path,
     )
 
 
@@ -1786,6 +1799,64 @@ def _enqueue_audit_instruction(
     )
 
 
+def _resolve_image_blob_path_from_payload(payload_obj: dict[str, Any]) -> str:
+    """
+    Resolve the first durable client-media blob path from a payload object.
+
+    Args:
+        payload_obj: Parsed ingress payload.
+
+    Returns:
+        ``client-media/...`` path or empty string.
+    """
+    return resolve_first_image_blob_path_from_payload(payload_obj, redis_client=_redis)
+
+
+def _resolve_intake_image_blob_path(
+    image_ref: IntakeImageRef,
+    payload_obj: dict[str, Any] | None = None,
+) -> str:
+    """
+    Resolve the durable blob path for a registered intake image.
+
+    Args:
+        image_ref: Registered intake image reference.
+        payload_obj: Optional ingress payload fallback.
+
+    Returns:
+        Normalized blob path or empty string.
+    """
+    blob_path = str(image_ref.image_blob_path or "").strip()
+    if blob_path:
+        return normalize_image_blob_path(blob_path) or blob_path
+    blob_path = normalize_image_blob_path(str(image_ref.image_url or ""))
+    if blob_path:
+        return blob_path
+    if payload_obj is not None:
+        return _resolve_image_blob_path_from_payload(payload_obj)
+    return ""
+
+
+def _fresh_signed_url_for_blob_path(blob_path: str) -> str:
+    """
+    Mint a fresh signed URL for a client-media blob path.
+
+    Args:
+        blob_path: Durable Firebase object path.
+
+    Returns:
+        Signed HTTPS URL or empty string on failure.
+    """
+    normalized = str(blob_path or "").strip()
+    if not normalized:
+        return ""
+    try:
+        return sign_client_image_blob_path(normalized)
+    except Exception:
+        logger.exception("failed to sign intake image blob path: path=%s", normalized)
+        return ""
+
+
 def _dispatch_audit_image_ref(
     *,
     request_id: str,
@@ -1793,8 +1864,9 @@ def _dispatch_audit_image_ref(
     client_id: str,
     message_id: str,
     channel: str,
-    image_url: str,
     context: str,
+    image_blob_path: str = "",
+    image_url: str = "",
     group_id: str = "",
     group_expected_count: int = 0,
 ) -> dict[str, str]:
@@ -1807,8 +1879,9 @@ def _dispatch_audit_image_ref(
         client_id: Client identifier.
         message_id: Message identifier.
         channel: Source channel.
-        image_url: Signed/downloadable image URL.
         context: Model context text.
+        image_blob_path: Preferred durable Firebase blob path.
+        image_url: Legacy signed URL fallback when blob path is unavailable.
         group_id: Group identifier.
         group_expected_count: Group expected count.
 
@@ -1822,9 +1895,15 @@ def _dispatch_audit_image_ref(
         "client_id": client_id,
         "message_id": message_id,
         "channel": channel,
-        "image_url": image_url,
         "context": context,
     }
+    normalized_blob_path = normalize_image_blob_path(str(image_blob_path or "").strip())
+    if normalized_blob_path:
+        payload["image_blob_path"] = normalized_blob_path
+    elif str(image_url or "").strip():
+        payload["image_url"] = str(image_url).strip()
+    else:
+        raise ValueError("image_blob_path or image_url is required for audit dispatch")
     if group_id:
         payload["group_id"] = group_id
     if group_expected_count > 0:
@@ -2151,7 +2230,17 @@ def register_intake_image(
             ),
         }
 
-    image_request_id, resolved_attachment_id, image_url = resolved
+    image_request_id, resolved_attachment_id, image_blob_path = resolved
+    signed_image_url = _fresh_signed_url_for_blob_path(image_blob_path)
+    if not signed_image_url:
+        return {
+            "status": "error",
+            "request_id": str(envelope.get("request_id") or request_id),
+            "detail": "could not resolve a downloadable image URL for this request",
+            "instruction": (
+                "The image could not be resolved for storage. Ask the user to resend the photo."
+            ),
+        }
     client_id = str(envelope.get("client_id") or "anonymous").strip()
     case_id = str(envelope.get("case_id") or image_request_id).strip()
     profile = _load_skin_profile_mapping(client_id)
@@ -2166,7 +2255,8 @@ def register_intake_image(
     images = dict(session.images)
     images[image_category.value] = IntakeImageRef(
         request_id=image_request_id,
-        image_url=image_url,
+        image_url=signed_image_url,
+        image_blob_path=image_blob_path,
         attachment_id=resolved_attachment_id,
         registered_at_ms=int(time.time() * 1000),
         visual_note=str(visual_note or "").strip(),
@@ -2394,17 +2484,23 @@ def enque_request_for_auditing_stream(
             "audit_type": audit_type.value,
         }
 
-    image_url = str(image_ref.image_url or "").strip()
-    if not image_url:
-        try:
-            payload_obj: dict[str, Any] = json.loads(str(image_envelope.get("payload") or "{}"))
-        except Exception:
-            payload_obj = {}
-        image_url = _resolve_image_url_from_payload(payload_obj)
+    try:
+        payload_obj: dict[str, Any] = json.loads(str(image_envelope.get("payload") or "{}"))
+    except Exception:
+        payload_obj = {}
 
-    if not image_url:
+    image_blob_path = _resolve_intake_image_blob_path(image_ref, payload_obj)
+    image_url = str(image_ref.image_url or "").strip()
+    if not image_url and image_blob_path:
+        image_url = _fresh_signed_url_for_blob_path(image_blob_path)
+    if not image_url and not image_blob_path:
+        image_url = _resolve_image_url_from_payload(payload_obj)
+        if not image_blob_path:
+            image_blob_path = _resolve_image_blob_path_from_payload(payload_obj)
+
+    if not image_blob_path and not image_url:
         logger.info(
-            "audit tool blocked (image url unresolved): image_request_id=%s audit_type=%s",
+            "audit tool blocked (image unresolved): image_request_id=%s audit_type=%s",
             image_ref.request_id,
             audit_type.value,
         )
@@ -2414,7 +2510,7 @@ def enque_request_for_auditing_stream(
             "image_request_id": image_ref.request_id,
             "audit_type": audit_type.value,
             "instruction": (
-                "Registered image URL could not be resolved. Ask the user to upload the image "
+                "Registered image could not be resolved. Ask the user to upload the image "
                 "again and call register_intake_image before enqueueing."
             ),
         }
@@ -2454,7 +2550,8 @@ def enque_request_for_auditing_stream(
             client_id=str(image_envelope.get("client_id") or client_id),
             message_id=str(image_envelope.get("message_id") or image_ref.request_id),
             channel=str(image_envelope.get("channel") or ""),
-            image_url=image_url,
+            image_blob_path=image_blob_path,
+            image_url=image_url if not image_blob_path else "",
             context=context_text,
             group_id=group_id,
             group_expected_count=group_expected_count,
@@ -2659,19 +2756,25 @@ def continue_product_review_after_skin_prerequisite(
             )
             return False
 
-        image_url = str(product_ref.image_url or "").strip()
-        if not image_url:
-            try:
-                payload_obj: dict[str, Any] = json.loads(str(image_envelope.get("payload") or "{}"))
-            except Exception:
-                payload_obj = {}
-            image_url = _resolve_image_url_from_payload(payload_obj)
+        try:
+            payload_obj: dict[str, Any] = json.loads(str(image_envelope.get("payload") or "{}"))
+        except Exception:
+            payload_obj = {}
 
-        if not image_url:
+        image_blob_path = _resolve_intake_image_blob_path(product_ref, payload_obj)
+        image_url = str(product_ref.image_url or "").strip()
+        if not image_url and image_blob_path:
+            image_url = _fresh_signed_url_for_blob_path(image_blob_path)
+        if not image_url and not image_blob_path:
+            image_url = _resolve_image_url_from_payload(payload_obj)
+            if not image_blob_path:
+                image_blob_path = _resolve_image_blob_path_from_payload(payload_obj)
+
+        if not image_blob_path and not image_url:
             if _redis is not None:
                 _redis.delete(dedupe_key)
             logger.warning(
-                "product auto-chain blocked; product image url unresolved: request_id=%s",
+                "product auto-chain blocked; product image unresolved: request_id=%s",
                 product_ref.request_id,
             )
             return False
@@ -2689,7 +2792,8 @@ def continue_product_review_after_skin_prerequisite(
                 client_id=str(image_envelope.get("client_id") or cid),
                 message_id=str(image_envelope.get("message_id") or product_ref.request_id),
                 channel=str(image_envelope.get("channel") or ""),
-                image_url=image_url,
+                image_blob_path=image_blob_path,
+                image_url=image_url if not image_blob_path else "",
                 context=context_text,
             )
             dispatched = True

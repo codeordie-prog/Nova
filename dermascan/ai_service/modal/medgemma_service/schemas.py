@@ -9,7 +9,7 @@ Schemas for web endpoints, with Pydantic models for request and response validat
 from typing import List
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # Pydantic model for base64 request.
 class DiagnoseBase64Request(BaseModel):
@@ -27,10 +27,11 @@ class DiagnoseBase64Request(BaseModel):
 
 
 class AuditImageRefRequest(BaseModel):
-    """JSON request schema for URL-based image auditing."""
+    """JSON request schema for image auditing via URL or durable blob path."""
 
     request_id: str = Field(min_length=1)
-    image_url: str = Field(min_length=1)
+    image_url: Optional[str] = None
+    image_blob_path: Optional[str] = None
     context: str = Field(min_length=1)
     case_id: Optional[str] = None
     client_id: Optional[str] = None
@@ -39,6 +40,21 @@ class AuditImageRefRequest(BaseModel):
     mime_type: Optional[str] = None
     group_id: Optional[str] = None
     group_expected_count: Optional[int] = None
+
+    @model_validator(mode="after")
+    def _require_image_reference(self) -> "AuditImageRefRequest":
+        """
+        Ensure at least one image reference is provided.
+
+        Returns:
+            Validated request instance.
+
+        Raises:
+            ValueError: When both image references are missing.
+        """
+        if not str(self.image_blob_path or "").strip() and not str(self.image_url or "").strip():
+            raise ValueError("image_blob_path or image_url is required")
+        return self
 
 # Pydantic model for response.
 class DiagnoseResponse(BaseModel):

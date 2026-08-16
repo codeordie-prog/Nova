@@ -174,7 +174,8 @@ class IntakeImageRef(BaseModel):
 
     Attributes:
         request_id: Ingress request id that carried the image attachment.
-        image_url: Resolved downloadable URL (set server-side, not by the model).
+        image_url: Fresh signed URL for legacy readers (set server-side).
+        image_blob_path: Durable ``client-media/...`` path (preferred).
         attachment_id: Attachment id from ingress payload when available.
         registered_at_ms: Unix timestamp ms when the image was registered.
         visual_note: Non-diagnostic intake observation from the orchestrator.
@@ -182,6 +183,7 @@ class IntakeImageRef(BaseModel):
 
     request_id: str = Field(min_length=1)
     image_url: str = Field(min_length=1)
+    image_blob_path: str = ""
     attachment_id: str = ""
     registered_at_ms: int = 0
     visual_note: str = ""

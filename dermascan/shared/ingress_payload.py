@@ -16,6 +16,8 @@ from typing import Any, Callable, Final, Optional
 
 from pydantic import BaseModel, Field
 
+from dermascan.shared.firebase_storage import normalize_image_blob_path, sign_client_image_blob_path
+
 _LOGGER: Final[logging.Logger] = logging.getLogger("dermascan.ingress_payload")
 
 
@@ -25,13 +27,15 @@ class ResolvedIngressImage(BaseModel):
 
     Attributes:
         attachment_id: Attachment identifier from ingress payload.
-        image_url: HTTPS URL or data-URL suitable for vision APIs.
+        image_url: Fresh signed HTTPS URL or data-URL suitable for vision APIs.
+        blob_path: Durable ``client-media/...`` path when available.
         mime_type: Image MIME type when known.
         index: Zero-based index among image attachments in the payload.
     """
 
     attachment_id: str = ""
     image_url: str = Field(min_length=1)
+    blob_path: str = ""
     mime_type: str = ""
     index: int = 0
 
@@ -71,6 +75,103 @@ def _redis_get(redis_client: Any, key: str) -> str:
         return ""
 
 
+def _resolve_cached_media_reference(cached: str) -> str:
+    """
+    Normalize a Redis media cache entry to a durable client-media blob path.
+
+    Legacy entries may store signed HTTPS URLs; new entries store blob paths.
+
+    Args:
+        cached: Raw Redis value.
+
+    Returns:
+        ``client-media/...`` path or empty string.
+    """
+    return normalize_image_blob_path(str(cached or "").strip())
+
+
+def _sign_client_media_path(blob_path: str) -> str:
+    """
+    Mint a fresh signed URL for a client-media blob path.
+
+    Args:
+        blob_path: Durable Firebase object path.
+
+    Returns:
+        Signed HTTPS URL, or empty string on failure.
+    """
+    normalized = str(blob_path or "").strip()
+    if not normalized:
+        return ""
+    try:
+        return sign_client_image_blob_path(normalized)
+    except Exception:
+        _LOGGER.warning(
+            "failed to sign client-media path for ingress image: path=%s",
+            normalized,
+            exc_info=True,
+        )
+        return ""
+
+
+def resolve_attachment_blob_path(
+    attachment: dict[str, Any],
+    payload_obj: dict[str, Any],
+    *,
+    redis_client: Any | None = None,
+    redis_get: Optional[Callable[[str], str]] = None,
+) -> str:
+    """
+    Resolve one attachment to a durable ``client-media/...`` blob path.
+
+    Supports ``blob_ref`` (Redis lookup), legacy ``url`` Firebase references,
+    and ``telegram_media_ref`` metadata fallback.
+
+    Args:
+        attachment: Image attachment dict.
+        payload_obj: Full ingress payload for metadata fallbacks.
+        redis_client: Optional Redis client for blob_ref resolution.
+        redis_get: Optional callable override for Redis reads (tests).
+
+    Returns:
+        Normalized blob path or empty string when not resolvable.
+    """
+    if not is_image_attachment(attachment):
+        return ""
+
+    source = attachment.get("source") or {}
+    if not isinstance(source, dict):
+        return ""
+
+    source_kind = str(source.get("kind") or "").strip().lower()
+    source_value = str(source.get("value") or "").strip()
+
+    getter = redis_get
+    if getter is None and redis_client is not None:
+        getter = lambda key: _redis_get(redis_client, key)
+
+    if source_kind == "url" and source_value:
+        return normalize_image_blob_path(source_value)
+
+    if source_kind == "blob_ref" and source_value and getter is not None:
+        cached = getter(source_value)
+        path = _resolve_cached_media_reference(cached)
+        if path:
+            return path
+
+    metadata_obj = payload_obj.get("metadata") or {}
+    extras_obj = metadata_obj.get("extras") if isinstance(metadata_obj, dict) else {}
+    if isinstance(extras_obj, dict) and getter is not None:
+        telegram_media_ref = str(extras_obj.get("telegram_media_ref") or "").strip()
+        if telegram_media_ref:
+            cached = getter(telegram_media_ref)
+            path = _resolve_cached_media_reference(cached)
+            if path:
+                return path
+
+    return ""
+
+
 def resolve_attachment_image_url(
     attachment: dict[str, Any],
     payload_obj: dict[str, Any],
@@ -81,8 +182,8 @@ def resolve_attachment_image_url(
     """
     Resolve one attachment to a vision-compatible image URL.
 
-    Supports ``url``, ``blob_ref`` (Redis lookup), ``base64`` data-URLs, and
-    ``telegram_media_ref`` metadata fallback on the payload.
+    Client-media references are normalized to blob paths and re-signed at
+    resolution time. External HTTPS URLs and base64 data-URLs pass through.
 
     Args:
         attachment: Image attachment dict.
@@ -104,12 +205,14 @@ def resolve_attachment_image_url(
     source_value = str(source.get("value") or "").strip()
     mime_type = str(attachment.get("mime_type") or "image/jpeg").strip()
 
-    getter = redis_get
-    if getter is None and redis_client is not None:
-        getter = lambda key: _redis_get(redis_client, key)
-
-    if source_kind == "url" and source_value.lower().startswith(("http://", "https://")):
-        return source_value
+    blob_path = resolve_attachment_blob_path(
+        attachment,
+        payload_obj,
+        redis_client=redis_client,
+        redis_get=redis_get,
+    )
+    if blob_path:
+        return _sign_client_media_path(blob_path)
 
     if source_kind == "base64" and source_value:
         try:
@@ -119,19 +222,8 @@ def resolve_attachment_image_url(
             return ""
         return f"data:{mime_type};base64,{source_value}"
 
-    if source_kind == "blob_ref" and source_value and getter is not None:
-        cached = getter(source_value)
-        if cached.lower().startswith(("http://", "https://")):
-            return cached
-
-    metadata_obj = payload_obj.get("metadata") or {}
-    extras_obj = metadata_obj.get("extras") if isinstance(metadata_obj, dict) else {}
-    if isinstance(extras_obj, dict) and getter is not None:
-        telegram_media_ref = str(extras_obj.get("telegram_media_ref") or "").strip()
-        if telegram_media_ref:
-            cached = getter(telegram_media_ref)
-            if cached.lower().startswith(("http://", "https://")):
-                return cached
+    if source_kind == "url" and source_value.lower().startswith(("http://", "https://")):
+        return source_value
 
     return ""
 
@@ -163,6 +255,12 @@ def resolve_image_urls_from_payload(
         if not isinstance(attachment, dict) or not is_image_attachment(attachment):
             continue
 
+        blob_path = resolve_attachment_blob_path(
+            attachment,
+            payload_obj,
+            redis_client=redis_client,
+            redis_get=redis_get,
+        )
         image_url = resolve_attachment_image_url(
             attachment,
             payload_obj,
@@ -177,6 +275,7 @@ def resolve_image_urls_from_payload(
             ResolvedIngressImage(
                 attachment_id=attachment_id,
                 image_url=image_url,
+                blob_path=blob_path,
                 mime_type=str(attachment.get("mime_type") or ""),
                 index=image_index,
             )
@@ -211,6 +310,41 @@ def resolve_first_image_url_from_payload(
     if not images:
         return ""
     return images[0].image_url
+
+
+def resolve_first_image_blob_path_from_payload(
+    payload_obj: dict[str, Any],
+    *,
+    redis_client: Any | None = None,
+    redis_get: Optional[Callable[[str], str]] = None,
+) -> str:
+    """
+    Resolve the first durable blob path from a payload.
+
+    Args:
+        payload_obj: Ingress payload object.
+        redis_client: Optional Redis client.
+        redis_get: Optional Redis read override.
+
+    Returns:
+        ``client-media/...`` path or empty string.
+    """
+    attachments = (payload_obj.get("content") or {}).get("attachments") or []
+    if not isinstance(attachments, list):
+        return ""
+
+    for attachment in attachments:
+        if not isinstance(attachment, dict) or not is_image_attachment(attachment):
+            continue
+        blob_path = resolve_attachment_blob_path(
+            attachment,
+            payload_obj,
+            redis_client=redis_client,
+            redis_get=redis_get,
+        )
+        if blob_path:
+            return blob_path
+    return ""
 
 
 def payload_has_image_attachment(payload: dict[str, Any]) -> bool:
