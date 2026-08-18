@@ -142,10 +142,9 @@ def load_skin_profile_dict(
 
     try:
         initialize_firebase_app()
-        from google.cloud import firestore  # type: ignore[import-untyped]
+        from firebase_admin import firestore
 
-        firestore_client = firestore.Client()
-        doc = firestore_client.collection("skin_profiles").document(cid).get()
+        doc = firestore.client().collection("skin_profiles").document(cid).get()
     except Exception:
         _LOGGER.exception("failed to read skin profile from firestore: client_id=%s", cid)
         return {}

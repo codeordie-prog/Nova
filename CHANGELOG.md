@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-08-18 — Firestore delivery context fix + billing/credits contracts
+
+**Fix — skin profile reads on staging workers**
+
+`delivery_context.load_skin_profile_dict` used `google.cloud.firestore.Client()` (Cloud Run ADC →
+project `qutisai`), while Firebase data lives in `dawagpn`. Switched to `firebase_admin.firestore.client()`
+after `initialize_firebase_app()`, matching `orchestrator_tools.py`.
+
+- **Modified:** `dermascan/shared/delivery_context.py`
+- **Added test:** `test_load_skin_profile_uses_firebase_admin_firestore`
+- **Staging:** deployed on `dermascan-workers-staging-00007-qms`
+
+**Added — billing and credits contract stubs (implementation later)**
+
+Placeholder ABC contracts for future token/credit metering across orchestrator, tool calls,
+MedGemma, and escalations. No runtime wiring yet.
+
+- **Added:** `dermascan/shared/billing.py` — billing module scaffold
+- **Added:** `dermascan/shared/credits.py` — `CreditDeductionContract`, `CountTokens`, input/output models
+
+---
+
 ## 2026-08-16 — Expired signed URL fix (vision + ingress + MedGemma)
 
 Fixes orchestrator `400 invalid_image_url` failures when LangGraph replayed checkpoint
