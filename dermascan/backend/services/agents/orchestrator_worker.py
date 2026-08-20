@@ -51,6 +51,7 @@ from dermascan.ai_service.postprocessing.escalation import resolve_client_messag
 from dermascan.backend.services.agents.group_report_aggregator import (
     collect_and_compile_if_ready,
 )
+from dermascan.billing import accounts as billing_accounts
 from dermascan.shared.logger import get_logger
 from dermascan.shared.ingress_payload import resolve_image_urls_from_payload
 from dermascan.shared.delivery_context import (
@@ -1601,6 +1602,10 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
     channel = str(fields.get("channel") or "whatsapp")
     username = str(fields.get("username") or "").strip()
     payload_json = str(fields.get("payload") or "{}")
+
+    # Billing tools only receive client_id, but accounts are keyed on
+    # (channel, client_id). Record the pairing while the envelope still has it.
+    billing_accounts.remember_channel(client_id, channel)
 
     # Serialize per client so concurrent workers cannot corrupt the shared
     # conversation checkpoint. On lock timeout, leave the message pending for
