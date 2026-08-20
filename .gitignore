@@ -61,3 +61,17 @@ copy_cir_pdfs_local_to_cloud.py
 copy_cir_pdfs_pg_dump.ps1
 
 cir_pdfs_backup.sql
+# Generated documentation artefacts — regenerate from the .md sources with
+# scripts/generate_*.py rather than committing binaries.
+dermascan/docs/.generated_billing_doc_assets/
+dermascan/docs/*.pdf
+dermascan/docs/*.docx
+
+# Root-level doc generator scripts — local tooling, not part of the app.
+/scripts/
+
+# Service account keys — never commit credentials.
+qutisai-*.json
+*-service-account.json
+# Meeting notes
+/granola
