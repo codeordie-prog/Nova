@@ -6,6 +6,7 @@ These are contract-first placeholders and intentionally contain no implementatio
 
 import base64
 import binascii
+from decimal import Decimal, InvalidOperation
 import asyncio
 import hmac
 import json
@@ -28,6 +29,17 @@ from dermascan.backend.models.requests import (
     OrchestratorIngressRequest,
     RequestMetadata,
     RoutingHint,
+)
+from psycopg.types.json import Jsonb
+
+from dermascan.billing import admin_queries as billing_admin
+from dermascan.billing.db import transaction as billing_transaction
+from dermascan.billing.flags import billing_enabled, paystack_is_live
+from dermascan.billing.webhook import (
+    SIGNATURE_HEADER as PAYSTACK_SIGNATURE_HEADER,
+    dedupe_key as paystack_dedupe_key,
+    is_paystack_ip,
+    verify_signature as verify_paystack_signature,
 )
 from dermascan.backend.api.group_media_helper import (
     append_to_media_batch,
@@ -73,6 +85,7 @@ _INGRESS_RETRY_AFTER_S: str = os.getenv("INGRESS_RETRY_AFTER_SECONDS", "1")
 _ORCHESTRATOR_SIGNAL_STREAM: str = os.getenv("ORCHESTRATOR_SIGNAL_STREAM", "orchestrator:signals")
 _EVENTS_STREAM: str = os.getenv("EVENTS_STREAM", "events:stream")
 _ESCALATION_CLOSED_TTL_SEC: int = 7 * 24 * 3600
+_BILLING_JOB_STREAM: str = os.getenv("BILLING_JOB_STREAM", "billing:jobs")
 
 # Initialize redis client
 _redis = redis.Redis.from_url(_REDIS_URL, decode_responses=True) if _REDIS_URL else None
@@ -1001,6 +1014,213 @@ async def _verify_qutis_hmac(request: Request) -> bytes:
         request.headers.get(TIMESTAMP_HEADER),
     )
     return raw_body
+
+
+async def _verify_admin_hmac(request: Request) -> None:
+    """
+    Verify an HMAC-signed admin request.
+
+    These are bodyless GETs, so the signature covers the full path and query
+    string. That binds it to the exact page and filters requested and stops a
+    captured signature being replayed against a different account.
+    """
+    if not billing_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    signed = request.url.path
+    if request.url.query:
+        signed = f"{signed}?{request.url.query}"
+    verify_hmac(
+        signed.encode("utf-8"),
+        request.headers.get(SIGNATURE_HEADER),
+        request.headers.get(TIMESTAMP_HEADER),
+    )
+
+
+@router.get("/admin/billing/overview")
+async def admin_billing_overview(request: Request, days: int = 30) -> dict[str, Any]:
+    await _verify_admin_hmac(request)
+    return billing_admin.overview(days=max(1, min(days, 365)))
+
+
+@router.get("/admin/billing/users")
+async def admin_billing_users(
+    request: Request,
+    limit: int = 50,
+    cursor: str | None = None,
+    sort: str = "recent",
+) -> dict[str, Any]:
+    await _verify_admin_hmac(request)
+    return billing_admin.list_accounts(limit=limit, cursor=cursor, sort=sort)
+
+
+@router.get("/admin/billing/users/{account_id}")
+async def admin_billing_user_detail(account_id: str, request: Request) -> dict[str, Any]:
+    await _verify_admin_hmac(request)
+    detail = billing_admin.account_detail(account_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return detail
+
+
+@router.get("/admin/billing/users/{account_id}/ledger")
+async def admin_billing_user_ledger(
+    account_id: str, request: Request, limit: int = 50, before_id: int | None = None
+) -> dict[str, Any]:
+    await _verify_admin_hmac(request)
+    return billing_admin.account_ledger(account_id, limit=limit, before_id=before_id)
+
+
+@router.get("/admin/billing/payments")
+async def admin_billing_payments(
+    request: Request, status: str | None = None, limit: int = 50
+) -> dict[str, Any]:
+    await _verify_admin_hmac(request)
+    return billing_admin.list_payments(status=status, limit=limit)
+
+
+@router.get("/admin/billing/pricing")
+async def admin_billing_pricing(request: Request, scope: str | None = None) -> dict[str, Any]:
+    await _verify_admin_hmac(request)
+    from dermascan.billing import pricing as billing_pricing
+
+    return {"items": billing_pricing.list_current_prices(scope)}
+
+
+@router.post("/admin/billing/pricing")
+async def admin_billing_set_price(request: Request) -> dict[str, Any]:
+    """
+    Record a new price, effective immediately.
+
+    A POST, so the signature covers the body rather than the path. Prices are
+    never updated in place: this inserts a new row and the previous one stays,
+    so a charge made last week is still explainable by the rate that was in
+    force when it ran.
+
+    ``changed_by`` is the authenticated admin, taken from the dashboard session
+    and carried through here for the audit trail.
+    """
+    if not billing_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    raw_body = await request.body()
+    verify_hmac(
+        raw_body,
+        request.headers.get(SIGNATURE_HEADER),
+        request.headers.get(TIMESTAMP_HEADER),
+    )
+
+    try:
+        body = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Malformed payload") from exc
+
+    scope = str(body.get("scope") or "").strip()
+    key = str(body.get("key") or "").strip()
+    changed_by = str(body.get("changed_by") or "").strip()
+
+    from dermascan.billing import pricing as billing_pricing
+
+    valid_scopes = {
+        billing_pricing.SCOPE_JOB_CREDITS,
+        billing_pricing.SCOPE_MODEL_TOKEN_RATE,
+        billing_pricing.SCOPE_SETTING,
+    }
+    if scope not in valid_scopes or not key:
+        raise HTTPException(status_code=400, detail="scope and key are required")
+    if not changed_by:
+        raise HTTPException(status_code=400, detail="changed_by is required")
+
+    try:
+        value = Decimal(str(body.get("value")))
+    except (InvalidOperation, TypeError):
+        raise HTTPException(status_code=400, detail="value must be numeric")
+
+    billing_pricing.set_price(scope, key, value, created_by=changed_by)
+    logger.info("price changed: scope=%s key=%s value=%s by=%s", scope, key, value, changed_by)
+    return {"status": "ok", "scope": scope, "key": key, "value": str(value)}
+
+
+@router.get("/admin/billing/reconciliation")
+async def admin_billing_reconciliation(request: Request) -> dict[str, Any]:
+    await _verify_admin_hmac(request)
+    drift = billing_admin.reconciliation_drift()
+    return {"drift": drift, "healthy": len(drift) == 0}
+
+
+@router.post("/webhooks/paystack")
+async def paystack_webhook(request: Request) -> dict[str, str]:
+    """
+    Receive a Paystack payment notification.
+
+    Does as little as possible: verify, record, enqueue, return 200. Anything
+    slower risks a timeout, and a non-200 earns 72 hours of Paystack retries.
+    Verification against Paystack and credit granting happen in the billing
+    worker, off the request path.
+
+    The signature covers the raw request body, so the body is read as bytes and
+    never through a parsed FastAPI model — re-serializing changes the digest and
+    would reject every webhook.
+    """
+    if not billing_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    raw_body = await request.body()
+
+    if not verify_paystack_signature(raw_body, request.headers.get(PAYSTACK_SIGNATURE_HEADER)):
+        logger.warning("paystack webhook rejected: bad signature")
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    # Enforced only for live keys: test-mode webhooks are commonly replayed
+    # from a local tunnel or curl, and blocking those blocks testing.
+    if paystack_is_live():
+        client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (
+            request.client.host if request.client else ""
+        )
+        if not is_paystack_ip(client_ip):
+            logger.warning("paystack webhook rejected: unexpected source ip=%s", client_ip)
+            raise HTTPException(status_code=401, detail="Unrecognized source")
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Malformed payload") from exc
+
+    event = str(payload.get("event") or "")
+    reference = str((payload.get("data") or {}).get("reference") or "")
+    dedupe = paystack_dedupe_key(payload)
+
+    try:
+        with billing_transaction() as conn:
+            inserted = conn.execute(
+                """
+                INSERT INTO billing.paystack_event (dedupe_key, event, reference, payload, status)
+                VALUES (%s, %s, %s, %s, 'received')
+                ON CONFLICT (dedupe_key) DO NOTHING
+                RETURNING id
+                """,
+                (dedupe, event, reference or None, Jsonb(payload)),
+            ).fetchone()
+    except Exception:
+        logger.exception("paystack webhook persist failed: reference=%s", reference)
+        raise HTTPException(status_code=500, detail="Storage unavailable")
+
+    if inserted is None:
+        logger.info("paystack webhook already seen: dedupe=%s", dedupe)
+        return {"status": "duplicate"}
+
+    redis_client = _require_redis()
+    fields = enrich_stream_fields(
+        {"event": event, "reference": reference, "dedupe_key": dedupe}
+    )
+    redis_client.xadd(
+        _BILLING_JOB_STREAM,
+        fields,
+        maxlen=_WORKERS_STREAM_MAXLEN,
+        approximate=True,
+    )
+    logger.info("paystack webhook queued: event=%s reference=%s", event, reference)
+    return {"status": "queued"}
 
 
 @router.post("/webhooks/escalation")
