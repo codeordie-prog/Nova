@@ -444,6 +444,11 @@ OrchestratorRequestIdArg = Annotated[
     ),
 ]
 
+from dermascan.backend.services.tools.orchestrator.billing_tools import (
+    create_topup,
+    get_credit_balance,
+)
+
 OrchestratorClientIdArg = Annotated[
     str,
     Field(
@@ -3438,6 +3443,8 @@ def request_specialist_escalation(request_id: OrchestratorRequestIdArg) -> dict[
 
 orchestrator_tools: list = [
     get_time,
+    get_credit_balance,
+    create_topup,
     skin_profile_is_available,
     get_skin_profile,
     update_intake,
