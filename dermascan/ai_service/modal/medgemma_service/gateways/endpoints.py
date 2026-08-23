@@ -61,6 +61,8 @@ from dermascan.ai_service.modal.medgemma_service.gateways.global_rate_limiter im
 )
 
 from dermascan.ai_service.modal.medgemma_service.worker import _ensure_consumer_group
+from dermascan.billing.flags import billing_active, billing_enforce_enabled
+from dermascan.billing.reservations import INSUFFICIENT_CREDITS_MESSAGE, InsufficientCreditsError
 
 # Create FastAPI app
 web_app = FastAPI(title="DermaScan MedGemma API", version="0.1")
@@ -119,6 +121,61 @@ async def _enqueue_with_retry(func, *args):
 class QueueCapacityExceededError(RuntimeError):
     """Raised when queue capacity is saturated at enqueue time."""
 
+
+def _billing_stream_fields(
+    *,
+    job_id: str,
+    channel: str,
+    client_id: str,
+    prompt: str,
+    case_id: str = "",
+) -> dict[str, str]:
+    """
+    Prepare billing hold metadata for a MedGemma enqueue.
+
+    Args:
+        job_id: Generated MedGemma job id.
+        channel: Ingress channel.
+        client_id: Messaging client id.
+        prompt: Prompt/context for job-type inference.
+        case_id: Optional case id.
+
+    Returns:
+        dict[str, str]: Redis fields to persist on the job hash/stream entry.
+
+    Raises:
+        InsufficientCreditsError: When enforce is on and the wallet is too low.
+    """
+    if not billing_active():
+        return {}
+
+    from dermascan.billing.medgemma import (
+        billing_fields_for_stream,
+        prepare_medgemma_job_billing,
+    )
+
+    try:
+        context = prepare_medgemma_job_billing(
+            job_id=job_id,
+            channel=channel,
+            client_id=client_id,
+            prompt=prompt,
+            case_id=case_id,
+        )
+        return billing_fields_for_stream(context)
+    except InsufficientCreditsError:
+        raise
+    except Exception:
+        logger.exception(
+            "medgemma billing prepare failed at enqueue: job_id=%s channel=%s client_id=%s",
+            job_id,
+            channel,
+            client_id,
+        )
+        if billing_enforce_enabled():
+            raise
+        return {}
+
 # enqueue job function
 def _enqueue_job(
     image_bytes: bytes,
@@ -149,6 +206,15 @@ def _enqueue_job(
     # Create a unique job ID
     job_id: str = uuid.uuid4().hex
     
+    # Prepare the billing fields for the MedGemma job
+    billing_fields: dict[str, str] = _billing_stream_fields(
+        job_id=job_id,
+        channel=channel,
+        client_id=client_id,
+        prompt=prompt,
+        case_id=case_id,
+    )
+
     # Encode the image to base64
     image_b64: str = base64.b64encode(image_bytes).decode("ascii")
     
@@ -184,6 +250,7 @@ def _enqueue_job(
                         "job_id": job_id,
                         "status": "queued",
                         "created_at": str(now_s),
+                        **billing_fields,
                     },
                 )
                 pipe.expire(job_key, _JOB_TTL_S)
@@ -201,6 +268,7 @@ def _enqueue_job(
                         "channel": channel,
                         "group_id": group_id,
                         "group_expected_count": str(group_expected_count),
+                        **billing_fields,
                     },
                     maxlen=_STREAM_MAXLEN,
                     approximate=True,
@@ -264,6 +332,13 @@ def _enqueue_ref_job(
         QueueCapacityExceededError: If queue capacity is saturated.
     """
     job_id: str = uuid.uuid4().hex
+    billing_fields: dict[str, str] = _billing_stream_fields(
+        job_id=job_id,
+        channel=channel,
+        client_id=client_id,
+        prompt=prompt,
+        case_id=case_id,
+    )
     job_key: str = f"medgemma:job:{job_id}"
     now_s: int = int(time.time())
 
@@ -287,6 +362,7 @@ def _enqueue_ref_job(
                         "image_source_kind": image_source_kind,
                         "image_source_value": image_source_value,
                         "mime_type": mime_type,
+                        **billing_fields,
                     },
                 )
                 pipe.expire(job_key, _JOB_TTL_S)
@@ -306,6 +382,7 @@ def _enqueue_ref_job(
                         "channel": channel,
                         "group_id": group_id,
                         "group_expected_count": str(group_expected_count),
+                        **billing_fields,
                     },
                     maxlen=_STREAM_MAXLEN,
                     approximate=True,
@@ -654,6 +731,9 @@ async def diagnose_base64(
         logger.error(f"Image validation error: {e}")
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
+    except InsufficientCreditsError:
+        raise HTTPException(status_code=402, detail=INSUFFICIENT_CREDITS_MESSAGE)
+
     except QueueCapacityExceededError:
         raise HTTPException(
             status_code=429,
@@ -738,6 +818,9 @@ async def audit_image_ref(
 
     except HTTPException:
         raise
+
+    except InsufficientCreditsError:
+        raise HTTPException(status_code=402, detail=INSUFFICIENT_CREDITS_MESSAGE)
 
     except QueueCapacityExceededError:
         raise HTTPException(

@@ -21,6 +21,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
+from dermascan.shared.load_env import resolve_redis_url
 from dermascan.shared.logger import get_logger
 
 logger = get_logger(__name__)
@@ -77,7 +78,7 @@ def load_redis_stability_config(*, decode_responses: bool = True) -> RedisStabil
         ValueError: If one or more environment values are invalid.
     """
 
-    redis_url: str = os.getenv("REDIS_URL", "").strip()
+    redis_url: str = resolve_redis_url()
     if not redis_url:
         raise RuntimeError("REDIS_URL is required for Redis connectivity")
 

@@ -56,6 +56,8 @@ test.py
 test2.py
 subagents.md
 behaviour.md
+cli.md
+PHASE0_DECISIONS.md
 
 copy_cir_pdfs_local_to_cloud.py
 copy_cir_pdfs_pg_dump.ps1

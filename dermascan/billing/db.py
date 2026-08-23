@@ -1,0 +1,165 @@
+"""
+Author: Dermascan Team
+Date: 2026-08-21
+License: MIT
+
+Postgres connection pool for the ``billing`` schema.
+
+Uses the same ``POSTGRES_*`` environment variables as the rules engine.
+Shared with all modules under ``dermascan.billing``.
+"""
+
+from __future__ import annotations
+
+import os
+from contextlib import contextmanager
+from typing import Any, Final, Iterator, Optional
+
+import psycopg
+from psycopg import Connection
+from psycopg.conninfo import make_conninfo
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+from dermascan.shared.logger import get_logger
+
+logger = get_logger(__name__)
+
+_POSTGRES_PASSWORD_ENV_KEYS: Final[tuple[str, ...]] = (
+    "POSTGRESS_PASSWORD",
+    "POSTGRES_PASSWORD",
+    "CLOUD_POSTGRES_PASSWORD",
+    "postgres_password",
+)
+
+_POOL_MIN_SIZE: Final[int] = 1
+_POOL_MAX_SIZE: Final[int] = 5
+_CONNECT_TIMEOUT_S: Final[int] = 15
+
+_POOL: Optional[ConnectionPool] = None
+
+
+def _resolve_postgres_password() -> str:
+    """
+    Resolve the Postgres password from supported environment variable names.
+
+    Returns:
+        str: Password string, or empty when none are set.
+    """
+    for key in _POSTGRES_PASSWORD_ENV_KEYS:
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def build_conninfo() -> str:
+    """
+    Build a libpq connection string from environment variables.
+
+    Returns:
+        str: Connection string suitable for psycopg.
+
+    Raises:
+        ValueError: When no password is configured.
+    """
+    password = _resolve_postgres_password()
+    if not password:
+        raise ValueError(
+            "Postgres password is required. Set one of: "
+            + ", ".join(_POSTGRES_PASSWORD_ENV_KEYS)
+        )
+
+    params: dict[str, Any] = {
+        "host": os.environ.get("POSTGRES_HOST", "localhost"),
+        "port": os.environ.get("POSTGRES_PORT", "5432"),
+        "dbname": os.environ.get("POSTGRES_DATABASE", "qutis_db"),
+        "user": os.environ.get("POSTGRES_USER", "postgres"),
+        "password": password,
+        "connect_timeout": _CONNECT_TIMEOUT_S,
+    }
+    sslmode = (
+        os.environ.get("POSTGRES_SSLMODE", "").strip()
+        or os.environ.get("CLOUD_POSTGRES_SSLMODE", "").strip()
+    )
+    if sslmode:
+        params["sslmode"] = sslmode
+    return make_conninfo(**params)
+
+
+def get_pool(*, refresh: bool = False) -> ConnectionPool:
+    """
+    Return the cached billing connection pool, creating it on first use.
+
+    Args:
+        refresh: When True, close and replace an existing pool.
+
+    Returns:
+        ConnectionPool: Shared pool for the billing schema.
+    """
+    global _POOL
+    if refresh:
+        reset_pool()
+    if _POOL is None:
+        _POOL = ConnectionPool(
+            conninfo=build_conninfo(),
+            min_size=_POOL_MIN_SIZE,
+            max_size=_POOL_MAX_SIZE,
+            kwargs={"row_factory": dict_row},
+            open=False,
+        )
+        _POOL.open()
+        logger.info("billing db pool opened: max_size=%s", _POOL_MAX_SIZE)
+    return _POOL
+
+
+def reset_pool() -> None:
+    """Close and discard the cached pool. Used by tests and on reconfiguration."""
+    global _POOL
+    if _POOL is not None:
+        try:
+            _POOL.close()
+        except Exception:
+            logger.exception("billing db pool close failed")
+        _POOL = None
+
+
+@contextmanager
+def transaction() -> Iterator[Connection]:
+    """
+    Yield a pooled connection inside a transaction.
+
+    Commits on clean exit, rolls back on exception.
+
+    Yields:
+        Connection: Pooled psycopg connection with ``dict_row`` rows.
+    """
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            yield conn
+
+
+def ping() -> bool:
+    """
+    Check that the billing database is reachable.
+
+    Returns:
+        bool: True when a trivial query succeeds.
+    """
+    try:
+        with get_pool().connection() as conn:
+            conn.execute("SELECT 1")
+        return True
+    except psycopg.Error:
+        logger.exception("billing db ping failed")
+        return False
+
+
+# Test the billing database connection
+if __name__ == "__main__":
+    from dermascan.shared.load_env import bootstrap_env
+
+    bootstrap_env()
+    ok = ping()
+    print("billing db ping:", "ok" if ok else "failed")
+    raise SystemExit(0 if ok else 1)

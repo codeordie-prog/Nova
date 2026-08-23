@@ -95,6 +95,8 @@ from dermascan.backend.services.agents.memory.redis_checkpointer import (
     delete_thread as delete_checkpoint_thread,
 )
 from dermascan.shared import agent_call_tracer
+from dermascan import billing
+from dermascan.billing.context import BillingScope
 from dermascan.shared.langsmith_observability import (
     build_invoke_config,
     configure_worker_project,
@@ -232,6 +234,7 @@ WORKERS_STREAM_MAXLEN: int = int(os.getenv("WORKERS_STREAM_MAXLEN", "5000"))
 # sent. This implements the one-way merge: signals write, jobs read, no
 # shared mutable state between flows.
 PROACTIVE_LOG_KEY_PREFIX: str = os.getenv("PROACTIVE_LOG_KEY_PREFIX", "orchestrator:proactive_log")
+SIGNAL_HANDLED_TTL_SEC: int = max(60, int(os.getenv("SIGNAL_HANDLED_TTL_SEC", "3600")))
 PROACTIVE_LOG_MAX_LEN: int = max(1, int(os.getenv("PROACTIVE_LOG_MAX_LEN", "50")))
 PROACTIVE_LOG_INCLUDE_N: int = max(0, int(os.getenv("PROACTIVE_LOG_INCLUDE_N", "5")))
 PROACTIVE_LOG_TTL_SEC: int = int(os.getenv("PROACTIVE_LOG_TTL_SEC", "2592000"))  # 30 days
@@ -623,6 +626,69 @@ def _is_timeout_error(exc: Exception) -> bool:
         if "timed out" in text or "timeout" in text or "deadline exceeded" in text:
             return True
     return False
+
+
+def _signal_handled_key(signal_type: str, request_id: str, discriminator: str) -> str:
+    """
+    Build a Redis key that marks one orchestrator signal as already handled.
+
+    Args:
+        signal_type: Signal type from the stream envelope.
+        request_id: Turn / case request id.
+        discriminator: ``signal_id`` when present, otherwise the stream msg id.
+
+    Returns:
+        str: Idempotency key for duplicate signal suppression.
+    """
+    return f"orchestrator:signal_handled:{signal_type}:{request_id}:{discriminator}"
+
+
+def _try_claim_signal(signal_type: str, request_id: str, discriminator: str) -> bool:
+    """
+    Claim exclusive handling rights for one signal envelope.
+
+    Args:
+        signal_type: Signal type from the stream envelope.
+        request_id: Turn / case request id.
+        discriminator: ``signal_id`` when present, otherwise the stream msg id.
+
+    Returns:
+        bool: True when this worker should process the signal.
+    """
+    if not signal_type or not request_id or not discriminator:
+        return True
+    key = _signal_handled_key(signal_type, request_id, discriminator)
+    try:
+        return bool(_redis.set(key, "1", nx=True, ex=SIGNAL_HANDLED_TTL_SEC))
+    except Exception:
+        logger.exception(
+            "failed to claim signal idempotency key: request_id=%s signal_type=%s",
+            request_id,
+            signal_type,
+        )
+        return True
+
+
+def _release_signal_claim(signal_type: str, request_id: str, discriminator: str) -> None:
+    """
+    Release a signal idempotency claim after a failed handler attempt.
+
+    Args:
+        signal_type: Signal type from the stream envelope.
+        request_id: Turn / case request id.
+        discriminator: ``signal_id`` when present, otherwise the stream msg id.
+    """
+    if not signal_type or not request_id or not discriminator:
+        return
+    key = _signal_handled_key(signal_type, request_id, discriminator)
+    try:
+        _redis.delete(key)
+    except Exception:
+        logger.exception(
+            "failed to release signal idempotency key: request_id=%s signal_type=%s",
+            request_id,
+            signal_type,
+        )
 
 
 def _proactive_log_key(client_id: str) -> str:
@@ -1624,7 +1690,70 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
     if client_lock is None:
         return
 
+    reservation_id: Optional[str] = None
+    billing_token: Optional[Any] = None
+
     try:
+        if billing.billing_active():
+            try:
+                account = billing.get_or_create_account(channel, client_id)
+                if billing.billing_enforce_enabled():
+                    try:
+                        reservation = billing.place_hold(
+                            account_id=account.id,
+                            reservation_key=request_id,
+                            case_id=case_id,
+                            client_id=client_id,
+                            channel=channel,
+                        )
+                        reservation_id = reservation.id
+                    except billing.InsufficientCreditsError as exc:
+                        logger.info(
+                            "billing gate blocked turn: client_id=%s request_id=%s balance=%s required=%s",
+                            client_id,
+                            request_id,
+                            exc.balance,
+                            exc.required,
+                        )
+                        _enqueue_outbound(
+                            client_id=client_id,
+                            case_id=case_id,
+                            channel=channel,
+                            request_id=request_id,
+                            text=billing.INSUFFICIENT_CREDITS_MESSAGE,
+                            kind="job_reply",
+                            must_deliver=True,
+                            reply_to_message_id=message_id,
+                        )
+                        _redis.xack(
+                            ORCHESTRATOR_JOB_STREAM,
+                            ORCHESTRATOR_CONSUMER_GROUP,
+                            msg_id,
+                        )
+                        _redis.xdel(ORCHESTRATOR_JOB_STREAM, msg_id)
+                        reclaim_logic.mark_processed(ORCHESTRATOR_JOB_STREAM, msg_id)
+                        return
+
+                billing_token = billing.billing_scope.set(
+                    BillingScope(
+                        account_id=account.id,
+                        scope_key=request_id,
+                        channel=channel,
+                        client_id=client_id,
+                        reservation_id=reservation_id,
+                    )
+                )
+            except billing.InsufficientCreditsError:
+                raise
+            except Exception:
+                logger.exception(
+                    "billing turn setup failed: client_id=%s request_id=%s",
+                    client_id,
+                    request_id,
+                )
+                if billing.billing_enforce_enabled():
+                    raise
+
         # If a signal flow is currently processing a proactive update for this
         # client, wait briefly so the proactive_log is refreshed before we
         # compose the user-facing reply. This prevents the job agent from
@@ -1774,7 +1903,6 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         reclaim_logic.mark_processed(ORCHESTRATOR_JOB_STREAM, msg_id)
 
     except Exception as exc:
-
         agent_call_tracer.end_turn(status="failed", error=str(exc))
 
         try:
@@ -1808,6 +1936,22 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         logger.exception("orchestrator job failed: request_id=%s client_id=%s", request_id, client_id)
 
     finally:
+        if reservation_id and billing.billing_enforce_enabled():
+            try:
+                # Commit the actual credits usage to the database.
+                # commit reservation sums up the total cost within the scope
+                # Does a refund or an overrun
+                # The actual credits are then deducted from the account balance
+                
+                billing.commit_reservation(reservation_id)
+            except Exception:
+                logger.exception(
+                    "billing settle failed: reservation_id=%s request_id=%s",
+                    reservation_id,
+                    request_id,
+                )
+        if billing_token is not None:
+            billing.billing_scope.reset(billing_token)
         _del_inflight("job", client_id)
         _release_client_lock(client_lock, client_id)
 
@@ -2009,9 +2153,25 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
     channel = str(fields.get("channel") or "")
     request_id = str(fields.get("request_id") or "")
     signal_type = str(fields.get("signal_type") or "")
+    signal_id = str(fields.get("signal_id") or "").strip()
+    signal_discriminator = signal_id or msg_id
     source_message_id = str(fields.get("message_id") or "").strip()
     reply_to_message_id = (source_message_id if signal_type.startswith("diagnose_")
     or signal_type.startswith("product_review_") else "")
+
+    if not _try_claim_signal(signal_type, request_id, signal_discriminator):
+        logger.info(
+            "signal already handled; skipping duplicate: request_id=%s case_id=%s signal_type=%s signal_id=%s msg_id=%s",
+            request_id,
+            case_id,
+            signal_type,
+            signal_id,
+            msg_id,
+        )
+        _redis.xack(ORCHESTRATOR_SIGNAL_STREAM, ORCHESTRATOR_SIGNAL_CONSUMER_GROUP, msg_id)
+        _redis.xdel(ORCHESTRATOR_SIGNAL_STREAM, msg_id)
+        reclaim_logic.mark_processed(ORCHESTRATOR_SIGNAL_STREAM, msg_id)
+        return
 
     try:
         payload_obj: dict[str, Any] = {}
@@ -2170,12 +2330,25 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                 },
                 delivery_context_prompt=delivery_prompt,
             )
-            if not aggregate_result.should_send:
+            if aggregate_result.should_send:
+                reply = aggregate_result.compiled_text
+            elif aggregate_result.reason == "already_sent":
+                logger.info(
+                    "group report already sent; skipping outbound: group_id=%s request_id=%s",
+                    group_id,
+                    request_id,
+                )
                 _redis.xack(ORCHESTRATOR_SIGNAL_STREAM, ORCHESTRATOR_SIGNAL_CONSUMER_GROUP, msg_id)
                 _redis.xdel(ORCHESTRATOR_SIGNAL_STREAM, msg_id)
                 reclaim_logic.mark_processed(ORCHESTRATOR_SIGNAL_STREAM, msg_id)
                 return
-            reply = aggregate_result.compiled_text
+            else:
+                logger.info(
+                    "group incomplete; sending item now: group_id=%s request_id=%s reason=%s",
+                    group_id,
+                    request_id,
+                    aggregate_result.reason,
+                )
 
         _enqueue_outbound(
             client_id=client_id,
@@ -2220,6 +2393,7 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         reclaim_logic.mark_processed(ORCHESTRATOR_SIGNAL_STREAM, msg_id)
 
     except Exception as exc:
+        _release_signal_claim(signal_type, request_id, signal_discriminator)
         # Finalize the trace for this turn (no-op if already ended on success).
         agent_call_tracer.end_turn(status="failed", error=str(exc))
         _redis.xadd(
@@ -2259,6 +2433,8 @@ def run_worker_forever() -> None:
     """
     # Check REDIS connection, ensure consumer groups exist for both streams.
     check_redis_connectivity(decode_responses=True)
+    if billing.billing_active():
+        billing.validate_billing_flags()
     _ensure_consumer_group("orchestrator_job")
     _ensure_consumer_group("signal_job")
 

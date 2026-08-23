@@ -256,6 +256,85 @@ class TestIntakeTools:
         assert len(dispatched) == 1
         assert "skin" in dispatched[0].get("context", "").lower() or dispatched[0].get("image_url")
 
+    def test_enqueue_insufficient_credits_does_not_mark_awaiting_audit(
+        self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(tools, "_redis", fake_redis)
+        self._wire_profile(monkeypatch)
+        self._cache_envelope(
+            fake_redis, "req-402", "client-402", "case-402", "https://example.com/skin.jpg"
+        )
+        monkeypatch.setattr(
+            tools,
+            "_dispatch_audit_image_ref",
+            lambda **_kwargs: {
+                "status": "insufficient_credits",
+                "detail": "Insufficient credits for image analysis.",
+                "instruction": "Tell the user to top up before retrying.",
+            },
+        )
+        monkeypatch.setattr(tools, "_emit_orchestrator_event", lambda _fields: None)
+
+        tools.update_intake.invoke(
+            {
+                "request_id": "req-402",
+                "service_intent": "skin_review",
+                "primary_concern": "Cheek rash",
+                "confirm_reproductive_status": True,
+                "current_medications": [],
+            }
+        )
+        tools.register_intake_image.invoke({"request_id": "req-402", "image_category": "skin"})
+
+        result = tools.enque_request_for_auditing_stream.invoke(
+            {"request_id": "req-402", "audit_type": "skin"}
+        )
+        assert result["status"] == "insufficient_credits"
+        assert "top up" in result["instruction"].lower()
+
+        session = load_intake_session("client-402", redis_client=fake_redis)
+        assert session is not None
+        assert session.phase != IntakePhase.AWAITING_AUDIT
+        assert fake_redis.get(tools._audit_enqueued_dedupe_key("req-402")) is None
+
+    def test_update_intake_auto_dispatch_surfaces_insufficient_credits(
+        self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(tools, "_redis", fake_redis)
+        self._wire_profile(monkeypatch)
+        self._cache_envelope(
+            fake_redis, "req-auto-402", "client-auto-402", "case-auto-402", "https://example.com/skin.jpg"
+        )
+        monkeypatch.setattr(
+            tools,
+            "_dispatch_audit_image_ref",
+            lambda **_kwargs: {
+                "status": "insufficient_credits",
+                "detail": "Insufficient credits for image analysis.",
+                "instruction": "Tell the user to top up before retrying.",
+            },
+        )
+        monkeypatch.setattr(tools, "_emit_orchestrator_event", lambda _fields: None)
+
+        tools.update_intake.invoke(
+            {
+                "request_id": "req-auto-402",
+                "service_intent": "skin_review",
+                "primary_concern": "Cheek rash",
+                "confirm_reproductive_status": True,
+                "current_medications": [],
+            }
+        )
+        tools.register_intake_image.invoke(
+            {"request_id": "req-auto-402", "image_category": "skin"}
+        )
+
+        result = tools.update_intake.invoke({"request_id": "req-auto-402"})
+        assert result.get("auto_dispatched") == ["insufficient_credits"]
+        assert result.get("dispatch_status") == "insufficient_credits"
+        assert "top up" in result["instruction"].lower()
+        assert "being reviewed" not in result["instruction"].lower()
+
     def test_new_image_on_awaiting_audit_session_reopens_and_dispatches(
         self, fake_redis: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:

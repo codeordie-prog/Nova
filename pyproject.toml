@@ -35,7 +35,7 @@ langchain-community = "^0.4.1"
 pypdf = "^6.11.0"
 pymupdf = "^1.27.2.3"
 pytesseract = "^0.3.13"
-psycopg = {extras = ["binary"], version = "^3.3.4"}
+psycopg = {extras = ["binary", "pool"], version = "^3.3.4"}
 psycopg2-binary = "^2.9.12"
 firebase = "^4.0.1"
 firebase-admin = "^7.4.0"

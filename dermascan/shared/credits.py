@@ -42,11 +42,16 @@ FUNCTION at_tool_start(tool_name: str, input: ToolInput) -> None:
     # Count the tokens
     token_count = count_tokens(input)
     Return token_count
+
+
+A redis billing key for a given account_id would be atomically deducted at each point of incured cost.
 """
 
 from abc import ABC, abstractmethod
 from pydantic import BaseModel
 from typing import Any
+
+from redis import Redis
 
 
 class RequestInput(BaseModel):
@@ -72,6 +77,7 @@ class CreditDeductionContract(ABC):
     @abstractmethod
     def charge_output_tokens(self, token_count: int, n_cost_per_token: float) -> None:
         pass
+    
 
 
 class CountTokens(ABC):
@@ -98,3 +104,26 @@ class CountTokens(ABC):
         pass
 
 
+class RedisDeductionSystem(CreditDeductionContract):
+
+    def __init__(self, redis_client: Redis, account_id: str):
+        self.redis_client = redis_client
+        self.account_id = account_id
+
+    @property
+    def account_id_key(self) -> str:
+        return f"accounts:{self.account_id}"
+
+    def _charge(self, token_count: int, n_cost_per_token: float) -> None:
+
+        total_cost = token_count * n_cost_per_token
+
+        # Redis atomic deduction goes 
+
+        return 
+        
+    def charge_input_tokens(self, token_count: int, n_cost_per_token: float) -> None:
+        pass
+
+    def charge_output_tokens(self, token_count: int, n_cost_per_token: float) -> None:
+        pass

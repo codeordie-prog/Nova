@@ -32,6 +32,7 @@ from dermascan.backend.services.agents.provider_circuit_breaker import (
     load_model_circuit_breaker,
 )
 from dermascan.shared.logger import get_logger
+from dermascan.billing.meter import record_llm_usage
 from dermascan.shared.vision_image_urls import (
     is_invalid_image_url_error,
     refresh_messages_vision_urls,
@@ -1067,6 +1068,7 @@ class ModelChainRunner:
                     response = model.invoke(input, **kwargs)
                 breaker.record_success()
                 self._record(name, True)
+                record_llm_usage(model_key=name, response=response, operation=operation)
                 return response
             except Exception as exc:
                 last_exc = exc
@@ -1119,6 +1121,7 @@ class ModelChainRunner:
                 logger.info("model replied: %s (%s)", name, role)
                 breaker.record_success()
                 self._record(name, True)
+                record_llm_usage(model_key=name, response=response, operation="agent_step")
                 return response
 
             except Exception as exc:
