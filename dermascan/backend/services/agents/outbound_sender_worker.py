@@ -10,7 +10,7 @@ from collections import defaultdict
 from typing import Any
 
 import redis
-from dotenv import load_dotenv
+from dermascan.shared.load_env import ensure_env_loaded
 
 from dermascan.shared.logger import get_logger
 from dermascan.shared.stream_pipeline_tracing import (
@@ -25,7 +25,7 @@ from dermascan.shared.redis_stability import (
 from dermascan.backend.services.agents import reclaim_logic
 from dermascan.backend.utils.backoff import post_with_outbound_retry
 
-load_dotenv()
+ensure_env_loaded()
 
 REDIS_URL: str = os.getenv("REDIS_URL", "")
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -191,26 +191,28 @@ def _send_typing_best_effort(fields: dict[str, Any]) -> None:
         )
 
 
-def _send_telegram(chat_id: str, text: str, reply_to_message_id: int | None = None) -> None:
+def _post_telegram_chunks(
+    chat_id: str,
+    text: str,
+    *,
+    reply_to_message_id: int | None,
+) -> None:
     """
-    Send a message to a Telegram chat.
+    Post one Telegram message, splitting into API-sized chunks when needed.
 
-    reply_to_message_id logic is crucial - it preserves logical order for a better UX.
-    
-    
     Args:
-        chat_id: The chat ID to send the message to.
-        text: The text to send.
-        reply_to_message_id: The message ID to reply to.
+        chat_id: Telegram chat id.
+        text: Message body.
+        reply_to_message_id: Optional message id to thread under.
+
+    Raises:
+        RuntimeError: When the Telegram API returns a non-ok response.
     """
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
     verify = _telegram_tls_verify()
-
-    # Send message URL
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-    # Create payload for each chunk in the split text
     for chunk in _split_telegram_text(text):
         payload: dict[str, Any] = {"chat_id": chat_id, "text": chunk}
         if reply_to_message_id is not None:
@@ -225,9 +227,34 @@ def _send_telegram(chat_id: str, text: str, reply_to_message_id: int | None = No
             timeout=TELEGRAM_HTTP_TIMEOUT_S,
             verify=verify,
         )
-        payload = resp.json() if resp.content else {}
-        if not payload.get("ok"):
-            raise RuntimeError(f"telegram send non-ok: {payload}")
+        response_payload = resp.json() if resp.content else {}
+        if not response_payload.get("ok"):
+            raise RuntimeError(f"telegram send non-ok: {response_payload}")
+
+
+def _send_telegram(chat_id: str, text: str, reply_to_message_id: int | None = None) -> None:
+    """
+    Send a message to a Telegram chat.
+
+    When threaded delivery fails, retries once without ``reply_to_message_id``
+    so proactive signal replies still reach the client.
+
+    Args:
+        chat_id: The chat ID to send the message to.
+        text: The text to send.
+        reply_to_message_id: The message ID to reply to.
+    """
+    try:
+        _post_telegram_chunks(chat_id, text, reply_to_message_id=reply_to_message_id)
+    except RuntimeError as exc:
+        if reply_to_message_id is None:
+            raise
+        logger.warning(
+            "telegram threaded send failed; retrying without reply_to_message_id: chat_id=%s error=%s",
+            chat_id,
+            exc,
+        )
+        _post_telegram_chunks(chat_id, text, reply_to_message_id=None)
 
 
 def _normalize_whatsapp_recipient(case_id: str) -> str:
@@ -874,13 +901,28 @@ def run_worker_forever() -> None:
 
                 for mid, fields in ordered_items:
                     dedupe_key = str(fields.get("dedupe_key") or "")
-                    if dedupe_key:
-                        seen_key = f"outbound:sent:{dedupe_key}"
-                        if not _redis.set(seen_key, "1", nx=True, ex=OUTBOUND_DEDUPE_TTL_SEC):
-                            _ack_delete(mid)
-                            continue
+                    seen_key = f"outbound:sent:{dedupe_key}" if dedupe_key else ""
+                    if seen_key and _redis.exists(seen_key):
+                        logger.info(
+                            "outbound dedupe skip: kind=%s client_id=%s dedupe_key=%s msg_id=%s",
+                            _kind(fields),
+                            fields.get("client_id"),
+                            dedupe_key,
+                            mid,
+                        )
+                        _ack_delete(mid)
+                        continue
                     try:
                         should_thread, target = _threading_decision(fields, chaos_mode)
+                        kind = _kind(fields)
+                        logger.info(
+                            "outbound delivering: kind=%s client_id=%s channel=%s threaded=%s msg_id=%s",
+                            kind,
+                            fields.get("client_id"),
+                            fields.get("channel"),
+                            should_thread,
+                            mid,
+                        )
                         run_traced_stream_handler(
                             stream=OUTBOUND_STREAM,
                             group=OUTBOUND_CONSUMER_GROUP,
@@ -892,15 +934,30 @@ def run_worker_forever() -> None:
                                 reply_to_message_id=target if should_thread else None,
                             ),
                         )
+                        if seen_key:
+                            _redis.set(seen_key, "1", ex=OUTBOUND_DEDUPE_TTL_SEC)
                         _ack_delete(mid)
+                        logger.info(
+                            "outbound delivered: kind=%s client_id=%s msg_id=%s",
+                            kind,
+                            fields.get("client_id"),
+                            mid,
+                        )
 
                         # Mark as processed for idempotency
                         reclaim_logic.mark_processed(OUTBOUND_STREAM, mid)
 
                     except Exception as exc:
+                        if seen_key:
+                            _redis.delete(seen_key)
                         _dlq(mid, fields, str(exc))
                         _ack_delete(mid)
-                        logger.exception("outbound delivery failed: msg_id=%s", mid)
+                        logger.exception(
+                            "outbound delivery failed: kind=%s client_id=%s msg_id=%s",
+                            _kind(fields),
+                            fields.get("client_id"),
+                            mid,
+                        )
     except KeyboardInterrupt:
         logger.info("outbound sender received KeyboardInterrupt; shutting down")
     finally:

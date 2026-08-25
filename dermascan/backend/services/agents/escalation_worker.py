@@ -18,7 +18,6 @@ from typing import Any
 
 import redis
 import requests
-from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from dermascan.backend.services.agents import reclaim_logic
@@ -28,6 +27,7 @@ from dermascan.shared.escalation_image import (
     resolve_escalation_image_blob_path,
 )
 from dermascan.shared.hmac_auth import SIGNATURE_HEADER, TIMESTAMP_HEADER, signature_header
+from dermascan.shared.load_env import ensure_env_loaded
 from dermascan.shared.logger import get_logger
 from dermascan.shared.redis_stability import (
     check_redis_connectivity,
@@ -35,7 +35,7 @@ from dermascan.shared.redis_stability import (
     run_with_redis_retries,
 )
 
-load_dotenv()
+ensure_env_loaded()
 
 logger = get_logger("agents")
 

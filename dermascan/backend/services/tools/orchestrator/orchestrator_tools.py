@@ -12,7 +12,6 @@ import hashlib
 from logging import Logger
 from uuid import uuid4
 from datetime import datetime, timezone
-from dotenv import load_dotenv
 from typing import Any, Dict, Optional, Annotated
 
 import httpx
@@ -80,8 +79,9 @@ from dermascan.backend.services.agents.text_product_review import (
     text_product_review_eligible,
 )
 from dermascan.shared.firebase_storage import initialize_firebase_app
+from dermascan.shared.load_env import ensure_env_loaded
 
-load_dotenv()
+ensure_env_loaded()
 
 TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY_QUTIS", "")
 
@@ -1950,6 +1950,25 @@ def _dispatch_audit_image_ref(
             ),
         }
 
+    if response.status_code == 402:
+        detail = "Insufficient credits for image analysis."
+        try:
+            body = response.json()
+            if isinstance(body, dict) and body.get("detail"):
+                detail = str(body["detail"])
+        except Exception:
+            pass
+        return {
+            "status": "insufficient_credits",
+            "request_id": request_id,
+            "endpoint": endpoint,
+            "detail": detail,
+            "instruction": (
+                "The user does not have enough credits for MedGemma image analysis. "
+                "Tell them to top up before retrying."
+            ),
+        }
+
     response.raise_for_status()
     data: dict[str, Any] = response.json() if response.content else {}
     return {
@@ -2583,13 +2602,13 @@ def enque_request_for_auditing_stream(
             "detail": f"audit dispatch failed: {exc}",
         }
 
-    if result.get("status") == "under_pressure":
+    if result.get("status") in {"under_pressure", "insufficient_credits"}:
         if _redis is not None:
             try:
                 _redis.delete(dedupe_key)
             except Exception:
                 logger.exception(
-                    "failed to clear dedupe key after backpressure: image_request_id=%s",
+                    "failed to clear dedupe key after non-success dispatch: image_request_id=%s",
                     image_ref.request_id,
                 )
         result["request_id"] = request_id
@@ -2902,6 +2921,23 @@ def _dispatch_required_audits_if_ready(
     return results
 
 
+def _audit_dispatch_failure_item(dispatched: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """
+    Return the first non-success audit dispatch result, if any.
+
+    Args:
+        dispatched: Raw results from ``enque_request_for_auditing_stream.func``.
+
+    Returns:
+        dict[str, Any] | None: Failure payload to surface to the model.
+    """
+    for item in dispatched:
+        status = str(item.get("status") or "")
+        if status in {"insufficient_credits", "under_pressure", "error"}:
+            return item
+    return None
+
+
 def _merge_auto_dispatch_into_intake_result(
     result: dict[str, Any],
     *,
@@ -2947,6 +2983,13 @@ def _merge_auto_dispatch_into_intake_result(
     session = recompute_intake_session(session, profile)
     refreshed = _format_intake_status(session, profile, request_id=request_id)
     refreshed["auto_dispatched"] = result["auto_dispatched"]
+    failure = _audit_dispatch_failure_item(dispatched)
+    if failure is not None:
+        refreshed["dispatch_status"] = str(failure.get("status") or "")
+        if failure.get("detail"):
+            refreshed["dispatch_detail"] = str(failure["detail"])
+        if failure.get("instruction"):
+            refreshed["instruction"] = str(failure["instruction"])
     for key in (
         "status",
         "registered_category",
@@ -3326,7 +3369,7 @@ def _run_tavily_search(
     Args:
         label: Human-readable tool label used in logs and cache keys.
         query: Search query string.
-        max_results: Already-capped number of results to retrieve.
+        max_results: Already-capped number of results to retrieve. 
         include_domains: Domain allowlist for the search.
         search_depth: Optional Tavily search depth (e.g. "advanced").
 

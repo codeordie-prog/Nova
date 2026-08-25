@@ -260,3 +260,27 @@ def resolve_channel(client_id: str) -> Optional[str]:
             "SELECT channel FROM billing.account WHERE client_id = %s", (client_id,)
         ).fetchall()
     return rows[0]["channel"] if len(rows) == 1 else None
+
+
+def get_balance(account_id: str) -> int:
+    """
+    Read the current spendable balance.
+
+    Args:
+        account_id: Account uuid.
+
+    Returns:
+        int: ``balance_credits``, or 0 when the account is unknown.
+    """
+    with transaction() as conn:
+        row = conn.execute(
+            "SELECT balance_credits FROM billing.account WHERE id = %s",
+            (account_id,),
+        ).fetchone()
+    return 0 if row is None else int(row["balance_credits"])
+
+
+# The meter lane calls this name. It must stay pointed at resolve_for_client so
+# there is exactly one path that makes the free-trial grant, sized from
+# billing.price_list rather than from the environment.
+get_or_create_account = resolve_for_client

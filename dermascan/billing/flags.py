@@ -78,3 +78,53 @@ def paystack_is_live() -> bool:
         bool: True for a live secret key.
     """
     return paystack_secret_key().startswith("sk_live_")
+
+
+def billing_meter_enabled() -> bool:
+    """
+    Whether to record ``usage_line`` rows.
+
+    Metering is safe to run on its own: usage lines are balance-neutral until a
+    reservation settles, so this is how the hold ceilings get sized from real
+    traffic before anything is enforced.
+
+    Returns:
+        bool: True when ``BILLING_METER_ENABLED`` is set.
+    """
+    return _env_flag("BILLING_METER_ENABLED", default=False)
+
+
+def billing_enforce_enabled() -> bool:
+    """
+    Whether to place holds and turn a request away on insufficient credits.
+
+    Returns:
+        bool: True when ``BILLING_ENFORCE`` is set.
+    """
+    return _env_flag("BILLING_ENFORCE", default=False)
+
+
+def billing_active() -> bool:
+    """
+    Whether any metering or enforcement path is live.
+
+    Returns:
+        bool: True when metering or enforcement is on.
+    """
+    return billing_meter_enabled() or billing_enforce_enabled()
+
+
+def validate_billing_flags() -> None:
+    """
+    Check flag combinations at worker startup.
+
+    Raises:
+        RuntimeError: When enforcement is on without metering, which would
+            settle every reservation against zero usage lines and refund the
+            whole hold.
+    """
+    if billing_enforce_enabled() and not billing_meter_enabled():
+        raise RuntimeError(
+            "BILLING_ENFORCE=true requires BILLING_METER_ENABLED=true so usage "
+            "lines exist before settle."
+        )

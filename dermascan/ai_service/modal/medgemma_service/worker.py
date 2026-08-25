@@ -9,6 +9,9 @@ The Stream is created by the FAST API POST endpoints.
 
 Worker utilizes Microbatching to dispatch jobs to the MedGemma model.
 This is implemented inorder to achieve a near one forward pass behavior.
+
+
+Billing is settled at the end of Inference where success = True, else the reservation is released at every point of failure.
 """
 
 import base64
@@ -40,6 +43,7 @@ from dermascan.shared.stream_pipeline_tracing import (
     run_traced_stream_handler,
 )
 from dermascan.backend.services.agents import reclaim_logic
+from dermascan.billing.flags import billing_active
 
 _redis = redis_client_from_env().get_redis()
 
@@ -257,6 +261,7 @@ class _JobEntry:
     group_id: str
     group_expected_count: int = 0
     image_blob_path: str = ""
+    billing_context: Any | None = None
 
 
 @dataclass
@@ -337,6 +342,43 @@ def _mark_status(job_id: str, *, status: str, **fields: str) -> None:
     pipe.expire(key, _JOB_TTL_S)
     pipe.execute()
     logger.info("job status updated: job_id=%s status=%s fields=%s", job_id, status, list(fields.keys()))
+
+
+def _settle_job_billing(
+    job_id: str,
+    payload: dict[str, Any],
+    *,
+    success: bool,
+    billing_context: Any | None = None,
+) -> None:
+    """
+    Meter and/or settle billing for one MedGemma job.
+
+    Args:
+        job_id: MedGemma job uuid.
+        payload: Stream payload and/or merged job metadata.
+        success: Whether inference succeeded.
+        billing_context: Optional pre-parsed billing context.
+    """
+    if not billing_active():
+        return
+
+    try:
+        from dermascan.billing.medgemma import (
+            billing_context_from_mapping,
+            settle_medgemma_job,
+        )
+
+        redis_fields = _redis.hgetall(_job_key(job_id))
+        merged: dict[str, Any] = {**redis_fields, **payload}
+        context = billing_context or billing_context_from_mapping(merged)
+        settle_medgemma_job(
+            job_id=job_id,
+            success=success,
+            billing_context=context,
+        )
+    except Exception:
+        logger.exception("medgemma billing settle failed: job_id=%s", job_id)
 
 # Increment attempts and mark job as running in one Redis pipeline
 # a REDIS pipeline is a way to group multiple commands together and execute them in a single round trip to the server
@@ -430,6 +472,7 @@ def _dispatch_message(msg_id: str, payload: dict[str, Any], service: MedGemmaSer
 
         # Mark job as failed and acknowledge the message
         _mark_status(job_id, status="failed", error="max attempts exceeded")
+        _settle_job_billing(job_id, payload, success=False)
 
         # Acknowledge the message to remove it from the stream
         _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id)
@@ -450,6 +493,7 @@ def _dispatch_message(msg_id: str, payload: dict[str, Any], service: MedGemmaSer
     except Exception as e:
         logger.exception("dispatch failed: job_id=%s", job_id)
         _mark_status(job_id, status="failed", error=str(e), finished_at=str(int(time.time())))
+        _settle_job_billing(job_id, payload, success=False)
         
         # Acknowledge the message to remove it from the stream
         _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id)
@@ -485,7 +529,21 @@ def _build_job_entry(pending: _PendingJob, image_bytes: bytes) -> _JobEntry:
         ),
         prompt=_to_str(payload.get("prompt") or payload.get(b"prompt")),
         image_blob_path=_resolve_image_blob_path(payload),
+        billing_context=_billing_context_from_payload(payload),
     )
+
+
+def _billing_context_from_payload(payload: dict[str, Any]) -> Any | None:
+    """Parse billing context from a stream payload when billing is enabled."""
+    if not billing_active():
+        return None
+    try:
+        from dermascan.billing.medgemma import billing_context_from_mapping
+
+        return billing_context_from_mapping(payload)
+    except Exception:
+        logger.exception("medgemma billing context parse failed")
+        return None
 
 
 def _resolve_pending_images(pending_jobs: list[_PendingJob]) -> dict[str, bytes]:
@@ -590,6 +648,7 @@ def _collect_batch() -> list[_JobEntry]:
             attempts: int = _start_attempt(pending.job_id)
             if attempts > _MAX_ATTEMPTS:
                 _mark_status(pending.job_id, status="failed", error="Max attempts reached")
+                _settle_job_billing(pending.job_id, pending.payload, success=False)
                 _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, pending.msg_id)
                 _redis.xdel(_JOB_STREAM, pending.msg_id)
                 continue
@@ -603,6 +662,7 @@ def _collect_batch() -> list[_JobEntry]:
                 finished_at=str(int(time.time())),
             )
             logger.exception("Failed to prepare job: job_id=%s", pending.job_id)
+            _settle_job_billing(pending.job_id, pending.payload, success=False)
             _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, pending.msg_id)
             _redis.xdel(_JOB_STREAM, pending.msg_id)
                 
@@ -657,6 +717,12 @@ def _collect_batch_result(batch: list[_JobEntry], call_handle: Any) -> None:
                     confidence=confidence_str,
                     finished_at=str(int(time.time())),
                 )
+                _settle_job_billing(
+                    entry.job_id,
+                    {},
+                    success=True,
+                    billing_context=entry.billing_context,
+                )
                 _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, entry.msg_id)
                 _redis.xdel(_JOB_STREAM, entry.msg_id)
                 reclaim_logic.mark_processed(_JOB_STREAM, entry.msg_id)
@@ -680,6 +746,12 @@ def _collect_batch_result(batch: list[_JobEntry], call_handle: Any) -> None:
                 status="failed",
                 error=str(e),
                 finished_at=str(int(time.time())),
+            )
+            _settle_job_billing(
+                entry.job_id,
+                {},
+                success=False,
+                billing_context=entry.billing_context,
             )
             _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, entry.msg_id)
             _redis.xdel(_JOB_STREAM, entry.msg_id)
@@ -712,6 +784,7 @@ def _collect_result(job_id: str, msg_id: str, call_handle: Any) -> None:
             confidence=confidence,
             finished_at=str(int(time.time())),
         )
+        _settle_job_billing(job_id, {}, success=True)
         _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id)
         _redis.xdel(_JOB_STREAM, msg_id)
 
@@ -722,6 +795,7 @@ def _collect_result(job_id: str, msg_id: str, call_handle: Any) -> None:
     except Exception as e:
         logger.exception("inference failed: job_id=%s", job_id)
         _mark_status(job_id, status="failed", error=str(e), finished_at=str(int(time.time())))
+        _settle_job_billing(job_id, {}, success=False)
         _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, msg_id)
         _redis.xdel(_JOB_STREAM, msg_id)
         logger.info("message acked after failure: msg_id=%s", msg_id)

@@ -38,6 +38,8 @@ KIND_DEBIT: Final[str] = "debit"
 KIND_GRANT: Final[str] = "grant"
 KIND_REFUND: Final[str] = "refund"
 KIND_ADJUSTMENT: Final[str] = "adjustment"
+KIND_HOLD: Final[str] = "hold"
+KIND_RELEASE: Final[str] = "release"
 
 
 @dataclass(frozen=True)
@@ -218,3 +220,7 @@ def verify_balance(account_id: str) -> tuple[int, int]:
     if row is None:
         raise ValueError(f"unknown billing account: {account_id}")
     return int(row["cached"]), int(row["summed"])
+
+
+# The meter lane names this type LedgerAppendResult; same shape, same writer.
+LedgerAppendResult = LedgerResult

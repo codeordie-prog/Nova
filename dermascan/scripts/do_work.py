@@ -16,6 +16,8 @@ from dermascan.backend.services.agents.billing_worker import run_worker_forever 
 from dermascan.backend.services.agents.escalation_worker import run_worker_forever as run_escalation_worker
 from dermascan.backend.services.agents.orchestrator_worker import run_worker_forever as run_orchestrator_worker
 from dermascan.backend.services.agents.outbound_sender_worker import run_worker_forever as run_outbound_sender_worker
+from dermascan.billing.flags import billing_active, validate_billing_flags
+from dermascan.billing.sweeper import start_billing_sweeper_thread
 
 
 logger = logging.getLogger("do_work")
@@ -37,6 +39,10 @@ def main() -> None:
     )
 
     stop_event = threading.Event()
+    if billing_active():
+        validate_billing_flags()
+    billing_sweeper_thread = start_billing_sweeper_thread(stop_event)
+
     workers: list[tuple[str, Callable[[], None]]] = [
         ("orchestrator", run_orchestrator_worker),
         ("escalation", run_escalation_worker),
@@ -78,6 +84,8 @@ def main() -> None:
         logger.info("keyboard interrupt received, stopping supervisor")
         stop_event.set()
     finally:
+        if billing_sweeper_thread is not None:
+            billing_sweeper_thread.join(timeout=2.0)
         for thread in threads:
             thread.join(timeout=2.0)
         logger.info("supervisor stopped")
