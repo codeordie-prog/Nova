@@ -1,127 +1,77 @@
-# Billing schema alignment
+# Billing schema
 
-Two lanes share one Postgres `billing` schema. **No code merge required** — only
-this schema contract and `002_align_paystack_schema.sql` on `qutis_db`.
+One schema, one migration mechanism. This file used to describe two lanes
+reconciling across branches; they are merged, and the split no longer exists.
 
-| Lane | Owner | Flow | Code |
-|------|-------|------|------|
-| **Meter / hold** | You | hold → meter (`usage_line`) → settle (`reservation`) | `dermascan/billing/` — `accounts`, `ledger`, `reservations`, `usage`, `meter`, `config` |
-| **Paystack / top-up** | Colleague | top-up → ledger `topup` | `dermascan/billing/` — `topups`, `paystack_client`, `redis_wallet`, `pricing`, … |
+## Applying it
 
----
+`dermascan/migrations/*.sql`, applied in filename order by
+`dermascan/scripts/migrate.py`, tracked in `billing.schema_migrations`
+(version, checksum, applied_at). Forward-only. Editing an applied migration is
+an error — write the next numbered file instead.
 
-## Shared tables (both lanes)
-
-### `billing.account`
-
-| Column | Meter lane | Paystack lane |
-|--------|------------|---------------|
-| `(channel, client_id)` UNIQUE | lookup / auto-create | `accounts.get_or_create()` |
-| `balance_credits` | updated on hold/settle | updated on topup/debit |
-| `email` | optional until needed | required at first top-up |
-| `msisdn` | unused | M-PESA number (user-provided) |
-| `free_credits_granted` | one-time grant | free trial grant |
-
-### `billing.ledger` (append-only)
-
-**Do not add CHECK constraints** — the two lanes use different `kind` / `ref_type` values.
-
-| kind | Written by |
-|------|------------|
-| `grant`, `topup`, `refund`, `adjustment` | Paystack lane |
-| `hold`, `release`, `debit` | Meter lane (settle / overrun) |
-| `debit` | Both (trip settle vs usage settle — use distinct `idempotency_key`) |
-
-| ref_type | Written by |
-|----------|------------|
-| `payment` | Paystack top-up |
-| `trip` | Colleague Redis settle (`trip:{request_id}`) — if they keep Redis path |
-| `grant`, `manual` | Both |
-| `reservation` | Meter lane hold/release |
-| `usage_settlement` | Meter lane final debit metadata |
-
-**Invariant (both):** `account.balance_credits = SUM(ledger.delta_credits)` — nightly verify.
-
----
-
-## Lane-specific tables
-
-### Meter lane only
-
-| Table | Purpose |
-|-------|---------|
-| `billing.reservation` | Hold ceiling per `request_id` / job |
-| `billing.usage_line` | Per-LLM token lines (balance-neutral until settle) |
-
-Colleague code **does not read or write** these. Safe to use exclusively for your flow.
-
-### Paystack lane only
-
-| Table | Purpose |
-|-------|---------|
-| `billing.payment_intent` | Checkout / STK lifecycle |
-| `billing.paystack_event` | Webhook dedupe |
-| `billing.price_list` | Job SKU prices + settings (`free_trial_credits`, `min_topup_kes`, …) |
-
-Your meter lane **does not need** `price_list` for token rates (those live in
-`dermascan/billing/config.py` / env). Colleague **does** need `price_list` for deliverable SKUs.
-
----
-
-## Apply on live DB
-
-You already ran `schema.sql`. Run:
-
-```powershell
-psql -h 34.79.111.107 -p 5432 -U postgres -d qutis_db -f cloud_sql/billing/002_align_paystack_schema.sql
+```bash
+python dermascan/scripts/migrate.py --dry-run   # list pending
+python dermascan/scripts/migrate.py             # apply
 ```
 
-Verify:
+`cloud_sql/billing/schema.sql` and `002_align_paystack_schema.sql` were the
+hand-run originals. They are deleted. `002_meter_lane.sql` reproduces what they
+created, written `IF NOT EXISTS` throughout, so it is a no-op on `qutis_db`
+where the hand-run version was already applied.
+
+## Tables
+
+| Table | Purpose |
+|---|---|
+| `account` | One wallet per `(channel, client_id)`. `balance_credits` is a cached sum. |
+| `ledger` | Append-only. The only writer of `balance_credits`. `idempotency_key` is the dedupe spine. |
+| `reservation` | A credit ceiling held for one scope — `request_id` for a turn, `medgemma_job_id` for an inference job. |
+| `usage_line` | What a scope actually cost, in micro-credits. Balance-neutral until settle. |
+| `payment_intent` | Paystack checkout/STK lifecycle. `reference` ties money back to one account. |
+| `paystack_event` | Webhook dedupe and audit. |
+| `price_list` | Versioned prices, token rates and settings. Rows are inserted, never updated. |
+| `schema_migrations` | Migration bookkeeping. |
+
+**Invariant:** `account.balance_credits = SUM(ledger.delta_credits)`. Reconciliation asserts it; drift is a P1.
+
+## The credit unit
+
+**One credit is one Kenyan shilling.** It is what a user tops up through
+Paystack, what they see in chat, and what they spend.
+
+Provider token prices are quoted in USD per million tokens. That is a *cost
+input*, not the wallet unit: `billing/config.py` converts USD list prices
+through the `usd_kes_rate` setting in `price_list` when the rate card loads.
+There is no separate USD credit scale.
+
+Token costs accumulate on `usage_line.cost_micro_credits` (1e-6 credit) and are
+rounded to whole credits once, when a reservation settles. Rounding per line
+would floor every LLM call at a whole shilling and overcharge a multi-call turn
+several times over.
+
+## What is data, not environment
+
+Prices, token rates, hold ceilings, the free-trial grant, the top-up minimum
+and `usd_kes_rate` all live in `price_list` and are edited from `/admin/pricing`.
+Changing one does not need a deploy, and a past charge stays explainable by the
+row that was in force when it ran.
+
+Environment holds only what is operational: `BILLING_ENABLED`,
+`BILLING_METER_ENABLED`, `BILLING_ENFORCE`, `PAYSTACK_SECRET_KEY`,
+`PAYSTACK_CALLBACK_URL`.
+
+## Hold ceilings are not yet sized
+
+`orchestrator_hold_credits = 25` and `medgemma_hold_credits = 60` are interim
+values, shipped with enforcement off. Size them from the p99 of `usage_line`
+after a metering run:
 
 ```sql
-\d billing.account          -- msisdn present
-\d billing.payment_intent   -- method, msisdn present
-\dt billing.*               -- price_list added
-SELECT scope, key, value_numeric FROM billing.price_list ORDER BY scope, key;
+SELECT percentile_cont(0.99) WITHIN GROUP (ORDER BY total)
+FROM (SELECT scope_key, SUM(cost_micro_credits) / 1000000.0 AS total
+      FROM billing.usage_line GROUP BY scope_key) s;
 ```
 
----
-
-## Open product decision (not schema)
-
-**Credit definition:**
-
-| Source | Model |
-|--------|--------|
-| Colleague `price_list` seeds | **1 credit = KES 1.00** (skin_audit = 20 credits) |
-| Your `billing_config.py` | **100 credits = $1.00 USD** API cost |
-
-Same `bigint` column — different semantics. Align before go-live (e.g. pick KES
-retail credits and map token rates through `usd_kes_rate`, or adopt micro-credits).
-
-Schema supports either; code must agree on one scale.
-
----
-
-## What colleague code expects vs your DB (after 002)
-
-| Expectation | After 002 |
-|-------------|-----------|
-| `billing.account.msisdn` | ✅ |
-| `payment_intent.method` NOT NULL | ✅ (default `checkout`) |
-| `payment_intent` status enum CHECK | ✅ |
-| `price_list` + seeds | ✅ |
-| `paystack_event` reference index | ✅ |
-| No `reservation` / `usage_line` | ✅ present but ignored by their code |
-| Ledger CHECK (kind/ref_type only trip/payment) | ✅ **not added** — would break hold/release |
-
-Colleague can deploy Paystack against this DB without touching your tables.
-
----
-
-## Your next steps (meter lane, no merge)
-
-1. Run `002_align_paystack_schema.sql` on `qutis_db`
-2. Implement account resolver + hold/settle against `reservation` / `usage_line` / `ledger`
-3. Wire metering hooks → `usage_line` + `credits_for_tokens()`
-4. Agree credit scale with colleague before blocking users on balance
+`min_balance_credits` is `0` on purpose. A hold already debits the balance and
+guarantees the funds; a floor on top of it is a second gate.
