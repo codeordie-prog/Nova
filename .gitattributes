@@ -1,0 +1,2 @@
+# Shell scripts must use LF so Cloud Build bash does not see trailing \r in env vars.
+*.sh text eol=lf

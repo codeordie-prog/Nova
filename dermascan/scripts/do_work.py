@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from dermascan.shared.load_env import bootstrap_env
+
+bootstrap_env()
+
 import logging
 import signal
 import threading

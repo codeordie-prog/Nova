@@ -21,8 +21,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from redis import Redis
 
-_REPO_ROOT = Path(__file__).resolve().parents[4]
-load_dotenv(_REPO_ROOT / ".env")
+from dermascan.shared.load_env import bootstrap_env
+
+bootstrap_env()
 
 @dataclass(frozen=True)
 class RedisConfig:

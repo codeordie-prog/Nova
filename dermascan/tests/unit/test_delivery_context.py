@@ -9,6 +9,7 @@ import pytest
 from dermascan.shared.delivery_context import (
     build_rules_skin_context,
     load_delivery_context,
+    load_skin_profile_dict,
 )
 from dermascan.shared.intake_session import IntakePhase, IntakeSession, ServiceIntent
 from dermascan.shared.intake_session_store import archive_intake_session, save_intake_session_recomputed
@@ -52,3 +53,38 @@ class TestDeliveryContext:
         assert skin_ctx["skin_type"] == "sensitive"
         assert any("allergy" in s for s in skin_ctx["symptoms"])
         assert "pregnant" in skin_ctx["notes"].lower()
+
+    def test_load_skin_profile_uses_firebase_admin_firestore(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        profile = {"skin_type": "oily", "current_goals": ["hydration"]}
+        mock_doc = type(
+            "Doc",
+            (),
+            {"exists": True, "to_dict": staticmethod(lambda: profile)},
+        )()
+
+        class MockFirestoreClient:
+            def collection(self, name: str) -> "MockFirestoreClient":
+                assert name == "skin_profiles"
+                return self
+
+            def document(self, doc_id: str) -> "MockFirestoreClient":
+                assert doc_id == "client-fs"
+                return self
+
+            def get(self) -> Any:
+                return mock_doc
+
+        monkeypatch.setattr(
+            "dermascan.shared.delivery_context.initialize_firebase_app",
+            lambda: object(),
+        )
+        monkeypatch.setattr(
+            "firebase_admin.firestore.client",
+            lambda: MockFirestoreClient(),
+        )
+
+        loaded = load_skin_profile_dict("client-fs", redis_client=object())
+        assert loaded == profile

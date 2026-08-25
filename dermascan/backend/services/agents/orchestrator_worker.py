@@ -20,7 +20,7 @@ import re
 import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dotenv import load_dotenv
+from dermascan.shared.load_env import bootstrap_env
 from typing import List, Dict, Any, Callable, Optional
 from pydantic import BaseModel
 import redis
@@ -54,6 +54,7 @@ from dermascan.backend.services.agents.group_report_aggregator import (
 from dermascan.billing import accounts as billing_accounts
 from dermascan.shared.logger import get_logger
 from dermascan.shared.ingress_payload import resolve_image_urls_from_payload
+from dermascan.shared.vision_image_urls import build_checkpoint_image_block
 from dermascan.shared.delivery_context import (
     format_delivery_context_for_prompt,
     load_delivery_context,
@@ -83,8 +84,10 @@ from dermascan.backend.services.agents.model_fallback_chain import (
     build_model_chain_from_spec,
     is_recursion_error,
     is_tool_protocol_error,
+    is_invalid_image_url_error,
     orchestrator_model_chain_spec,
     parse_model_chain_spec,
+    refresh_vision_urls_middleware,
     serial_tool_calls_middleware,
     should_retry_agent_invoke,
     summarization_model_chain_spec,
@@ -109,7 +112,7 @@ from dermascan.shared.stream_pipeline_tracing import (
 
 
 # Load environment variables
-load_dotenv()
+bootstrap_env()
 configure_worker_project("orchestrator")
 
 # Get env variables
@@ -416,7 +419,11 @@ def _should_reset_checkpoint_on_agent_error(exc: Exception) -> bool:
     Returns:
         bool: True when clearing the checkpoint before retry may recover.
     """
-    return _is_recursion_error(exc) or is_tool_protocol_error(exc)
+    return (
+        _is_recursion_error(exc)
+        or is_tool_protocol_error(exc)
+        or is_invalid_image_url_error(exc)
+    )
 
 
 def _invoke_agent_with_recursion_retry(
@@ -1136,6 +1143,7 @@ def _build_orchestrator_text_context(
                         "attachment_id": image.attachment_id,
                         "index": image.index,
                         "mime_type": image.mime_type,
+                        "blob_path": image.blob_path,
                     }
                     for image in resolved_images
                 ],
@@ -1217,7 +1225,7 @@ def _build_orchestrator_user_content(
         payload_json: Raw ingress payload JSON string.
 
     Returns:
-        list[dict[str, Any]]: LangChain/OpenAI-style content blocks (text + image_url).
+        list[dict[str, Any]]: LangChain/OpenAI-style content blocks (text + image_blob/image_url).
     """
     try:
         payload: dict[str, Any] = json.loads(payload_json)
@@ -1238,12 +1246,18 @@ def _build_orchestrator_user_content(
 
     blocks: list[dict[str, Any]] = [{"type": "text", "text": text_context}]
     for image in resolved_images:
-        blocks.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": image.image_url},
-            }
-        )
+        blob_path = str(image.blob_path or "").strip()
+        if blob_path:
+            blocks.append(build_checkpoint_image_block(blob_path))
+            continue
+        image_url = str(image.image_url or "").strip()
+        if image_url:
+            blocks.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                }
+            )
     return blocks
 
 # Create/ensure a consumer group for the job stream exists
@@ -1404,6 +1418,7 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
                 trigger=("tokens", summarization_trigger_tokens),
                 keep=("messages", 3),
             ),
+            refresh_vision_urls_middleware,
             serial_tool_calls_middleware,
         ],
         checkpointer=checkpointer,

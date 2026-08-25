@@ -1,5 +1,67 @@
 # Changelog
 
+## 2026-08-18 — Firestore delivery context fix + billing/credits contracts
+
+**Fix — skin profile reads on staging workers**
+
+`delivery_context.load_skin_profile_dict` used `google.cloud.firestore.Client()` (Cloud Run ADC →
+project `qutisai`), while Firebase data lives in `dawagpn`. Switched to `firebase_admin.firestore.client()`
+after `initialize_firebase_app()`, matching `orchestrator_tools.py`.
+
+- **Modified:** `dermascan/shared/delivery_context.py`
+- **Added test:** `test_load_skin_profile_uses_firebase_admin_firestore`
+- **Staging:** deployed on `dermascan-workers-staging-00007-qms`
+
+**Added — billing and credits contract stubs (implementation later)**
+
+Placeholder ABC contracts for future token/credit metering across orchestrator, tool calls,
+MedGemma, and escalations. No runtime wiring yet.
+
+- **Added:** `dermascan/shared/billing.py` — billing module scaffold
+- **Added:** `dermascan/shared/credits.py` — `CreditDeductionContract`, `CountTokens`, input/output models
+
+---
+
+## 2026-08-16 — Expired signed URL fix (vision + ingress + MedGemma)
+
+Fixes orchestrator `400 invalid_image_url` failures when LangGraph replayed checkpoint
+history containing expired Firebase signed URLs (notably client threads with prior skin photos).
+
+**Root cause:** Ephemeral signed URLs (24h TTL) were persisted in durable state (checkpoints,
+ingress payloads, Redis media cache). OpenAI/Gemini vision replayed dead URLs on later turns.
+
+**Solution (three layers, aligned with escalation `client-media/...` blob-path pattern):**
+
+| Layer | What |
+|-------|------|
+| **A — Model boundary** | `refresh_vision_urls_middleware` re-signs client-media refs before each LLM call; `invalid_image_url` triggers checkpoint reset + retry |
+| **B — Ingress / audit** | Telegram/WhatsApp store `blob_ref` + blob path in Redis (7d TTL); intake + MedGemma enqueue prefer `image_blob_path`; worker downloads by path |
+| **C — Checkpoints** | New turns persist `image_blob` blocks (durable path), not signed HTTPS URLs |
+
+**Added**
+- `dermascan/shared/vision_image_urls.py` — refresh helpers, `build_checkpoint_image_block()`, poison detection
+- `dermascan/tests/unit/test_vision_image_urls.py` — unit tests for refresh + checkpoint blocks
+- `firebase_storage.sign_client_image_blob_path()`, `normalize_image_blob_path()`, `ClientImageUpload` return type
+- `ingress_payload.resolve_attachment_blob_path()`, `resolve_first_image_blob_path_from_payload()`
+- MedGemma `/audit_image_ref` accepts optional `image_blob_path`; worker handles `blob_path` source kind
+- `IntakeImageRef.image_blob_path` on intake session model
+
+**Modified**
+- `orchestrator_worker.py` — vision middleware wiring; checkpoint user content uses `image_blob`
+- `model_fallback_chain.py` — `refresh_vision_urls_middleware`, `is_invalid_image_url_error`
+- `orchestrator_tools.py` — register/enqueue audit via blob path
+- `backend/api/endpoints.py` — `_store_uploaded_client_image()` caches blob path in Redis
+- `escalation_image.py` — resolve ingress blob paths without signing; shared `normalize_image_blob_path`
+- `test_ingress_payload.py` — blob_ref / legacy signed-URL cache coverage
+
+**Env (optional)**
+- `VISION_REFRESH_URLS_ENABLED=true` (default) — toggle URL refresh middleware
+- `MEDIA_BLOB_TTL_S=604800` (default 7d) — Redis media blob cache TTL
+
+**Staging verified:** Cloud Build deploy + client `5350968932` text turn processed without `invalid_image_url`.
+
+---
+
 ## 2026-08-08 — Cosmetic Intelligence Pivot (feature-flagged rollout)
 
 Incremental pivot from clinical diagnosis toward **cosmetic decision support**: skin snapshot first,

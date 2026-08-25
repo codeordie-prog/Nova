@@ -102,7 +102,7 @@ Map every key from `.env_example` to a **service** and **secret name**:
 | Modal | `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` | MedGemma worker only |
 | Firebase | service account JSON or ADC | API, workers, MedGemma worker |
 | Webhooks | `TELEGRAM_BOT_TOKEN`, WhatsApp sidecar URL | API / ingress |
-| Tesseract | `TESSERACT_PATH` | Indexer job only |
+| Tesseract | `TESSERACT_PATH` | Workers image (lazy PDF indexing) |
 
 - [ ] Document staging vs production secret values (separate Secret Manager secrets or prefixes).
 
@@ -134,21 +134,19 @@ Map every key from `.env_example` to a **service** and **secret name**:
 
 ### Step 1.1 — Repository layout
 
-Create (when implementing):
+Implemented under `deploy/`:
 
 ```
 deploy/
+  README.md                     # gcloud + Cloud Build operations guide
   docker/
-    Dockerfile.api
-    Dockerfile.workers
-    Dockerfile.medgemma-gateway   # phase 3
-    Dockerfile.medgemma-worker    # phase 3
-    Dockerfile.indexer            # phase 5, optional
+    Dockerfile                  # multi-target: api, workers, medgemma, telegram
   cloudbuild/
-    cloudbuild.staging.yaml
-    cloudbuild.prod.yaml
+    cloudbuild.images-only.yaml # build + push only
+    cloudbuild.staging.yaml     # build + push + deploy staging
   scripts/
-    promote.sh                    # optional
+    run_with_health.py          # Cloud Run health port for workers
+    deploy-staging-services.sh  # gcloud run deploy all staging services
 ```
 
 ### Step 1.2 — Base Docker image strategy
@@ -167,9 +165,14 @@ deploy/
 
 ### Step 1.4 — `Dockerfile.workers`
 
-- [ ] Same base image as API (shared layer cache in Cloud Build).
-- [ ] CMD: `python dermascan/scripts/do_work.py`
-- [ ] **Exclude Tesseract** unless you run ingestion in-process (not recommended).
+- [x] Same base image as API (shared layer cache in Cloud Build).
+- [x] CMD: `do_work.py` via `run_with_health.py`
+- [x] Includes Tesseract for lazy PDF indexing in-process
+
+### Step 1.4b — Telegram polling bridge (MVP)
+
+- [x] `telegram-bridge` target → `dermascan-telegram-bridge-staging`
+- [ ] Prefer Telegram `setWebhook` → API URL in production when stable
 
 ### Step 1.5 — Cloud Build pipeline (staging)
 
@@ -426,11 +429,8 @@ Use **different Redis logical databases** or **key prefixes** for staging vs pro
 
 ## Next implementation task
 
-When ready to code **Phase 1 only**:
+**Phase 0 (you):** Follow [deploy/README.md](../../deploy/README.md) — enable APIs, Artifact Registry, IAM, Secret Manager.
 
-1. Add `deploy/docker/Dockerfile.api` and `Dockerfile.workers`
-2. Add `deploy/cloudbuild/cloudbuild.staging.yaml`
-3. Small change: read `PORT` in uvicorn entrypoint
-4. Add `docs/deploy-operations.md` with gcloud commands for your project/region
+**Phase 1 (done in repo):** Dockerfiles + Cloud Build configs added.
 
-Do **not** change orchestrator logic, Modal app, or local scripts in Phase 1.
+**Phase 2 (you):** Run `cloudbuild.images-only.yaml`, then `cloudbuild.staging.yaml` after secrets exist.

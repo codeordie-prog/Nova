@@ -1,0 +1,40 @@
+# Git / IDE
+.git
+.gitignore
+.vscode
+.idea
+
+# Local env and secrets
+.env
+.env.*
+!.env_example
+
+# Python caches / venvs
+__pycache__
+*.py[cod]
+.venv
+venv
+.pytest_cache
+.mypy_cache
+.coverage
+htmlcov
+
+# Frontend (out of scope for backend deploy)
+node_modules
+frontend
+dermascan/frontend
+
+# Docs / agent transcripts (not needed in runtime image)
+agent-transcripts
+.cursor
+
+# Service account keys (mount via Secret Manager in Cloud Run)
+**/service-account*.json
+**/service_account*.json
+*-firebase-adminsdk-*.json
+dermascan/backend/services/agents/configurations/*-*.json
+
+# Large local artifacts
+*.log
+dist
+build

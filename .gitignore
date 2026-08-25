@@ -75,3 +75,6 @@ qutisai-*.json
 *-service-account.json
 # Meeting notes
 /granola
+
+# Local deploy runbook (may contain project-specific notes)
+deploy/scripts/guidelines.md

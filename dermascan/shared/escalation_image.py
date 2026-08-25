@@ -15,34 +15,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from dermascan.shared.firebase_storage import CLIENT_MEDIA_PREFIX, extract_blob_path_from_url
-from dermascan.shared.ingress_payload import resolve_first_image_url_from_payload
+from dermascan.shared.firebase_storage import normalize_image_blob_path
+from dermascan.shared.ingress_payload import resolve_first_image_blob_path_from_payload
 
 INGRESS_PAYLOAD_CACHE_PREFIX: str = "orchestrator:ingress_payload"
 DEFAULT_IMAGE_PATH_TTL_SEC: int = 7 * 24 * 3600
-
-
-def normalize_image_blob_path(raw: str) -> str:
-    """
-    Normalize an escalation image reference to a durable Firebase blob path.
-
-    Args:
-        raw: ``client-media/...`` path or HTTPS Firebase/GCS URL.
-
-    Returns:
-        Normalized ``client-media/...`` path, or empty string when not resolvable.
-    """
-    normalized = str(raw or "").strip()
-    if not normalized:
-        return ""
-    if normalized.startswith(f"{CLIENT_MEDIA_PREFIX}/"):
-        return normalized
-    if normalized.lower().startswith(("http://", "https://")):
-        try:
-            return extract_blob_path_from_url(normalized)
-        except ValueError:
-            return ""
-    return ""
 
 
 def _ingress_blob_path(
@@ -67,8 +44,8 @@ def _ingress_blob_path(
     except Exception:
         return ""
 
-    image_url = resolve_first_image_url_from_payload(payload, redis_client=redis_client)
-    return normalize_image_blob_path(image_url)
+    image_blob_path = resolve_first_image_blob_path_from_payload(payload, redis_client=redis_client)
+    return normalize_image_blob_path(image_blob_path)
 
 
 def _signal_payload_ids(redis_client: Any, *, case_id: str) -> tuple[str, str]:
