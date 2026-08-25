@@ -12,18 +12,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Final, Optional
 
 from dermascan.billing.config import (
-    BILLING_MIN_BALANCE_CREDITS,
-    BILLING_ORCHESTRATOR_HOLD_CREDITS,
     BILLING_RATE_CARD_VERSION,
-    BILLING_RESERVATION_TTL_SEC,
     BillingJobType,
     BillingRefType,
     LedgerKind,
     ReservationState,
+    micro_to_credits,
+    min_balance_credits,
+    orchestrator_hold_credits,
+    reservation_ttl_sec,
 )
 from dermascan.billing.db import transaction
 from dermascan.billing.ledger import append
-from dermascan.billing.usage import sum_usage_for_scope
+from dermascan.billing.usage import sum_usage_micro_for_scope
 from dermascan.shared.logger import get_logger
 
 logger = get_logger(__name__)
@@ -60,7 +61,7 @@ def place_hold(
     account_id: str,
     reservation_key: str,
     job_type: str = BillingJobType.ORCHESTRATOR_TURN.value,
-    hold_credits: int = BILLING_ORCHESTRATOR_HOLD_CREDITS,
+    hold_credits: Optional[int] = None,
     case_id: Optional[str] = None,
     client_id: Optional[str] = None,
     channel: Optional[str] = None,
@@ -72,7 +73,8 @@ def place_hold(
         account_id: Account uuid.
         reservation_key: Idempotency scope (e.g. ``request_id``).
         job_type: Billable job type label.
-        hold_credits: Maximum credits to hold.
+        hold_credits: Maximum credits to hold. Defaults to the
+            ``orchestrator_hold_credits`` setting.
         case_id: Optional clinical case id.
         client_id: Optional client id for support queries.
         channel: Optional channel for support queries.
@@ -84,10 +86,12 @@ def place_hold(
         InsufficientCreditsError: When balance is below hold + minimum floor.
         ValueError: When hold_credits is non-positive or account is unknown.
     """
+    if hold_credits is None:
+        hold_credits = orchestrator_hold_credits()
     if hold_credits <= 0:
         raise ValueError("hold_credits must be positive")
 
-    required = hold_credits + BILLING_MIN_BALANCE_CREDITS
+    required = hold_credits + min_balance_credits()
 
     with transaction() as conn:
         existing = conn.execute(
@@ -117,7 +121,7 @@ def place_hold(
 
         reservation_id = str(uuid.uuid4())
         expires_at = datetime.now(timezone.utc) + timedelta(
-            seconds=BILLING_RESERVATION_TTL_SEC
+            seconds=reservation_ttl_sec()
         )
 
         conn.execute(
@@ -206,7 +210,10 @@ def commit_reservation(reservation_id: str) -> int:
         hold_credits = int(reservation["hold_credits"])
         job_type = str(reservation["job_type"])
 
-        actual = sum_usage_for_scope(conn, scope_key)
+        # Round the scope total once. Rounding each usage line would charge a
+        # whole shilling per LLM call and multiply the error by the number of
+        # calls in the turn.
+        actual = micro_to_credits(sum_usage_micro_for_scope(conn, scope_key))
         refund = max(0, hold_credits - actual)
         overrun = max(0, actual - hold_credits)
 

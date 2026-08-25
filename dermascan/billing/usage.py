@@ -12,8 +12,10 @@ from psycopg import Connection
 from dermascan.billing.config import (
     BILLING_RATE_CARD_VERSION,
     LlmPurpose,
+    MICRO_PER_CREDIT,
     MeterType,
-    credits_for_tokens,
+    micro_credits_for_tokens,
+    micro_to_credits,
 )
 from dermascan.billing.db import transaction
 
@@ -22,20 +24,23 @@ def _json(payload: dict[str, Any]) -> str:
     return json.dumps(payload)
 
 
-def sum_usage_for_scope(conn: Connection, scope_key: str) -> int:
+def sum_usage_micro_for_scope(conn: Connection, scope_key: str) -> int:
     """
-    Sum ``cost_credits`` for all usage lines on a scope key.
+    Sum the micro-credit cost of every usage line on a scope key.
+
+    Micro, not credits: summing the rounded per-line figures would multiply the
+    rounding error by the number of LLM calls in the turn.
 
     Args:
         conn: Open connection inside a transaction.
         scope_key: Correlation key (e.g. ``request_id``).
 
     Returns:
-        int: Total credited cost for the scope.
+        int: Total cost for the scope in micro-credits.
     """
     row = conn.execute(
         """
-        SELECT COALESCE(SUM(cost_credits), 0)::bigint AS total
+        SELECT COALESCE(SUM(cost_micro_credits), 0)::bigint AS total
         FROM billing.usage_line
         WHERE scope_key = %s
         """,
@@ -71,14 +76,16 @@ def record_usage_line(
         metadata: Optional extra context.
 
     Returns:
-        int: ``cost_credits`` recorded for this line.
+        int: ``cost_credits`` recorded for this line (display value; the
+            authoritative figure is ``cost_micro_credits``).
     """
     provider, _, model = provider_model.partition(":")
-    cost = credits_for_tokens(
+    cost_micro = micro_credits_for_tokens(
         provider_model=provider_model,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
     )
+    cost = micro_to_credits(cost_micro)
     idempotency_key = f"usage:{scope_key}:{line_seq}"
     meta = {"rate_card": BILLING_RATE_CARD_VERSION, **(metadata or {})}
 
@@ -88,9 +95,9 @@ def record_usage_line(
             INSERT INTO billing.usage_line (
                 account_id, reservation_id, scope_key, line_seq, meter_type,
                 provider, model, purpose, input_tokens, output_tokens,
-                cost_credits, idempotency_key, metadata
+                cost_micro_credits, cost_credits, idempotency_key, metadata
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
             ON CONFLICT (idempotency_key) DO NOTHING
             """,
             (
@@ -104,6 +111,7 @@ def record_usage_line(
                 purpose.value,
                 max(0, input_tokens),
                 max(0, output_tokens),
+                cost_micro,
                 cost,
                 idempotency_key,
                 _json(meta),
@@ -133,7 +141,8 @@ def record_inference_usage_line(
         metadata: Optional extra context.
 
     Returns:
-        int: ``cost_credits`` recorded for this line.
+        int: ``cost_credits`` recorded for this line (display value; the
+            authoritative figure is ``cost_micro_credits``).
     """
     cost = max(0, int(cost_credits))
     idempotency_key = f"usage:{scope_key}:1"
@@ -149,9 +158,9 @@ def record_inference_usage_line(
             INSERT INTO billing.usage_line (
                 account_id, reservation_id, scope_key, line_seq, meter_type,
                 provider, model, purpose, input_tokens, output_tokens,
-                cost_credits, idempotency_key, metadata
+                cost_micro_credits, cost_credits, idempotency_key, metadata
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
             ON CONFLICT (idempotency_key) DO NOTHING
             """,
             (
@@ -165,6 +174,7 @@ def record_inference_usage_line(
                 job_type,
                 0,
                 0,
+                cost * MICRO_PER_CREDIT,
                 cost,
                 idempotency_key,
                 _json(meta),

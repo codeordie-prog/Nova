@@ -15,7 +15,7 @@ from typing import Any, Mapping, Optional
 
 from dermascan.billing.accounts import get_or_create_account
 from dermascan.billing.config import (
-    BILLING_MEDGEMMA_HOLD_CREDITS,
+    medgemma_hold_credits,
     BillingJobType,
     credits_for_medgemma_job,
     resolve_medgemma_job_type,
@@ -103,7 +103,7 @@ def prepare_medgemma_job_billing(
                 account_id=account.id,
                 reservation_key=job_id,
                 job_type=job_type,
-                hold_credits=BILLING_MEDGEMMA_HOLD_CREDITS,
+                hold_credits=medgemma_hold_credits(),
                 case_id=case_id or None,
                 client_id=client_id,
                 channel=channel,

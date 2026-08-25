@@ -8,9 +8,10 @@ Billing configuration and enums locked in Phase 0.
 See cloud_sql/billing/PHASE0_DECISIONS.md and cloud_sql/billing/RATE_CARD.md.
 Module path: ``dermascan.billing.config``.
 
-Rate card v2026-08-21:
-  Internal credits use **100 credits = $1.00 USD** of provider API cost
-  (``BILLING_CREDITS_PER_USD``). Retail KES ↔ credits is set at Paystack top-up.
+Credits are KES: one credit is one shilling. Provider token prices are quoted
+in USD per 1M tokens and converted through the ``usd_kes_rate`` setting in
+``billing.price_list``. Costs accumulate in micro-credits and round once, at
+settle.
 
 Sources (paid tier, standard context, per 1M tokens):
   - OpenAI: https://developers.openai.com/api/docs/pricing (Aug 2026)
@@ -31,8 +32,14 @@ Inference is metering flat job type cost + token usage.
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 from enum import StrEnum
 from typing import Final, Optional
+
+from dermascan.shared.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 class LedgerKind(StrEnum):
@@ -132,153 +139,171 @@ class BillingRefType(StrEnum):
 
 
 # --- Credit scale --------------------------------------------------------------
+#
+# One credit is one Kenyan shilling. That is what a user tops up through
+# Paystack, sees in chat, and spends.
+#
+# Provider token prices are quoted in USD per million tokens. That is a cost
+# input, not the wallet unit, so the rate card below stays authored in USD --
+# it is how the provider docs read, and it makes a price update mechanical --
+# and is converted through the ``usd_kes_rate`` setting when a cost is computed.
+#
+# Costs accumulate in MICRO-CREDITS (1e-6 credit) and are rounded to whole
+# credits once, when a reservation settles. Rounding per line would floor every
+# LLM call at a whole shilling: a five-call turn costing ~1.4 credits would be
+# charged 15.
 
-# 100 internal credits = $1.00 of provider API spend (before retail markup).
-BILLING_CREDITS_PER_USD: Final[int] = max(
-    1, int(os.getenv("BILLING_CREDITS_PER_USD", "100"))
-)
+MICRO_PER_CREDIT: Final[int] = 1_000_000
 
 
-def _usd_per_1m_to_credits(usd_per_1m: float) -> int:
+def _setting_int(key: str, *, default: int) -> int:
     """
-    Convert a USD-per-1M-token list price to internal credits per 1M tokens.
+    Read an integer setting from ``billing.price_list``.
 
     Args:
-        usd_per_1m: Provider list price in USD per million tokens.
+        key: Setting key.
+        default: Value when the row is missing or unreadable.
 
     Returns:
-        int: Credits per 1M tokens (rounded up to nearest integer).
+        int: Setting value.
     """
-    if usd_per_1m <= 0:
-        return 0
-    micro_usd: int = int(round(usd_per_1m * 1_000_000))
-    credits: int = (micro_usd * BILLING_CREDITS_PER_USD + 999_999) // 1_000_000
-    return max(1, credits)
+    from dermascan.billing import pricing
+
+    try:
+        return int(pricing.setting(key, default=Decimal(default)))
+    except Exception:
+        logger.exception("price_list setting unreadable, using default: %s", key)
+        return default
 
 
-def _rate_from_env(env_key: str, *, usd_fallback: float) -> int:
+def usd_kes_rate() -> Decimal:
     """
-    Read credits-per-1M from env or derive from USD fallback.
-
-    Args:
-        env_key: Environment variable name.
-        usd_fallback: USD per 1M tokens when env is unset or zero.
+    Shillings per US dollar, used to price the USD rate card in credits.
 
     Returns:
-        int: Credits per 1M tokens.
+        Decimal: Conversion rate from ``billing.price_list``.
     """
-    raw: str = os.getenv(env_key, "").strip()
-    if raw:
-        return max(0, int(raw))
-    return _usd_per_1m_to_credits(usd_fallback)
+    from dermascan.billing import pricing
+
+    try:
+        return pricing.setting("usd_kes_rate", default=Decimal(129))
+    except Exception:
+        logger.exception("usd_kes_rate unreadable, using 129")
+        return Decimal(129)
 
 
-# --- Hold ceilings (credits) ---------------------------------------------------
+# --- Hold ceilings ---------------------------------------------------------
+#
+# These are ceilings, not charges: a hold debits the balance immediately and
+# the unused remainder is refunded at settle. They live in price_list so they
+# are editable from the admin portal, and the shipped values are interim --
+# size them from the p99 of billing.usage_line after a metering run.
 
-BILLING_ORCHESTRATOR_HOLD_CREDITS: Final[int] = max(
-    1, int(os.getenv("BILLING_ORCHESTRATOR_HOLD_CREDITS", "150"))
-)
-BILLING_MEDGEMMA_HOLD_CREDITS: Final[int] = max(
-    1, int(os.getenv("BILLING_MEDGEMMA_HOLD_CREDITS", "200"))
-)
-BILLING_SKIN_AUDIT_CREDITS: Final[int] = max(
-    0, int(os.getenv("BILLING_SKIN_AUDIT_CREDITS", "40"))
-)
-BILLING_PRODUCT_REVIEW_IMAGE_CREDITS: Final[int] = max(
-    0, int(os.getenv("BILLING_PRODUCT_REVIEW_IMAGE_CREDITS", "50"))
-)
-BILLING_COMBINED_AUDIT_CREDITS: Final[int] = max(
-    0, int(os.getenv("BILLING_COMBINED_AUDIT_CREDITS", "60"))
-)
 
-BILLING_MEDGEMMA_JOB_CREDITS: Final[dict[str, int]] = {
-    BillingJobType.SKIN_AUDIT.value: BILLING_SKIN_AUDIT_CREDITS,
-    BillingJobType.PRODUCT_REVIEW_IMAGE.value: BILLING_PRODUCT_REVIEW_IMAGE_CREDITS,
-    BillingJobType.COMBINED_AUDIT.value: BILLING_COMBINED_AUDIT_CREDITS,
-}
-BILLING_MIN_BALANCE_CREDITS: Final[int] = max(
-    0, int(os.getenv("BILLING_MIN_BALANCE_CREDITS", "150"))
-)
-BILLING_FREE_GRANT_CREDITS: Final[int] = max(
-    0, int(os.getenv("BILLING_FREE_GRANT_CREDITS", "0"))
-)
-BILLING_RESERVATION_TTL_SEC: Final[int] = max(
-    60, int(os.getenv("BILLING_RESERVATION_TTL_SEC", "900"))
-)
+def orchestrator_hold_credits() -> int:
+    """
+    Credit ceiling held for one orchestrator turn.
 
-# --- Rate card (token → credits) -----------------------------------------------
+    Returns:
+        int: Hold size in credits.
+    """
+    return max(1, _setting_int("orchestrator_hold_credits", default=25))
+
+
+def medgemma_hold_credits() -> int:
+    """
+    Credit ceiling held for one MedGemma inference job.
+
+    Returns:
+        int: Hold size in credits.
+    """
+    return max(1, _setting_int("medgemma_hold_credits", default=60))
+
+
+def min_balance_credits() -> int:
+    """
+    Balance a user must retain on top of a hold.
+
+    Zero by design. A hold already debits the balance and guarantees the funds;
+    a floor on top of it is a second gate, and a non-zero one strands credits
+    the user paid for and can never spend.
+
+    Returns:
+        int: Minimum retained balance in credits.
+    """
+    return max(0, _setting_int("min_balance_credits", default=0))
+
+
+def reservation_ttl_sec() -> int:
+    """
+    How long a hold survives before the sweeper releases it.
+
+    Returns:
+        int: Time to live in seconds.
+    """
+    return max(60, _setting_int("reservation_ttl_sec", default=900))
+
+
+# --- Rate card (USD per 1M tokens) ---------------------------------------------
 
 BILLING_RATE_CARD_VERSION: Final[str] = os.getenv(
-    "BILLING_RATE_CARD_VERSION", "2026-08-21"
+    "BILLING_RATE_CARD_VERSION", "2026-08-25"
 ).strip()
 
-# Orchestrator primary chain (model_fallback_chain._DEFAULT_ORCHESTRATOR_MODEL_CHAIN)
-# gemini-3.5-flash:        $1.50 in / $9.00 out
-# gemini-3.1-flash-lite:   $0.25 in / $1.50 out
-# gpt-4o:                  $2.50 in / $10.00 out
-# gpt-5:                   $1.25 in / $10.00 out
-
-BILLING_TOKEN_RATES: Final[dict[str, dict[str, int]]] = {
+# Paid tier, standard context, USD per 1M tokens.
+#   OpenAI: https://developers.openai.com/api/docs/pricing (Aug 2026)
+#   Gemini: https://ai.google.dev/gemini-api/docs/pricing (Aug 2026)
+BILLING_TOKEN_RATES_USD: Final[dict[str, dict[str, Decimal]]] = {
     "google:gemini-3.5-flash": {
-        "input_per_1m_credits": _rate_from_env(
-            "BILLING_GEMINI_35_FLASH_INPUT_1M", usd_fallback=1.50
-        ),
-        "output_per_1m_credits": _rate_from_env(
-            "BILLING_GEMINI_35_FLASH_OUTPUT_1M", usd_fallback=9.00
-        ),
-        "cached_input_per_1m_credits": _rate_from_env(
-            "BILLING_GEMINI_35_FLASH_CACHED_INPUT_1M", usd_fallback=0.15
-        ),
+        "input": Decimal("1.50"),
+        "output": Decimal("9.00"),
+        "cached_input": Decimal("0.15"),
     },
     "google:gemini-3.1-flash-lite": {
-        "input_per_1m_credits": _rate_from_env(
-            "BILLING_GEMINI_31_FLASH_LITE_INPUT_1M", usd_fallback=0.25
-        ),
-        "output_per_1m_credits": _rate_from_env(
-            "BILLING_GEMINI_31_FLASH_LITE_OUTPUT_1M", usd_fallback=1.50
-        ),
-        "cached_input_per_1m_credits": _rate_from_env(
-            "BILLING_GEMINI_31_FLASH_LITE_CACHED_INPUT_1M", usd_fallback=0.025
-        ),
+        "input": Decimal("0.25"),
+        "output": Decimal("1.50"),
+        "cached_input": Decimal("0.025"),
     },
     "openai:gpt-4o": {
-        "input_per_1m_credits": _rate_from_env(
-            "BILLING_OPENAI_GPT4O_INPUT_1M", usd_fallback=2.50
-        ),
-        "output_per_1m_credits": _rate_from_env(
-            "BILLING_OPENAI_GPT4O_OUTPUT_1M", usd_fallback=10.00
-        ),
-        "cached_input_per_1m_credits": _rate_from_env(
-            "BILLING_OPENAI_GPT4O_CACHED_INPUT_1M", usd_fallback=1.25
-        ),
+        "input": Decimal("2.50"),
+        "output": Decimal("10.00"),
+        "cached_input": Decimal("1.25"),
     },
     "openai:gpt-5": {
-        "input_per_1m_credits": _rate_from_env(
-            "BILLING_OPENAI_GPT5_INPUT_1M", usd_fallback=1.25
-        ),
-        "output_per_1m_credits": _rate_from_env(
-            "BILLING_OPENAI_GPT5_OUTPUT_1M", usd_fallback=10.00
-        ),
-        "cached_input_per_1m_credits": _rate_from_env(
-            "BILLING_OPENAI_GPT5_CACHED_INPUT_1M", usd_fallback=0.125
-        ),
+        "input": Decimal("1.25"),
+        "output": Decimal("10.00"),
+        "cached_input": Decimal("0.125"),
     },
     # Summarization chain fallback
     "openai:gpt-4o-mini": {
-        "input_per_1m_credits": _rate_from_env(
-            "BILLING_OPENAI_GPT4O_MINI_INPUT_1M", usd_fallback=0.15
-        ),
-        "output_per_1m_credits": _rate_from_env(
-            "BILLING_OPENAI_GPT4O_MINI_OUTPUT_1M", usd_fallback=0.60
-        ),
-        "cached_input_per_1m_credits": _rate_from_env(
-            "BILLING_OPENAI_GPT4O_MINI_CACHED_INPUT_1M", usd_fallback=0.075
-        ),
+        "input": Decimal("0.15"),
+        "output": Decimal("0.60"),
+        "cached_input": Decimal("0.075"),
     },
 }
 
 
-def credits_for_tokens(
+def micro_credits_per_1m(provider_model: str, bucket: str) -> int:
+    """
+    Price one million tokens in micro-credits.
+
+    Args:
+        provider_model: Rate-card key such as ``google:gemini-3.5-flash``.
+        bucket: ``input``, ``output`` or ``cached_input``.
+
+    Returns:
+        int: Micro-credits per 1M tokens, 0 when the model is not on the card.
+    """
+    rates = BILLING_TOKEN_RATES_USD.get(provider_model)
+    if rates is None:
+        return 0
+    usd = rates.get(bucket)
+    if usd is None or usd <= 0:
+        return 0
+    return int(usd * usd_kes_rate() * MICRO_PER_CREDIT)
+
+
+def micro_credits_for_tokens(
     *,
     provider_model: str,
     input_tokens: int,
@@ -286,68 +311,90 @@ def credits_for_tokens(
     cached_input_tokens: int = 0,
 ) -> int:
     """
-    Convert token counts to integer credits using the active rate card.
+    Cost of one LLM call in micro-credits.
+
+    No rounding happens here. The scope total is rounded to whole credits once,
+    at settle, so a turn made of many small calls is not charged a shilling per
+    call.
 
     Args:
-        provider_model: Key such as ``openai:gpt-4o`` or ``google:gemini-3.5-flash``.
-        input_tokens: Non-cached prompt/input token count.
-        output_tokens: Completion/output token count.
-        cached_input_tokens: Cached prompt tokens (priced separately when configured).
+        provider_model: Key such as ``openai:gpt-4o``.
+        input_tokens: Non-cached prompt tokens.
+        output_tokens: Completion tokens.
+        cached_input_tokens: Cached prompt tokens, priced separately.
 
     Returns:
-        int: Non-negative credits (rounded up per token bucket).
+        int: Non-negative cost in micro-credits.
     """
-    rates = BILLING_TOKEN_RATES.get(provider_model)
-    if rates is None:
+    if provider_model not in BILLING_TOKEN_RATES_USD:
         return 0
 
-    def _bucket(count: int, per_1m: int) -> int:
-        if count <= 0 or per_1m <= 0:
+    def _bucket(count: int, bucket: str) -> int:
+        if count <= 0:
             return 0
-        return (count * per_1m + 999_999) // 1_000_000
+        return (count * micro_credits_per_1m(provider_model, bucket)) // 1_000_000
 
-    in_credits = _bucket(max(0, input_tokens), int(rates.get("input_per_1m_credits", 0)))
-    out_credits = _bucket(max(0, output_tokens), int(rates.get("output_per_1m_credits", 0)))
-    cached_credits = _bucket(
-        max(0, cached_input_tokens),
-        int(rates.get("cached_input_per_1m_credits", 0)),
+    return (
+        _bucket(max(0, input_tokens), "input")
+        + _bucket(max(0, output_tokens), "output")
+        + _bucket(max(0, cached_input_tokens), "cached_input")
     )
-    return in_credits + out_credits + cached_credits
+
+
+def micro_to_credits(micro: int) -> int:
+    """
+    Round a micro-credit total to whole credits.
+
+    Rounds up, so a scope that consumed anything at all is never free.
+
+    Args:
+        micro: Cost in micro-credits.
+
+    Returns:
+        int: Non-negative whole credits.
+    """
+    if micro <= 0:
+        return 0
+    return max(1, (micro + MICRO_PER_CREDIT - 1) // MICRO_PER_CREDIT)
 
 
 def credits_for_medgemma_job(job_type: str) -> int:
     """
-    Return flat credits for a completed MedGemma inference job.
+    Flat credit price of one successful MedGemma inference job.
 
     Args:
         job_type: :class:`BillingJobType` value.
 
     Returns:
-        int: Non-negative credits for one successful job.
+        int: Non-negative credits, from ``billing.price_list``.
     """
-    return max(0, int(BILLING_MEDGEMMA_JOB_CREDITS.get(job_type, 0)))
+    from dermascan.billing import pricing
+
+    try:
+        return max(0, pricing.job_credits(job_type))
+    except Exception:
+        logger.exception("job price unreadable: %s", job_type)
+        return 0
 
 
 __all__ = [
-    "BILLING_CREDITS_PER_USD",
-    "BILLING_FREE_GRANT_CREDITS",
-    "BILLING_COMBINED_AUDIT_CREDITS",
-    "BILLING_MEDGEMMA_HOLD_CREDITS",
-    "BILLING_MEDGEMMA_JOB_CREDITS",
-    "BILLING_PRODUCT_REVIEW_IMAGE_CREDITS",
-    "BILLING_SKIN_AUDIT_CREDITS",
-    "BILLING_MIN_BALANCE_CREDITS",
-    "BILLING_ORCHESTRATOR_HOLD_CREDITS",
     "BILLING_RATE_CARD_VERSION",
-    "BILLING_RESERVATION_TTL_SEC",
-    "BILLING_TOKEN_RATES",
+    "BILLING_TOKEN_RATES_USD",
     "BillingJobType",
     "BillingRefType",
     "LedgerKind",
     "LlmPurpose",
+    "MICRO_PER_CREDIT",
     "MeterType",
     "ReservationState",
     "credits_for_medgemma_job",
-    "credits_for_tokens",
+    "medgemma_hold_credits",
+    "micro_credits_for_tokens",
+    "micro_credits_per_1m",
+    "micro_to_credits",
+    "min_balance_credits",
+    "orchestrator_hold_credits",
+    "reservation_ttl_sec",
     "resolve_medgemma_job_type",
+    "usd_kes_rate",
 ]
