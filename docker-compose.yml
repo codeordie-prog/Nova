@@ -1,0 +1,57 @@
+# Local development infrastructure: Redis and Postgres only.
+#
+# The application processes (backend API, do_work.py workers, the MedGemma
+# gateway) keep running on the host under poetry — this file exists so those
+# processes stop reaching across the internet to Redis Cloud and Cloud SQL
+# while you are developing.
+#
+#   ./dermascan/scripts/local_stack.sh up        # start, wait for health, migrate
+#   ./dermascan/scripts/local_stack.sh status
+#   ./dermascan/scripts/local_stack.sh down
+#
+# Ports match the Homebrew defaults on purpose, so one .env.local works
+# whichever stack is running. Only one of the two can be up at a time; the
+# script checks and tells you which to stop.
+
+name: qutis-local
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: qutis-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    # Streams and consumer groups are the whole point of Redis here, and a
+    # worker that loses its pending-entries list mid-trip is worse than one
+    # that restarts cold. AOF keeps stream state across a container restart.
+    command: ["redis-server", "--appendonly", "yes", "--save", ""]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: qutis-postgres
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: localdev
+      POSTGRES_DB: qutis_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d qutis_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  redis_data:
+  postgres_data:

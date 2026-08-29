@@ -1,7 +1,9 @@
 """
 Bootstrap environment variables for local and Cloud Run runtimes.
 
-Local dev loads ``.env`` from the repo root. Cloud Run mounts a synced copy at
+Local dev loads ``.env`` from the repo root, and ``.env.local`` on top of it
+when present -- the overlay that points Redis and Postgres at the local stack
+(see ``dermascan/scripts/local_stack.sh``). Cloud Run mounts a synced copy at
 ``/secrets/env/.env`` (Secret Manager) and sets ``DERMASCAN_ENV_FILE``; deploy-time
 overrides (API URL, MedGemma gateway URL) are injected by Cloud Run first and
 are not overwritten.
@@ -135,7 +137,18 @@ def _load_env_files() -> None:
     if cloud_env_file and os.path.isfile(cloud_env_file):
         load_dotenv(cloud_env_file, override=False)
 
-    local_env = _repo_root() / ".env"
+    root = _repo_root()
+
+    # `.env.local` is loaded first and, because every load is override=False,
+    # the first value seen wins. It therefore overlays the local stack's Redis
+    # and Postgres pointers on top of `.env` while every key it does not
+    # mention -- API keys, model chains -- still comes from `.env`.
+    overlay = root / ".env.local"
+    if overlay.is_file():
+        logger.info("local overlay active: .env.local")
+        load_dotenv(overlay, override=False)
+
+    local_env = root / ".env"
     if local_env.is_file():
         load_dotenv(local_env, override=False)
 

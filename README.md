@@ -39,6 +39,20 @@ poetry install
 cp .env_example .env   # fill in values — see sections below
 ```
 
+### Local infrastructure
+
+Rather than pointing at Redis Cloud and Cloud SQL, run both locally:
+
+```bash
+./dermascan/scripts/local_stack.sh up
+```
+
+This starts Redis and Postgres (Docker Compose, falling back to Homebrew
+services), creates `qutis_db`, applies the billing migrations, and writes a
+`.env.local` overlay that redirects `REDIS_URL` and `POSTGRES_*` at the local
+stack while your `.env` keeps supplying API keys. Delete `.env.local` to go back
+to the cloud. See `dermascan/docs/local-stack.md`.
+
 ## 1. LLM model chains
 
 The orchestrator and report subagents no longer use a single primary/fallback pair. Each flow runs an **ordered model chain** implemented in `dermascan/backend/services/agents/model_fallback_chain.py`.
@@ -157,13 +171,12 @@ This script runs:
 
 ### Suggested local run order
 
-1. Redis
-2. PostgreSQL (if using product / rules flows)
-3. Set `OPENAI_API_KEY_QUTIS` and Vertex/Gemini credentials in `.env`
-4. MedGemma gateway + worker (if image / skin review flows are needed)
-5. Backend API (`8088`)
-6. `poetry run python dermascan/scripts/do_work.py`
-7. (Optional) `telegram_polling_bridge.py` for local Telegram testing
+1. `./dermascan/scripts/local_stack.sh up` — Redis, Postgres and migrations
+2. Set `OPENAI_API_KEY_QUTIS` and Vertex/Gemini credentials in `.env`
+3. MedGemma gateway + worker (if image / skin review flows are needed)
+4. Backend API (`8088`)
+5. `poetry run python dermascan/scripts/do_work.py`
+6. (Optional) `telegram_polling_bridge.py` for local Telegram testing
 
 ## 5. MedGemma (vision diagnosis — separate)
 
