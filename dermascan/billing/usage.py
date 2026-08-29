@@ -18,6 +18,9 @@ from dermascan.billing.config import (
     micro_to_credits,
 )
 from dermascan.billing.db import transaction
+from dermascan.shared.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def _json(payload: dict[str, Any]) -> str:
@@ -117,6 +120,19 @@ def record_usage_line(
                 _json(meta),
             ),
         )
+
+    logger.info(
+        "billing usage line: scope=%s seq=%s model=%s in=%s out=%s micro=%s "
+        "credits=%s reservation_id=%s",
+        scope_key,
+        line_seq,
+        provider_model,
+        input_tokens,
+        output_tokens,
+        cost_micro,
+        cost,
+        reservation_id,
+    )
     return cost
 
 

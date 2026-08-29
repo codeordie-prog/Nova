@@ -18,9 +18,10 @@ from dermascan.backend.services.agents.orchestrator_worker import run_worker_for
 from dermascan.backend.services.agents.outbound_sender_worker import run_worker_forever as run_outbound_sender_worker
 from dermascan.billing.flags import billing_active, validate_billing_flags
 from dermascan.billing.sweeper import start_billing_sweeper_thread
+from dermascan.shared.logger import get_logger
 
 
-logger = logging.getLogger("do_work")
+logger = get_logger("do_work")
 
 
 def _worker_thread_target(name: str, worker_fn: Callable[[], None], stop_event: threading.Event) -> None:

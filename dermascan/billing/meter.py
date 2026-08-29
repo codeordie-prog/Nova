@@ -137,7 +137,8 @@ def record_llm_usage(
             metadata={"model_key": model_key, "operation": operation},
         )
         logger.debug(
-            "billing usage line: scope=%s seq=%s model=%s cost=%s in=%s out=%s",
+            "billing usage line queued: scope=%s seq=%s model=%s cost_credits=%s "
+            "in=%s out=%s",
             scope.scope_key,
             line_seq,
             provider_model,

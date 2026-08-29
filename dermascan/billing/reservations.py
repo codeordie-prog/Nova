@@ -99,6 +99,15 @@ def place_hold(
             (reservation_key,),
         ).fetchone()
         if existing is not None:
+            logger.info(
+                "billing hold reused: reservation_key=%s id=%s state=%s hold=%s "
+                "account_id=%s",
+                reservation_key,
+                existing["id"],
+                existing["state"],
+                existing["hold_credits"],
+                account_id,
+            )
             return Reservation(
                 id=str(existing["id"]),
                 account_id=str(existing["account_id"]),
@@ -117,6 +126,17 @@ def place_hold(
 
         balance = int(locked["balance_credits"])
         if balance < required:
+            logger.info(
+                "billing hold refused: reservation_key=%s account_id=%s balance=%s "
+                "required=%s (hold=%s + min_balance=%s) job_type=%s",
+                reservation_key,
+                account_id,
+                balance,
+                required,
+                hold_credits,
+                required - hold_credits,
+                job_type,
+            )
             raise InsufficientCreditsError(balance=balance, required=required)
 
         reservation_id = str(uuid.uuid4())
@@ -163,10 +183,16 @@ def place_hold(
         )
 
     logger.info(
-        "billing hold placed: reservation_key=%s hold=%s account_id=%s",
+        "billing hold placed: reservation_key=%s id=%s job_type=%s hold=%s "
+        "account_id=%s balance=%s->%s expires_at=%s",
         reservation_key,
+        reservation_id,
+        job_type,
         hold_credits,
         account_id,
+        balance,
+        balance - hold_credits,
+        expires_at.isoformat(),
     )
     return Reservation(
         id=reservation_id,
@@ -201,8 +227,16 @@ def commit_reservation(reservation_id: str) -> int:
 
         state = str(reservation["state"])
         if state == ReservationState.COMMITTED.value:
+            logger.info(
+                "billing settle skipped: id=%s already committed actual=%s",
+                reservation_id,
+                reservation["actual_credits"] or 0,
+            )
             return int(reservation["actual_credits"] or 0)
         if state == ReservationState.RELEASED.value:
+            logger.info(
+                "billing settle skipped: id=%s already released", reservation_id
+            )
             return 0
 
         account_id = str(reservation["account_id"])
@@ -213,9 +247,22 @@ def commit_reservation(reservation_id: str) -> int:
         # Round the scope total once. Rounding each usage line would charge a
         # whole shilling per LLM call and multiply the error by the number of
         # calls in the turn.
-        actual = micro_to_credits(sum_usage_micro_for_scope(conn, scope_key))
+        usage_micro = sum_usage_micro_for_scope(conn, scope_key)
+        actual = micro_to_credits(usage_micro)
         refund = max(0, hold_credits - actual)
         overrun = max(0, actual - hold_credits)
+
+        logger.info(
+            "billing settle computing: id=%s scope=%s usage_micro=%s actual=%s "
+            "hold=%s refund=%s overrun=%s",
+            reservation_id,
+            scope_key,
+            usage_micro,
+            actual,
+            hold_credits,
+            refund,
+            overrun,
+        )
 
         if refund > 0:
             append(
@@ -258,10 +305,15 @@ def commit_reservation(reservation_id: str) -> int:
         )
 
     logger.info(
-        "billing reservation committed: id=%s actual=%s hold=%s",
+        "billing reservation committed: id=%s account_id=%s job_type=%s actual=%s "
+        "hold=%s refunded=%s overrun=%s",
         reservation_id,
+        account_id,
+        job_type,
         actual,
         hold_credits,
+        refund,
+        overrun,
     )
     return actual
 
@@ -312,6 +364,12 @@ def release_reservation(
 
         state = str(reservation["state"])
         if state != ReservationState.HELD.value:
+            logger.info(
+                "billing release skipped: id=%s state=%s reason=%s",
+                reservation_id,
+                state,
+                reason,
+            )
             return 0
 
         account_id = str(reservation["account_id"])
@@ -340,9 +398,13 @@ def release_reservation(
         )
 
     logger.info(
-        "billing reservation released: id=%s refund=%s",
+        "billing reservation released: id=%s account_id=%s job_type=%s refund=%s "
+        "reason=%s",
         reservation_id,
+        account_id,
+        job_type,
         hold_credits,
+        reason,
     )
     return hold_credits
 

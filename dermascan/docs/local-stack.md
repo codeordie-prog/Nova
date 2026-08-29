@@ -85,6 +85,42 @@ Top-ups need a Paystack `sk_test_` key in `PAYSTACK_SECRET_KEY`. The webhook's
 source-IP allowlist is skipped for test keys, so a tunnel or a replayed `curl`
 reaches `POST /v1/webhooks/paystack` without spoofing.
 
+## Tracing a run to a file
+
+`LOG_FILE` (set to `logs/local-run.log` in `.env.local`) appends every log record
+to a file as well as the console. A relative path resolves against the repo root,
+so the API, the workers and the Telegram bridge all write to the same file no
+matter which directory each was started from, and one end-to-end run reads as a
+single chronological trace. Each line carries process, pid and thread, so the
+four worker threads stay separable. `logs/` is gitignored.
+
+The billing lane logs one line per step, which is what makes a run auditable
+after the fact:
+
+| Step | Line |
+|---|---|
+| Account resolved, trial granted | `free trial granted` + `ledger entry ... kind=grant` |
+| Turn enters billing | `billing scope open` — ties `request_id` to `account_id` and `reservation_id` |
+| Hold taken | `billing hold placed` — with `balance=before->after` and `expires_at` |
+| Hold replayed (same `request_id`) | `billing hold reused` |
+| Turn refused | `billing hold refused` — `balance`, `required`, and the hold/floor split |
+| Each metered LLM call | `billing usage line` — tokens, `micro=`, and the rounded `credits=` |
+| Settle arithmetic | `billing settle computing` — `usage_micro`, `actual`, `refund`, `overrun` |
+| Settle done | `billing reservation committed` |
+| Turn cancelled or failed | `billing reservation released` with `reason=` |
+| Sweeper reclaimed a stale hold | `billing reservation released ... reason=expired_ttl` |
+
+`micro=` next to `actual=` is the check that matters: the scope total is rounded
+**once**, at settle. If `actual` ever equals the sum of the per-line `credits=`
+values rather than the rounding of `usage_micro`, per-line rounding has come back
+and every turn is being overcharged.
+
+To watch one turn as it happens:
+
+```bash
+tail -f logs/local-run.log | grep billing
+```
+
 ## Verifying
 
 ```bash

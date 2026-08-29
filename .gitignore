@@ -81,3 +81,6 @@ qutisai-*.json
 
 # Local deploy runbook (may contain project-specific notes)
 deploy/scripts/guidelines.md
+
+# Local run traces (LOG_FILE)
+logs/
