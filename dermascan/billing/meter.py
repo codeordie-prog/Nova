@@ -15,7 +15,7 @@ from langchain_core.messages import AIMessage, BaseMessage
 
 from dermascan.billing.config import LlmPurpose
 from dermascan.billing.context import billing_scope
-from dermascan.billing.usage import record_usage_line
+from dermascan.billing.usage import record_job_usage_line, record_usage_line
 from dermascan.shared.logger import get_logger
 
 logger = get_logger(__name__)
@@ -152,3 +152,120 @@ def record_llm_usage(
             scope.scope_key,
             provider_model,
         )
+
+
+def record_job_charge(job_type: str, *, dedupe_on: str) -> int:
+    """
+    Charge a flat job SKU into the active billing scope.
+
+    For work that costs money but produces no tokens, so the LLM meter never
+    sees it. Settles with the rest of the scope, which means it can push a turn
+    past its hold and be collected as an overrun rather than silently dropped.
+
+    Args:
+        job_type: ``billing.price_list`` key under scope ``job_credits``.
+        dedupe_on: Stable identifier for the thing being paid for, so a retried
+            or repeated tool call charges once.
+
+    Returns:
+        int: Credits charged. 0 when no scope is active, the job is free, or
+            the charge was a duplicate.
+    """
+    scope = billing_scope.get()
+    if scope is None:
+        return 0
+
+    from dermascan.billing import pricing
+
+    try:
+        credits = max(0, pricing.job_credits(job_type))
+    except Exception:
+        logger.exception("job price unreadable: %s", job_type)
+        return 0
+
+    if credits <= 0:
+        return 0
+
+    try:
+        return record_job_usage_line(
+            account_id=scope.account_id,
+            scope_key=scope.scope_key,
+            line_seq=scope.next_line_seq(),
+            job_type=job_type,
+            cost_credits=credits,
+            idempotency_key=f"job:{job_type}:{dedupe_on}",
+            reservation_id=scope.reservation_id,
+        )
+    except Exception:
+        logger.exception(
+            "billing job charge failed: job_type=%s dedupe_on=%s", job_type, dedupe_on
+        )
+        return 0
+
+
+def job_credits_shortfall(job_type: str) -> int:
+    """
+    Credits a caller is short of affording a flat job, 0 when it can pay.
+
+    A flat SKU dearer than the turn's hold always overruns, and an overrun is
+    collected after the work is done -- which for human review means the
+    dermatologist has already been booked. Callers that dispatch real-world
+    cost check this first.
+
+    Returns 0 whenever enforcement is off, no scope is active, or the job is
+    free, so shadow-mode runs are never blocked.
+
+    Args:
+        job_type: ``billing.price_list`` key under scope ``job_credits``.
+
+    Returns:
+        int: Missing credits, or 0 when the charge is affordable.
+    """
+    from dermascan.billing import accounts, pricing
+    from dermascan.billing.flags import billing_enforce_enabled
+
+    if not billing_enforce_enabled():
+        return 0
+
+    scope = billing_scope.get()
+    if scope is None:
+        return 0
+
+    try:
+        credits = max(0, pricing.job_credits(job_type))
+        if credits <= 0:
+            return 0
+        # The hold has already been debited, so the balance read here is what
+        # is left after it -- money the turn has not spent yet.
+        balance = accounts.get_balance(scope.account_id) + scope_hold_credits(scope)
+        return max(0, credits - balance)
+    except Exception:
+        logger.exception("job affordability check failed: %s", job_type)
+        return 0
+
+
+def scope_hold_credits(scope: Any) -> int:
+    """
+    Credits still held by this scope's reservation, 0 when there is none.
+
+    The hold was debited from the balance when it was placed, so it has to be
+    added back to see what the turn can actually spend.
+
+    Args:
+        scope: Active :class:`BillingScope`.
+
+    Returns:
+        int: Held credits available to this scope.
+    """
+    from dermascan.billing.db import transaction
+
+    if not scope.reservation_id:
+        return 0
+    with transaction() as conn:
+        row = conn.execute(
+            "SELECT hold_credits, state FROM billing.reservation WHERE id = %s",
+            (scope.reservation_id,),
+        ).fetchone()
+    if row is None or str(row["state"]) != "held":
+        return 0
+    return int(row["hold_credits"])

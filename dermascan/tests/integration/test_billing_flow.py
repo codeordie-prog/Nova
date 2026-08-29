@@ -598,3 +598,121 @@ class TestAdminApi:
     ) -> None:
         monkeypatch.setenv("BILLING_ENABLED", "false")
         assert self._get(admin_client, "/v1/admin/billing/overview").status_code == 404
+
+
+class TestFlatJobCharges:
+    """Jobs that cost money but produce no tokens."""
+
+    @pytest.fixture
+    def enforcing(self, billing_env, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("BILLING_METER_ENABLED", "true")
+        monkeypatch.setenv("BILLING_ENFORCE", "true")
+        return billing_env
+
+    @staticmethod
+    def _scope(account_id: str, key: str, reservation_id):
+        from dermascan.billing.context import BillingScope
+
+        return BillingScope(
+            account_id=account_id,
+            scope_key=key,
+            channel="telegram",
+            client_id="tg-flat",
+            reservation_id=reservation_id,
+        )
+
+    def test_escalation_is_charged_once_however_often_the_tool_fires(
+        self, enforcing
+    ) -> None:
+        from dermascan.billing import accounts, meter, reservations
+        from dermascan.billing.config import BillingJobType
+        from dermascan.billing.context import billing_scope
+
+        account = accounts.resolve_for_client("telegram", "tg-flat")
+        held = reservations.place_hold(account_id=account.id, reservation_key="r-1")
+        token = billing_scope.set(self._scope(account.id, "r-1", held.id))
+        try:
+            job = BillingJobType.SPECIALIST_ESCALATION.value
+            first = meter.record_job_charge(job, dedupe_on="tg-flat:case-1")
+            second = meter.record_job_charge(job, dedupe_on="tg-flat:case-1")
+        finally:
+            billing_scope.reset(token)
+
+        assert first == 40
+        assert second == 0
+
+    def test_a_charge_dearer_than_the_hold_settles_as_an_overrun(
+        self, enforcing
+    ) -> None:
+        from dermascan.billing import accounts, meter, reservations
+        from dermascan.billing.config import BillingJobType
+        from dermascan.billing.context import billing_scope
+
+        account = accounts.resolve_for_client("telegram", "tg-flat")
+        held = reservations.place_hold(account_id=account.id, reservation_key="r-2")
+        token = billing_scope.set(self._scope(account.id, "r-2", held.id))
+        try:
+            meter.record_job_charge(
+                BillingJobType.SPECIALIST_ESCALATION.value, dedupe_on="tg-flat:case-2"
+            )
+        finally:
+            billing_scope.reset(token)
+
+        # 40 charged against a 25 hold: the 15 difference is collected, not lost.
+        assert reservations.commit_reservation(held.id) == 40
+        assert accounts.get_balance(account.id) == 0
+
+    def test_escalation_is_refused_when_the_balance_cannot_cover_it(
+        self, enforcing
+    ) -> None:
+        from dermascan.billing import accounts, meter, reservations
+        from dermascan.billing.config import BillingJobType
+        from dermascan.billing.context import billing_scope
+        from dermascan.billing.db import transaction
+        from dermascan.billing.ledger import append
+
+        account = accounts.resolve_for_client("telegram", "tg-flat")
+        with transaction() as conn:
+            append(
+                conn,
+                account_id=account.id,
+                delta_credits=-10,
+                kind="debit",
+                ref_type="manual",
+                ref_id="spend",
+                idempotency_key="spend-1",
+            )
+
+        held = reservations.place_hold(account_id=account.id, reservation_key="r-3")
+        token = billing_scope.set(self._scope(account.id, "r-3", held.id))
+        try:
+            shortfall = meter.job_credits_shortfall(
+                BillingJobType.SPECIALIST_ESCALATION.value
+            )
+        finally:
+            billing_scope.reset(token)
+
+        # 30 spendable against a 40 job. The hold is added back because placing
+        # it already debited the balance.
+        assert shortfall == 10
+
+    def test_nothing_is_charged_outside_a_billing_scope(self, enforcing) -> None:
+        from dermascan.billing import meter
+        from dermascan.billing.config import BillingJobType
+
+        job = BillingJobType.SPECIALIST_ESCALATION.value
+        assert meter.record_job_charge(job, dedupe_on="no-scope") == 0
+        assert meter.job_credits_shortfall(job) == 0
+
+    def test_retired_price_rows_are_gone(self, enforcing) -> None:
+        from dermascan.billing import pricing
+
+        # Token-metered work must not also carry a flat price. A missing key
+        # raises rather than returning 0, which is how combined_audit stayed
+        # free: credits_for_medgemma_job swallowed the KeyError.
+        for retired in ("chat_turn", "product_review_text", "deep_research"):
+            with pytest.raises(KeyError):
+                pricing.job_credits(retired)
+
+        # A MedGemma job type that had no row was silently free.
+        assert pricing.job_credits("combined_audit") == 40

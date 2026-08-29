@@ -84,6 +84,7 @@ class BillingJobType(StrEnum):
     SKIN_AUDIT = "skin_audit"
     PRODUCT_REVIEW_IMAGE = "product_review_image"
     COMBINED_AUDIT = "combined_audit"
+    SPECIALIST_ESCALATION = "specialist_escalation"
 
 
 _MEDGEMMA_PRODUCT_REVIEW_HINTS: Final[tuple[str, ...]] = (

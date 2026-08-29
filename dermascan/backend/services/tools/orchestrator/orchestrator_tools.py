@@ -447,6 +447,8 @@ OrchestratorRequestIdArg = Annotated[
     ),
 ]
 
+from dermascan.billing.config import BillingJobType
+from dermascan.billing.meter import job_credits_shortfall, record_job_charge
 from dermascan.backend.services.tools.orchestrator.billing_tools import (
     create_topup,
     get_credit_balance,
@@ -3667,6 +3669,27 @@ def request_specialist_escalation(request_id: OrchestratorRequestIdArg) -> dict[
             "detail": "missing client_id in ingress envelope",
         }
 
+    shortfall = job_credits_shortfall(BillingJobType.SPECIALIST_ESCALATION.value)
+    if shortfall > 0:
+        logger.info(
+            "specialist escalation blocked for credits: client_id=%s case_id=%s short=%s",
+            client_id,
+            case_id,
+            shortfall,
+        )
+        return {
+            "status": "insufficient_credits",
+            "request_id": request_id,
+            "case_id": case_id,
+            "client_id": client_id,
+            "shortfall_credits": shortfall,
+            "instruction": (
+                "The user cannot afford specialist review and no specialist has been "
+                f"contacted. Tell them they need {shortfall} more credits and offer to "
+                "top up. Do NOT call this tool again until they have topped up."
+            ),
+        }
+
     if has_pending_consent_escalation_offer(client_id, case_id=case_id or None):
         if not dispatch_consent_escalation(client_id, case_id=case_id or None):
             return {
@@ -3676,6 +3699,10 @@ def request_specialist_escalation(request_id: OrchestratorRequestIdArg) -> dict[
                 "client_id": client_id,
                 "detail": "failed to dispatch consent escalation job",
             }
+        record_job_charge(
+            BillingJobType.SPECIALIST_ESCALATION.value,
+            dedupe_on=f"{client_id}:{case_id}",
+        )
         return {
             "status": "queued",
             "request_id": request_id,
@@ -3701,6 +3728,10 @@ def request_specialist_escalation(request_id: OrchestratorRequestIdArg) -> dict[
     )
 
     if dispatch_status == "dispatched":
+        record_job_charge(
+            BillingJobType.SPECIALIST_ESCALATION.value,
+            dedupe_on=f"{client_id}:{case_id}",
+        )
         return {
             "status": "queued",
             "request_id": request_id,
