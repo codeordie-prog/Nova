@@ -393,6 +393,13 @@ Add `billing_worker` to `scripts/do_work.py` alongside orchestrator / escalation
 
 ### Feature flags (default OFF — matches the cosmetic-pivot convention)
 
+> **Superseded, 2026-08-25.** The env-var model below no longer exists. Prices,
+> hold ceilings and the free grant moved into `billing.price_list` (editable
+> from the admin Pricing page); credits are KES at 1 credit = 1 shilling, with
+> provider USD prices converted through the `usd_kes_rate` setting. Kept as a
+> record of what was decided and why. Current behaviour:
+> `dermascan/docs/billing-deduction-contract.md`.
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `BILLING_ENABLED` | `false` | Master switch. Off = today's behavior exactly |

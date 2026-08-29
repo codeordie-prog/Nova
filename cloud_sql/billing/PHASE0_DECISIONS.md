@@ -124,7 +124,14 @@ If fractional costs matter later, switch to millicredits (`×1000`) without chan
 
 ## 8. Rate card (v1) — locked 2026-08-21
 
-Stored in `dermascan/shared/billing_config.py` and `cloud_sql/billing/RATE_CARD.md`.
+> **Superseded, 2026-08-25.** The env-var model below no longer exists. Prices,
+> hold ceilings and the free grant moved into `billing.price_list` (editable
+> from the admin Pricing page); credits are KES at 1 credit = 1 shilling, with
+> provider USD prices converted through the `usd_kes_rate` setting. Kept as a
+> record of what was decided and why. Current behaviour:
+> `dermascan/docs/billing-deduction-contract.md`.
+
+Stored in `dermascan/billing/config.py` and `cloud_sql/billing/RATE_CARD.md`.
 
 **Scale:** `100 credits = $1.00 USD` of provider API list price (`BILLING_CREDITS_PER_USD`).
 
