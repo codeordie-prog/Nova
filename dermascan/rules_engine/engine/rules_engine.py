@@ -14,7 +14,6 @@ from typing import Any
 
 import psycopg2
 import redis
-from dotenv import load_dotenv
 
 from dermascan.rules_engine.confidence.decision_confidence import compute_product_decision_confidence
 from dermascan.rules_engine.engine.skin_audit_bridge import build_skin_audit_bridge
@@ -34,10 +33,16 @@ from dermascan.rules_engine.knowledge_agent.knowledge_agent import (
 )
 from dermascan.rules_engine.knowledge_agent.prompt import system_prompt
 from dermascan.rules_engine.vector_store.build_vectorstore import VectorStore
+from dermascan.shared.load_env import bootstrap_env
 from dermascan.shared.logger import get_logger
 
-# Load environment variables (.env overrides empty shell exports)
-load_dotenv(override=True)
+# Importing this module must not change where the process is already pointed.
+# `load_dotenv(override=True)` re-read `.env` over everything already in the
+# environment, so importing the rules engine silently moved a worker off the
+# local stack -- and off any shell export -- onto Cloud SQL and production
+# Redis. bootstrap_env() honours the `.env.local` overlay and leaves injected
+# Cloud Run values alone.
+bootstrap_env()
 
 # Initialize logger
 logger = get_logger(__name__)

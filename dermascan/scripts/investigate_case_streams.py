@@ -9,9 +9,9 @@ import sys
 from collections import defaultdict
 from typing import Any
 
-from dotenv import load_dotenv
+from dermascan.shared.load_env import bootstrap_env
 
-load_dotenv(override=True)
+bootstrap_env()
 
 CASE_ID = sys.argv[1] if len(sys.argv) > 1 else "c7bd36488a96421cb4f2150a96537646"
 
