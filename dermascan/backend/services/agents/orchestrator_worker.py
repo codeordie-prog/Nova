@@ -52,6 +52,8 @@ from dermascan.backend.services.agents.group_report_aggregator import (
     collect_and_compile_if_ready,
 )
 from dermascan.billing import accounts as billing_accounts
+from dermascan.billing import redis_wallet as billing_wallet
+from dermascan.billing import topups as billing_topups
 from dermascan.shared.logger import get_logger
 from dermascan.shared.ingress_payload import resolve_image_urls_from_payload
 from dermascan.shared.vision_image_urls import build_checkpoint_image_block
@@ -143,6 +145,9 @@ SUMMARIZATION_MAX_TOKENS: int = max(
     256, int(os.getenv("SUMMARIZATION_MAX_TOKENS", "1024"))
 )
 _PROVIDER_MAX_RETRIES_HARD_CAP: int = 3
+# The description is quoted back inside a chat message, so it has to stay short
+# enough to read as a phrase rather than a wall of the user's own text.
+PENDING_TASK_TEXT_LIMIT: int = 80
 OPENAI_REQUEST_TIMEOUT_S: float = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"))
 OPENAI_MAX_RETRIES: int = max(0, min(_PROVIDER_MAX_RETRIES_HARD_CAP, int(os.getenv("OPENAI_MAX_RETRIES", "2"))))
 # Hard ceiling on agent reasoning/tool-call steps per turn.
@@ -1667,6 +1672,46 @@ def _start_reclaim_thread(
     return thread
 
 
+def _pending_task_description(payload_json: str) -> str:
+    """
+    Describe the blocked request so it can be offered back after payment.
+
+    Reads as the object of "You had ___ waiting" in the payment confirmation,
+    so it is a noun phrase, not a sentence. The user's own words are quoted
+    back rather than summarised: a paraphrase of a skin complaint they wrote
+    days earlier is worse than silence.
+
+    Args:
+        payload_json: Raw ingress payload JSON string.
+
+    Returns:
+        str: Short noun phrase naming the blocked task.
+    """
+    try:
+        payload: dict[str, Any] = json.loads(payload_json)
+    except Exception:
+        payload = {}
+
+    content = payload.get("content") or {}
+    text = str(content.get("text") or "").strip()
+    attachments = content.get("attachments") or []
+    if not isinstance(attachments, list):
+        attachments = []
+
+    if text:
+        # Truncated on a word boundary; a mid-word cut reads like corruption.
+        if len(text) > PENDING_TASK_TEXT_LIMIT:
+            text = text[:PENDING_TASK_TEXT_LIMIT].rsplit(" ", 1)[0].rstrip(",.;:") + "\u2026"
+        if attachments:
+            return f'a photo and your question "{text}"'
+        return f'your question "{text}"'
+
+    if attachments:
+        return "a photo you sent" if len(attachments) == 1 else f"{len(attachments)} photos you sent"
+
+    return "a request"
+
+
 def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> None:
     """
     Process a message from the orchestrator job stream.
@@ -1720,12 +1765,21 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                             exc.balance,
                             exc.required,
                         )
+                        # Remember what they were doing, so the confirmation
+                        # message after payment can offer to pick it back up.
+                        billing_wallet.set_pending_task(
+                            account.id, _pending_task_description(payload_json)
+                        )
                         _enqueue_outbound(
                             client_id=client_id,
                             case_id=case_id,
                             channel=channel,
                             request_id=request_id,
-                            text=billing.INSUFFICIENT_CREDITS_MESSAGE,
+                            text=billing_topups.offer_for_blocked_request(
+                                account=account,
+                                balance=exc.balance,
+                                required=exc.required,
+                            ),
                             kind="job_reply",
                             must_deliver=True,
                             reply_to_message_id=message_id,
@@ -1747,6 +1801,20 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                         client_id=client_id,
                         reservation_id=reservation_id,
                     )
+                )
+                # The one line that ties a turn to its account and reservation.
+                # Without it, usage lines and settle rows in the trace cannot be
+                # matched back to the conversation that produced them.
+                logger.info(
+                    "billing scope open: request_id=%s account_id=%s balance_at_entry=%s "
+                    "reservation_id=%s enforce=%s client_id=%s channel=%s",
+                    request_id,
+                    account.id,
+                    account.balance_credits,
+                    reservation_id,
+                    billing.billing_enforce_enabled(),
+                    client_id,
+                    channel,
                 )
             except billing.InsufficientCreditsError:
                 raise
@@ -1949,6 +2017,11 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                 # The actual credits are then deducted from the account balance
                 
                 billing.commit_reservation(reservation_id)
+                logger.info(
+                    "billing scope closed: request_id=%s reservation_id=%s",
+                    request_id,
+                    reservation_id,
+                )
             except Exception:
                 logger.exception(
                     "billing settle failed: reservation_id=%s request_id=%s",

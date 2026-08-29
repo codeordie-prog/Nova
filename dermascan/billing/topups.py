@@ -193,3 +193,40 @@ def _start_checkout(
         stk_sent=False,
         fallback_reason=fallback_reason,
     )
+
+
+def offer_for_blocked_request(
+    *,
+    account: accounts.Account,
+    balance: int,
+    required: Optional[int] = None,
+) -> str:
+    """
+    Build the message shown when a request is turned away for want of credits.
+
+    Creates a checkout link up front so the user has a route that asks nothing
+    of them, and falls back to the link-less copy if Paystack is unreachable —
+    being told how to pay is better than being told nothing.
+
+    Args:
+        account: Account that was blocked.
+        balance: Their current balance.
+        required: Credits the blocked action needed, when known.
+
+    Returns:
+        str: Message text offering both top-up routes.
+    """
+    from dermascan.billing import notify
+
+    authorization_url: Optional[str] = None
+    try:
+        offer = start_topup(account=account, credits=pricing.min_topup_credits())
+        authorization_url = offer.authorization_url
+    except Exception:
+        logger.exception("could not create a top-up link: account_id=%s", account.id)
+
+    return notify.out_of_credits_message(
+        authorization_url=authorization_url,
+        balance=balance,
+        required=required,
+    )
