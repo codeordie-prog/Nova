@@ -1,4 +1,10 @@
-"""Ordered outbound sender worker."""
+"""
+Author: Dermascan Team
+Date: 2026-09-24
+License: MIT
+
+Ordered outbound sender worker.
+"""
 
 import json
 import logging
@@ -6,6 +12,7 @@ import os
 import re
 import socket
 import threading
+import zlib
 from collections import defaultdict
 from typing import Any
 
@@ -24,6 +31,7 @@ from dermascan.shared.redis_stability import (
 )
 from dermascan.backend.services.agents import reclaim_logic
 from dermascan.backend.utils.backoff import post_with_outbound_retry
+from dermascan.shared.whatsapp_platform_message_id import is_whatsapp_platform_message_id
 
 ensure_env_loaded()
 
@@ -163,7 +171,11 @@ def _send_typing_best_effort(fields: dict[str, Any]) -> None:
             return
 
         if channel == "whatsapp":
-            if not reply_ref or not WHATSAPP_INTERNAL_API_SECRET:
+            if (
+                not reply_ref
+                or not WHATSAPP_INTERNAL_API_SECRET
+                or not is_whatsapp_platform_message_id(reply_ref)
+            ):
                 return
             base_url = WHATSAPP_API_BASE_URL.rstrip("/")
             typing_path = (
@@ -298,6 +310,7 @@ def _send_whatsapp(case_id: str, text: str, reply_to_wamid: str | None = None) -
     reply_target = str(reply_to_wamid or "").strip()
     if reply_target:
         payload["reply_to_wamid"] = reply_target
+        logger.debug("whatsapp send threaded reply_to_wamid=%s", reply_target[:48])
 
     response = post_with_outbound_retry(
         url=url,
@@ -336,21 +349,24 @@ def _to_int(value: Any) -> int | None:
 
 def _whatsapp_reply_wamid(fields: dict[str, Any]) -> str | None:
     """
-    Resolve WhatsApp threading target.
+    Resolve WhatsApp threading target (quoted reply to inbound message).
 
-    WhatsApp threads only signal updates. Job replies are sent without
-    ``reply_to_wamid``, even when chaos mode would thread on Telegram.
+    Job replies after a user photo and proactive ``signal_update`` deliveries
+    both carry the inbound ``message_id`` (wamid) in ``reply_to_message_id``.
 
     Args:
         fields: Outbound stream fields.
 
     Returns:
-        Inbound wamid when this outbound item is a signal update, else None.
+        Inbound wamid when this outbound should thread on WhatsApp, else None.
     """
-    if not _is_signal_kind(fields):
+    kind = _kind(fields)
+    if kind not in {"signal_update", "job_reply"}:
         return None
     wamid = str(fields.get("reply_to_message_id") or "").strip()
-    return wamid or None
+    if not is_whatsapp_platform_message_id(wamid):
+        return None
+    return wamid
 
 
 def _deliver(fields: dict[str, Any], reply_to_message_id: int | None = None) -> None:
@@ -497,7 +513,15 @@ def _reply_target(fields: dict[str, Any]) -> int | None:
     Returns:
         The reply target of the message.
     """
-    return _to_int(fields.get("reply_to_message_id"))
+    raw = str(fields.get("reply_to_message_id") or "").strip()
+    if not raw:
+        return None
+    as_int = _to_int(raw)
+    if as_int is not None:
+        return as_int
+    if is_whatsapp_platform_message_id(raw):
+        return zlib.crc32(raw.encode("utf-8")) & 0x7FFFFFFF
+    return None
 
 
 def _inbound_ts_ms(fields: dict[str, Any]) -> int:

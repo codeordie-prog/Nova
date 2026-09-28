@@ -99,6 +99,8 @@ def build_gemini_chat_model(
     gemini_api_key: str = "",
     top_p: float | None = None,
     thinking_level: str | None = None,
+    request_timeout_s: float | None = None,
+    max_retries: int = 1,
 ) -> ChatGoogleGenerativeAI:
     """
     Build a Gemini chat model with the correct auth mode for the environment.
@@ -118,6 +120,8 @@ def build_gemini_chat_model(
         top_p: Optional nucleus sampling parameter.
         thinking_level: Gemini 3+ reasoning depth (``minimal``, ``low``, ``medium``,
             ``high``). Defaults to model default (``high`` on Gemini 3+).
+        request_timeout_s: HTTP deadline for each generateContent call (seconds).
+        max_retries: Google SDK retries; use ``1`` so model-chain fallback owns retries.
 
     Returns:
         ChatGoogleGenerativeAI: Configured Gemini client.
@@ -134,6 +138,9 @@ def build_gemini_chat_model(
         kwargs["top_p"] = top_p
     if thinking_level is not None:
         kwargs["thinking_level"] = thinking_level
+    if request_timeout_s is not None:
+        kwargs["timeout"] = request_timeout_s
+    kwargs["max_retries"] = max(1, max_retries)
 
     if _use_vertex_ai():
         kwargs["credentials"] = build_google_credentials(path=google_credentials_path)
@@ -241,6 +248,11 @@ def build_summarization_gemini_model(
         or os.getenv("SUMMARIZATION_GEMINI_MODEL", _DEFAULT_SUMMARIZATION_GEMINI_MODEL)
     ).strip()
     output_tokens = max_tokens or int(os.getenv("SUMMARIZATION_MAX_TOKENS", "1024"))
+    gemini_timeout_raw = os.getenv("GEMINI_REQUEST_TIMEOUT_S", "").strip()
+    if gemini_timeout_raw:
+        summarization_timeout_s = float(gemini_timeout_raw)
+    else:
+        summarization_timeout_s = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"))
     return build_gemini_chat_model(
         model=model_name,
         temperature=0.0,
@@ -250,6 +262,8 @@ def build_summarization_gemini_model(
         google_location=google_location,
         gemini_api_key=gemini_api_key,
         top_p=0.95,
+        request_timeout_s=summarization_timeout_s,
+        max_retries=int(os.getenv("GEMINI_MAX_RETRIES", "1")),
     )
 
 

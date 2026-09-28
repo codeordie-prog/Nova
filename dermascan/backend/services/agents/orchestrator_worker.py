@@ -24,6 +24,7 @@ from dermascan.shared.load_env import bootstrap_env
 from typing import List, Dict, Any, Callable, Optional
 from pydantic import BaseModel
 import redis
+from redis.exceptions import LockError, LockNotOwnedError
 
 
 from dermascan.backend.services.tools.orchestrator.orchestrator_tools import (
@@ -43,8 +44,10 @@ from dermascan.backend.services.agents.build import (
 )
 from dermascan.backend.services.agents.product_rules_signal_helper import (
     run_product_signal_rules_flow,
+    run_product_signal_rules_flow_index_ready,
     run_skin_signal_rules_flow,
 )
+from dermascan.backend.services.agents.rules_index_jobs import ORCHESTRATOR_SIGNAL_TYPE_INDEX_READY
 from dermascan.ai_service.postprocessing.consent_escalation import append_escalation_offer_to_reply
 from dermascan.shared.concise_report_format import dermatologist_connection_guidance
 from dermascan.ai_service.postprocessing.escalation import resolve_client_message_for_signal
@@ -64,6 +67,7 @@ from dermascan.shared.delivery_context import (
 from dermascan.shared.intake_session_store import (
     IntakeSessionStoreError,
     archive_intake_session,
+    delete_intake_session,
     load_archived_intake_session,
     load_intake_session,
 )
@@ -72,13 +76,20 @@ from dermascan.shared.redis_stability import (
     get_redis_client,
     run_with_redis_retries,
 )
+from dermascan.shared.whatsapp_platform_message_id import resolve_channel_reply_target
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware, ToolCallLimitMiddleware, wrap_model_call, ModelRequest, ModelResponse
 from dermascan.backend.services.agents.prompts.orchestrator_prompt import system_prompt
 from dermascan.backend.services.agents import reclaim_logic
+from dermascan.backend.services.agents.heartbeat import (
+    compute_heartbeat_interval_sec,
+    start_stream_heartbeat,
+)
 from dermascan.backend.services.agents.model_fallback_chain import (
+    GEMINI_MAX_RETRIES,
+    GEMINI_REQUEST_TIMEOUT_S,
     ModelChainRunner,
     MODEL_CHAIN_MAX_RETRIES,
     MODEL_CHAIN_RETRY_DELAY_S,
@@ -286,6 +297,39 @@ INFLIGHT_WAIT_POLL_MS: int = max(50, int(os.getenv("ORCHESTRATOR_INFLIGHT_WAIT_P
 CLIENT_LOCK_KEY_PREFIX: str = os.getenv("ORCHESTRATOR_CLIENT_LOCK_KEY_PREFIX", "orchestrator:client_lock")
 CLIENT_LOCK_LEASE_SEC: int = max(30, int(os.getenv("ORCHESTRATOR_CLIENT_LOCK_LEASE_SEC", "180")))
 CLIENT_LOCK_WAIT_SEC: float = max(1.0, float(os.getenv("ORCHESTRATOR_CLIENT_LOCK_WAIT_SEC", "60")))
+
+# Cadence for refreshing a job message's pending idle time so the reclaim loop
+# does not race a slow-but-healthy turn. Defaults to a safe fraction of the
+# reclaim idle threshold and the lock lease; override only to tune load.
+JOB_HEARTBEAT_INTERVAL_SEC: float = max(
+    1.0,
+    float(
+        os.getenv("ORCHESTRATOR_JOB_HEARTBEAT_INTERVAL_SEC", "")
+        or compute_heartbeat_interval_sec(
+            reclaim_logic.PENDING_MIN_IDLE_MS, CLIENT_LOCK_LEASE_SEC
+        )
+    ),
+)
+# Same idea for signals (product/skin rules flows with slow ingredient indexing).
+# This eliminates the duplicate rules engine flows that were initially invoked by #reclaim logic when rules engine ran longer than idle time
+SIGNAL_HEARTBEAT_INTERVAL_SEC: float = max(
+    1.0,
+    float(
+        os.getenv("ORCHESTRATOR_SIGNAL_HEARTBEAT_INTERVAL_SEC", "")
+        or compute_heartbeat_interval_sec(reclaim_logic.PENDING_MIN_IDLE_MS)
+    ),
+)
+
+# User chat command that wipes the sender's conversation memory (LangGraph
+# checkpoint + conversation log + active intake session) without invoking the
+# agent. Skin audit snapshots and escalated cases are intentionally preserved.
+WIPE_MEMORY_COMMAND: str = (
+    os.getenv("ORCHESTRATOR_WIPE_MEMORY_COMMAND", "/wipe_memory").strip().lower()
+)
+WIPE_MEMORY_REPLY: str = os.getenv(
+    "ORCHESTRATOR_WIPE_MEMORY_REPLY",
+    "Your conversation memory has been reset. We are starting fresh - how can I help you today?",
+)
 
 # Initialize REDIS client
 _redis: redis.Redis = get_redis_client(decode_responses=True)
@@ -1125,6 +1169,7 @@ def _acquire_client_lock(client_id: str, request_id: str) -> Optional[Any]:
         timeout=CLIENT_LOCK_LEASE_SEC,
         blocking=True,
         blocking_timeout=CLIENT_LOCK_WAIT_SEC,
+        thread_local=False,
     )
     try:
         if lock.acquire():
@@ -1143,14 +1188,68 @@ def _release_client_lock(lock: Any, client_id: str) -> None:
     """
     Release a held per-client job lock. Best-effort.
 
+    A lock whose lease expired mid-turn (or was taken over) is an expected
+    condition for very long turns, so it is logged as a warning rather than
+    an error with a traceback.
+
     Args:
         lock: Lock handle returned by ``_acquire_client_lock``.
         client_id: Client identifier, for logging.
     """
     try:
         lock.release()
+    except LockNotOwnedError:
+        logger.warning(
+            "client lock lease expired before release (turn outlived lease): client_id=%s",
+            client_id,
+        )
     except Exception:
         logger.exception("client lock release failed: client_id=%s", client_id)
+
+
+def _start_client_lock_extender(lock: Any, client_id: str) -> threading.Event:
+    """
+    Keep a held client lock alive while a long turn is running.
+
+    A daemon thread extends the lease every third of ``CLIENT_LOCK_LEASE_SEC``
+    so turns that outlive the initial TTL (LLM retries, 429 fallback chains)
+    cannot lose the lock mid-turn — which would let a second worker start a
+    concurrent turn for the same client and corrupt the shared checkpoint.
+    Crash-safety is preserved: if the worker dies, extension stops and the
+    lock self-expires within one lease.
+
+    Args:
+        lock: Held lock handle returned by ``_acquire_client_lock``.
+        client_id: Client identifier, for logging.
+
+    Returns:
+        threading.Event: Stop signal; set it before releasing the lock.
+    """
+    stop = threading.Event()
+    interval_sec: float = max(5.0, CLIENT_LOCK_LEASE_SEC / 3.0)
+
+    def _extend_until_stopped() -> None:
+        while not stop.wait(interval_sec):
+            try:
+                lock.extend(CLIENT_LOCK_LEASE_SEC, replace_ttl=True)
+            except LockError:
+                logger.warning(
+                    "client lock extension failed (lease lost): client_id=%s",
+                    client_id,
+                )
+                return
+            except Exception:
+                logger.exception(
+                    "client lock extension error: client_id=%s", client_id
+                )
+                return
+
+    threading.Thread(
+        target=_extend_until_stopped,
+        name=f"client-lock-extender-{client_id}",
+        daemon=True,
+    ).start()
+    return stop
 
 
 # Build the orchestrator ingress context (text + optional multimodal image blocks)
@@ -1405,17 +1504,20 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         google_project=PROJECT_ID,
         google_location=LOCATION,
         gemini_api_key=GEMINI_API_KEY,
+        gemini_timeout_s=GEMINI_REQUEST_TIMEOUT_S,
+        gemini_max_retries=GEMINI_MAX_RETRIES,
     )
     primary_model: Any = model_chain[0][1]
 
     logger.info(
         "orchestrator model chain: %s (thinking_level=%s, max_tokens=%s, "
-        "chain_retries=%s, retry_delay_s=%s)",
+        "chain_retries=%s, retry_delay_s=%s, gemini_timeout_s=%s)",
         " -> ".join(name for name, _ in model_chain),
         ORCHESTRATOR_GEMINI_THINKING_LEVEL,
         ORCHESTRATOR_MAX_TOKENS,
         MODEL_CHAIN_MAX_RETRIES,
         MODEL_CHAIN_RETRY_DELAY_S,
+        GEMINI_REQUEST_TIMEOUT_S,
     )
 
     chain_runner = ModelChainRunner(
@@ -1461,6 +1563,8 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         google_project=PROJECT_ID,
         google_location=LOCATION,
         gemini_api_key=GEMINI_API_KEY,
+        gemini_timeout_s=GEMINI_REQUEST_TIMEOUT_S,
+        gemini_max_retries=GEMINI_MAX_RETRIES,
         label="summarization",
     )
 
@@ -1672,6 +1776,7 @@ def _start_reclaim_thread(
     return thread
 
 
+
 def _pending_task_description(payload_json: str) -> str:
     """
     Describe the blocked request so it can be offered back after payment.
@@ -1712,6 +1817,78 @@ def _pending_task_description(payload_json: str) -> str:
     return "a request"
 
 
+def _maybe_handle_wipe_memory(
+    *,
+    msg_id: str,
+    payload_json: str,
+    request_id: str,
+    case_id: str,
+    client_id: str,
+    channel: str,
+) -> bool:
+    """
+    Handle the ``/wipe_memory`` user command without invoking the agent.
+
+    Deletes the client's LangGraph checkpoint, conversation log, and active
+    intake session, then queues a fixed confirmation reply and acks the
+    stream message. Skin audit snapshots and escalated cases are preserved.
+
+    Args:
+        msg_id: Job stream message id (acked when the command is handled).
+        payload_json: Raw ingress payload JSON for this turn.
+        request_id: Current request id.
+        case_id: Current case id.
+        client_id: Conversation thread identifier to wipe.
+        channel: Ingress channel for the confirmation reply.
+
+    Returns:
+        bool: True when the message was the wipe command and was fully handled.
+    """
+    try:
+        payload_obj: dict[str, Any] = json.loads(payload_json)
+    except Exception:
+        return False
+    text = str(((payload_obj.get("content") or {}).get("text") or "")).strip().lower()
+    if text != WIPE_MEMORY_COMMAND:
+        return False
+
+    logger.warning(
+        "wipe_memory command received: client_id=%s request_id=%s",
+        client_id, request_id,
+    )
+    if _checkpointer is not None:
+        try:
+            delete_checkpoint_thread(_checkpointer, client_id)
+        except Exception:
+            logger.exception("wipe_memory: checkpoint delete failed: client_id=%s", client_id)
+    try:
+        _redis.delete(_conversation_log_key(client_id))
+    except Exception:
+        logger.exception("wipe_memory: conversation log delete failed: client_id=%s", client_id)
+    try:
+        delete_intake_session(client_id, redis_client=_redis)
+    except Exception:
+        logger.exception("wipe_memory: intake session delete failed: client_id=%s", client_id)
+    # A deliberate wipe must not trigger the post-reset context restoration
+    # (which would re-inject a recap of the conversation the user just wiped).
+    _clear_checkpoint_reset(client_id)
+
+    _enqueue_outbound(
+        client_id=client_id,
+        case_id=case_id,
+        channel=channel,
+        request_id=request_id,
+        text=WIPE_MEMORY_REPLY,
+        kind="job_reply",
+        must_deliver=True,
+    )
+    _redis.xack(ORCHESTRATOR_JOB_STREAM, ORCHESTRATOR_CONSUMER_GROUP, msg_id)
+    _redis.xdel(ORCHESTRATOR_JOB_STREAM, msg_id)
+    reclaim_logic.mark_processed(ORCHESTRATOR_JOB_STREAM, msg_id)
+    return True
+
+
+
 def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> None:
     """
     Process a message from the orchestrator job stream.
@@ -1724,8 +1901,12 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
     request_id = str(fields.get("request_id") or "")
     case_id = str(fields.get("case_id") or request_id)
     client_id = str(fields.get("client_id") or "anonymous")
-    message_id = str(fields.get("message_id") or request_id)
+    stream_message_id = str(fields.get("message_id") or "").strip()
+    message_id = stream_message_id or request_id
     channel = str(fields.get("channel") or "whatsapp")
+    reply_target = resolve_channel_reply_target(
+        channel=channel, message_id=stream_message_id
+    )
     username = str(fields.get("username") or "").strip()
     payload_json = str(fields.get("payload") or "{}")
 
@@ -1739,11 +1920,34 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
     client_lock = _acquire_client_lock(client_id, request_id)
     if client_lock is None:
         return
+    lock_extender_stop = _start_client_lock_extender(client_lock, client_id)
+    # Keep this job message's pending idle time fresh so the reclaim loop does
+    # not treat a healthy long turn as a dead worker and race it.
+    heartbeat_stop = start_stream_heartbeat(
+        _redis,
+        stream=ORCHESTRATOR_JOB_STREAM,
+        group=ORCHESTRATOR_CONSUMER_GROUP,
+        consumer=ORCHESTRATOR_CONSUMER_NAME,
+        msg_id=msg_id,
+        interval_sec=JOB_HEARTBEAT_INTERVAL_SEC,
+    )
 
     reservation_id: Optional[str] = None
     billing_token: Optional[Any] = None
 
     try:
+        # User command turns bypass the agent entirely (e.g. /wipe_memory).
+        if _maybe_handle_wipe_memory(
+            msg_id=msg_id,
+            payload_json=payload_json,
+            request_id=request_id,
+            case_id=case_id,
+            client_id=client_id,
+            channel=channel,
+        ):
+            return
+
+
         if billing.billing_active():
             try:
                 account = billing.get_or_create_account(channel, client_id)
@@ -1967,7 +2171,7 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             text=reply,
             kind="job_reply",
             must_deliver=False,
-            reply_to_message_id=message_id,
+            reply_to_message_id=reply_target,
         )
 
         _redis.xack(ORCHESTRATOR_JOB_STREAM, ORCHESTRATOR_CONSUMER_GROUP, msg_id)
@@ -1987,7 +2191,7 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                 text=ORCHESTRATOR_FAILURE_REPLY,
                 kind="job_reply",
                 must_deliver=True,
-                reply_to_message_id=message_id,
+                reply_to_message_id=reply_target,
             )
         except Exception:
             logger.exception("failed to enqueue fallback reply: request_id=%s", request_id)
@@ -2031,6 +2235,8 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         if billing_token is not None:
             billing.billing_scope.reset(billing_token)
         _del_inflight("job", client_id)
+        heartbeat_stop.set()
+        lock_extender_stop.set()
         _release_client_lock(client_lock, client_id)
 
 
@@ -2234,8 +2440,17 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
     signal_id = str(fields.get("signal_id") or "").strip()
     signal_discriminator = signal_id or msg_id
     source_message_id = str(fields.get("message_id") or "").strip()
-    reply_to_message_id = (source_message_id if signal_type.startswith("diagnose_")
-    or signal_type.startswith("product_review_") else "")
+    reply_to_message_id = (
+        resolve_channel_reply_target(channel=channel, message_id=source_message_id) or ""
+    )
+    heartbeat_stop = start_stream_heartbeat(
+        _redis,
+        stream=ORCHESTRATOR_SIGNAL_STREAM,
+        group=ORCHESTRATOR_SIGNAL_CONSUMER_GROUP,
+        consumer=ORCHESTRATOR_SIGNAL_CONSUMER_NAME,
+        msg_id=msg_id,
+        interval_sec=SIGNAL_HEARTBEAT_INTERVAL_SEC,
+    )
 
     if not _try_claim_signal(signal_type, request_id, signal_discriminator):
         logger.info(
@@ -2281,6 +2496,8 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             },
         )
 
+        rules_result: dict[str, Any] = {}
+
         if signal_type.endswith("_physician_reviewed"):
             logger.info(
                 "processing physician-reviewed signal: request_id=%s case_id=%s signal_type=%s",
@@ -2297,6 +2514,33 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                 signal_type,
             )
             reply = escalation_reply
+        elif signal_type == ORCHESTRATOR_SIGNAL_TYPE_INDEX_READY:
+            logger.info(
+                "processing product index ready final pass: request_id=%s case_id=%s client_id=%s",
+                request_id,
+                case_id,
+                client_id,
+            )
+            rules_result = run_product_signal_rules_flow_index_ready(
+                fields=fields,
+                context=_read_conversation_log(client_id, 10),
+            )
+            if rules_result.get("skip_outbound"):
+                logger.info(
+                    "product final report duplicate suppressed: request_id=%s",
+                    request_id,
+                )
+                _redis.xack(ORCHESTRATOR_SIGNAL_STREAM, ORCHESTRATOR_SIGNAL_CONSUMER_GROUP, msg_id)
+                _redis.xdel(ORCHESTRATOR_SIGNAL_STREAM, msg_id)
+                reclaim_logic.mark_processed(ORCHESTRATOR_SIGNAL_STREAM, msg_id)
+                return
+            summary = str(rules_result.get("summary") or "").strip()
+            friendly_report = str(rules_result.get("user_friendly_report") or "").strip()
+            sources = rules_result.get("sources") or []
+            sources_text = "\n".join(str(item) for item in sources if str(item).strip())
+            primary_text = friendly_report or summary
+            reply = primary_text if not sources_text else f"{primary_text}\n\nSources:\n{sources_text}"
+
         elif signal_type.startswith("product_review_"):
             logger.info(
                 "processing product-review signal through rules flow: request_id=%s case_id=%s client_id=%s signal_type=%s",
@@ -2309,6 +2553,15 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                 fields=fields,
                 context=_read_conversation_log(client_id, 10),
             )
+            if rules_result.get("skip_outbound"):
+                logger.info(
+                    "product index interim already sent; acking signal: request_id=%s",
+                    request_id,
+                )
+                _redis.xack(ORCHESTRATOR_SIGNAL_STREAM, ORCHESTRATOR_SIGNAL_CONSUMER_GROUP, msg_id)
+                _redis.xdel(ORCHESTRATOR_SIGNAL_STREAM, msg_id)
+                reclaim_logic.mark_processed(ORCHESTRATOR_SIGNAL_STREAM, msg_id)
+                return
             summary = str(rules_result.get("summary") or "").strip()
             friendly_report = str(rules_result.get("user_friendly_report") or "").strip()
             sources = rules_result.get("sources") or []
@@ -2428,6 +2681,12 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                     aggregate_result.reason,
                 )
 
+        outbound_dedupe = signal_type
+        if signal_type == ORCHESTRATOR_SIGNAL_TYPE_INDEX_READY:
+            outbound_dedupe = f"{signal_type}:final"
+        elif signal_type.startswith("product_review_") and rules_result.get("defer_final_report"):
+            outbound_dedupe = f"{signal_type}:index_pending"
+
         _enqueue_outbound(
             client_id=client_id,
             case_id=case_id,
@@ -2437,7 +2696,7 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             kind="signal_update",
             must_deliver=True,
             reply_to_message_id=reply_to_message_id,
-            dedupe_discriminator=signal_type,
+            dedupe_discriminator=outbound_dedupe,
             confidence=signal_confidence or None,
             threshold=signal_threshold or None,
         )
@@ -2493,6 +2752,7 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
     finally:
         # Always clear the signal in-flight marker so any waiting job flow
         # unblocks promptly rather than waiting for TTL.
+        heartbeat_stop.set()
         _del_inflight("signal", client_id)
 
 

@@ -82,6 +82,23 @@ OPENAI_REASONING_MAX_TOKENS: int = max(
 OPENAI_REASONING_EFFORT: str = str(
     os.getenv("OPENAI_REASONING_EFFORT", "minimal")
 ).strip().lower()
+_PROVIDER_MAX_RETRIES_HARD_CAP: int = 3
+GEMINI_REQUEST_TIMEOUT_S: float = max(
+    1.0,
+    float(
+        os.getenv(
+            "GEMINI_REQUEST_TIMEOUT_S",
+            os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"),
+        )
+    ),
+)
+GEMINI_MAX_RETRIES: int = max(
+    1,
+    min(
+        _PROVIDER_MAX_RETRIES_HARD_CAP,
+        int(os.getenv("GEMINI_MAX_RETRIES", "1")),
+    ),
+)
 
 # Serialize tool calls to one per model step (OpenAI API flag + Gemini response trim).
 AGENT_DISABLE_PARALLEL_TOOL_CALLS: bool = os.getenv(
@@ -654,6 +671,8 @@ def build_model_chain_from_spec(
     google_project: str,
     google_location: str,
     gemini_api_key: str,
+    gemini_timeout_s: float | None = None,
+    gemini_max_retries: int | None = None,
 ) -> list[tuple[str, Any]]:
     """
     Materialize LangChain chat models for each entry in a chain spec.
@@ -671,12 +690,21 @@ def build_model_chain_from_spec(
         google_project: GCP project id.
         google_location: GCP location.
         gemini_api_key: Gemini API key (non-Vertex mode).
+        gemini_timeout_s: Per-request Gemini HTTP timeout; defaults to ``GEMINI_REQUEST_TIMEOUT_S``.
+        gemini_max_retries: Google SDK retries; default ``1`` (chain handles fallback).
 
     Returns:
         list[tuple[str, Any]]: Ordered ``(chain_name, chat_model)`` pairs.
     """
     if not openai_api_key:
         raise RuntimeError("OPENAI_API_KEY_QUTIS is required for the model chain")
+
+    resolved_gemini_timeout_s = (
+        gemini_timeout_s if gemini_timeout_s is not None else GEMINI_REQUEST_TIMEOUT_S
+    )
+    resolved_gemini_max_retries = (
+        gemini_max_retries if gemini_max_retries is not None else GEMINI_MAX_RETRIES
+    )
 
     chain: list[tuple[str, Any]] = []
     for provider, model_id in parse_model_chain_spec(chain_spec):
@@ -712,6 +740,8 @@ def build_model_chain_from_spec(
                     google_project=google_project,
                     google_location=google_location,
                     gemini_api_key=gemini_api_key,
+                    request_timeout_s=resolved_gemini_timeout_s,
+                    max_retries=resolved_gemini_max_retries,
                 ),
             )
         )
@@ -1273,6 +1303,8 @@ def build_chained_chat_model(
     google_project: str,
     google_location: str,
     gemini_api_key: str,
+    gemini_timeout_s: float | None = None,
+    gemini_max_retries: int | None = None,
     label: str = "summarization",
     max_retries: int = MODEL_CHAIN_MAX_RETRIES,
     retry_delay_s: float = MODEL_CHAIN_RETRY_DELAY_S,
@@ -1293,6 +1325,8 @@ def build_chained_chat_model(
         google_project: GCP project id.
         google_location: GCP location.
         gemini_api_key: Gemini API key.
+        gemini_timeout_s: Gemini HTTP timeout override.
+        gemini_max_retries: Gemini SDK retry override.
         label: Operation label for logs.
         max_retries: Full-chain retries after all models fail.
         retry_delay_s: Delay between full-chain retries.
@@ -1313,6 +1347,8 @@ def build_chained_chat_model(
         google_project=google_project,
         google_location=google_location,
         gemini_api_key=gemini_api_key,
+        gemini_timeout_s=gemini_timeout_s,
+        gemini_max_retries=gemini_max_retries,
     )
     runner = ModelChainRunner(
         model_chain,

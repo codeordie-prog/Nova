@@ -7,18 +7,29 @@ from dermascan.shared.load_env import bootstrap_env
 bootstrap_env()
 
 import logging
+import os
 import signal
 import threading
 import time
+from functools import partial
 from typing import Callable
 
 from dermascan.backend.services.agents.billing_worker import run_worker_forever as run_billing_worker
 from dermascan.backend.services.agents.escalation_worker import run_worker_forever as run_escalation_worker
 from dermascan.backend.services.agents.orchestrator_worker import run_worker_forever as run_orchestrator_worker
 from dermascan.backend.services.agents.outbound_sender_worker import run_worker_forever as run_outbound_sender_worker
-from dermascan.billing.flags import billing_active, validate_billing_flags
+from dermascan.billing.flags import billing_active, billing_enabled, validate_billing_flags
 from dermascan.billing.sweeper import start_billing_sweeper_thread
 from dermascan.shared.logger import get_logger
+
+
+def _rules_index_worker_enabled() -> bool:
+    return os.getenv("RULES_INDEX_WORKER_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 logger = get_logger("do_work")
@@ -48,8 +59,15 @@ def main() -> None:
         ("orchestrator", run_orchestrator_worker),
         ("escalation", run_escalation_worker),
         ("outbound_sender", run_outbound_sender_worker),
-        ("billing", run_billing_worker),
     ]
+    if billing_enabled():
+        workers.append(
+            ("billing", partial(run_billing_worker, stop_event)),
+        )
+    if _rules_index_worker_enabled():
+        from dermascan.backend.services.agents.indexing_worker import run_worker_forever as run_rules_index_worker
+
+        workers.append(("rules_index", run_rules_index_worker))
 
     threads: list[threading.Thread] = []
     for name, worker_fn in workers:
@@ -62,9 +80,10 @@ def main() -> None:
         thread.start()
         threads.append(thread)
 
+    started = ", ".join(name for name, _ in workers)
     logger.info(
-        "all worker threads started: orchestrator, escalation, outbound, billing "
-        "(knowledge + medgemma excluded)"
+        "all worker threads started: %s (knowledge + medgemma excluded unless enabled above)",
+        started,
     )
 
     def _handle_shutdown(_sig: int, _frame: object) -> None:
