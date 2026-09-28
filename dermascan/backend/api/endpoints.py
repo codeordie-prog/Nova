@@ -1,4 +1,8 @@
 """
+Author: Dermascan Team
+Date: 2026-09-24
+License: MIT
+
 Backend API endpoint drafts for orchestrator request intake.
 
 These are contract-first placeholders and intentionally contain no implementation.
@@ -53,7 +57,16 @@ from dermascan.shared.escalation_image import (
     resolve_escalation_image_blob_path,
 )
 from dermascan.shared.firebase_storage import upload_client_image, download_client_image_bytes_by_path
+from dermascan.shared.whatsapp_ingress_dedupe import (
+    claim_whatsapp_ingress_message,
+    whatsapp_ingress_seen_key,
+)
+from dermascan.shared.whatsapp_turn_media import (
+    fetch_turn_media_bytes,
+    is_whatsapp_protected_media_url,
+)
 from dermascan.shared.global_rate_limiter import _enforce_global_rate_limit
+from dermascan.shared.redis_stability import get_redis_client
 from dermascan.shared.hmac_auth import SIGNATURE_HEADER, TIMESTAMP_HEADER, verify as verify_hmac
 from dermascan.shared.logger import get_logger
 from dermascan.shared.queue_depth_manager import _wait_for_queue_capacity
@@ -89,9 +102,9 @@ _EVENTS_STREAM: str = os.getenv("EVENTS_STREAM", "events:stream")
 _ESCALATION_CLOSED_TTL_SEC: int = 7 * 24 * 3600
 _BILLING_JOB_STREAM: str = os.getenv("BILLING_JOB_STREAM", "billing:jobs")
 
-# Initialize redis client
-_redis = redis.Redis.from_url(_REDIS_URL, decode_responses=True) if _REDIS_URL else None
-_redis_binary = redis.Redis.from_url(_REDIS_URL, decode_responses=False) if _REDIS_URL else None
+# Shared pooled clients (same caps as workers; avoids extra from_url pools).
+_redis = get_redis_client(decode_responses=True) if _REDIS_URL else None
+_redis_binary = get_redis_client(decode_responses=False) if _REDIS_URL else None
 
 
 def _validate_image_bytes(image_bytes: bytes) -> None:
@@ -195,6 +208,91 @@ def _store_whatsapp_image_attachment(
     return source, size_bytes
 
 
+def _resolve_whatsapp_image_attachment_source(
+    *,
+    client_id: str,
+    message_id: str,
+    media_id: str,
+    media_ref: str,
+    image_url: str,
+    image_b64: str,
+    mime_type: str,
+) -> tuple[AttachmentSource, int | None]:
+    """
+    Resolve a WhatsApp image to a durable attachment source for orchestrator ingress.
+
+    Turn/Meta webhooks often include ``lookaside.fbsbx.com`` URLs that require bearer
+    auth; when ``media_id`` is present those are fetched via Turn and stored in Firebase.
+
+    Args:
+        client_id: Sender wa_id.
+        message_id: Inbound wamid.
+        media_id: Cloud API media id from ``image.id``.
+        media_ref: Pre-resolved sidecar blob ref when present.
+        image_url: Optional CDN URL from the webhook.
+        image_b64: Optional inline base64 from a sidecar.
+        mime_type: Declared MIME type.
+
+    Returns:
+        Attachment source and optional size in bytes.
+
+    Raises:
+        HTTPException: On invalid bytes, fetch failure, or missing resolvable media.
+    """
+    if image_b64:
+        try:
+            image_bytes: bytes = base64.b64decode(image_b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid image base64") from exc
+        _validate_image_bytes(image_bytes)
+        source, size_bytes = _store_whatsapp_image_attachment(
+            client_id=client_id,
+            message_id=message_id,
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+        )
+        return source, size_bytes
+
+    if media_ref:
+        return AttachmentSource(kind="blob_ref", value=media_ref), None
+
+    protected_url = is_whatsapp_protected_media_url(image_url)
+    should_fetch = bool(media_id) and (protected_url or not image_url)
+    if should_fetch:
+        try:
+            fetched_bytes, fetched_mime = fetch_turn_media_bytes(media_id)
+        except (RuntimeError, ValueError) as exc:
+            logger.exception(
+                "Turn media fetch failed: media_id=%s message_id=%s",
+                media_id,
+                message_id,
+            )
+            raise HTTPException(status_code=502, detail=f"Failed to fetch WhatsApp media: {exc}") from exc
+        resolved_mime = fetched_mime if fetched_mime.startswith("image/") else mime_type
+        _validate_image_bytes(fetched_bytes)
+        source, size_bytes = _store_whatsapp_image_attachment(
+            client_id=client_id,
+            message_id=message_id,
+            image_bytes=fetched_bytes,
+            mime_type=resolved_mime,
+        )
+        return source, size_bytes
+
+    if image_url.lower().startswith(("http://", "https://")) and not protected_url:
+        return AttachmentSource(kind="url", value=image_url), None
+
+    if protected_url and not media_id:
+        raise HTTPException(
+            status_code=400,
+            detail="WhatsApp image URL requires auth; missing image.id for Turn media fetch",
+        )
+
+    if media_id:
+        return AttachmentSource(kind="whatsapp_media_id", value=media_id), None
+
+    return AttachmentSource(kind="whatsapp_media_id", value="unknown"), None
+
+
 async def _enforce_ingress_capacity(*, cost: int = 1) -> None:
     """
     Apply global RPM and orchestrator queue-depth gates before enqueueing.
@@ -244,6 +342,17 @@ def _extract_whatsapp_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
         A list of message objects in source order.
     """
     out: list[dict[str, Any]] = []
+
+    # Turn.io inbound webhooks use Meta flat shape: messages[] at top level
+    # (not wrapped in entry[].changes[].value). See Turn webhook docs.
+    top_level_messages = payload.get("messages")
+    if isinstance(top_level_messages, list):
+        for raw_message in top_level_messages:
+            if isinstance(raw_message, dict) and raw_message:
+                out.append(raw_message)
+        if out:
+            return out
+
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {})
@@ -420,18 +529,20 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
         media_id = str(raw_attachment.get("media_id") or "")
         image_b64 = str(raw_attachment.get("base64") or raw_attachment.get("data_base64") or raw_attachment.get("image_base64") or "")
 
-        if image_b64:
-            try:
-                image_bytes: bytes = base64.b64decode(image_b64, validate=True)
-            except (binascii.Error, ValueError) as exc:
-                raise HTTPException(status_code=400, detail="Invalid image base64") from exc
-            _validate_image_bytes(image_bytes)
-            source, size_bytes = _store_whatsapp_image_attachment(
+        if attachment_type == "image":
+            source, resolved_size = _resolve_whatsapp_image_attachment_source(
                 client_id=client_id,
                 message_id=message_id,
-                image_bytes=image_bytes,
+                media_id=media_id or attachment_id,
+                media_ref=media_ref,
+                image_url=attachment_url,
+                image_b64=image_b64,
                 mime_type=mime_type,
             )
+            size_bytes = resolved_size if resolved_size is not None else raw_attachment.get("size_bytes")
+        elif image_b64:
+            source = AttachmentSource(kind="base64", value=image_b64)
+            size_bytes = raw_attachment.get("size_bytes")
         elif media_ref:
             source = AttachmentSource(kind="blob_ref", value=media_ref)
             size_bytes = raw_attachment.get("size_bytes")
@@ -468,27 +579,16 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
         mime_type: str = str(image_obj.get("mime_type") or "image/*")
         image_b64: str = str(image_obj.get("base64") or image_obj.get("data_base64") or "")
 
-        if image_b64:
-            try:
-                image_bytes: bytes = base64.b64decode(image_b64, validate=True)
-            except (binascii.Error, ValueError) as exc:
-                raise HTTPException(status_code=400, detail="Invalid image base64") from exc
-            _validate_image_bytes(image_bytes)
-            source, size_bytes = _store_whatsapp_image_attachment(
-                client_id=client_id,
-                message_id=message_id,
-                image_bytes=image_bytes,
-                mime_type=mime_type,
-            )
-        elif media_ref:
-            source = AttachmentSource(kind="blob_ref", value=media_ref)
-            size_bytes = None
-        elif image_url.lower().startswith(("http://", "https://")):
-            source = AttachmentSource(kind="url", value=image_url)
-            size_bytes = image_obj.get("file_size")
-        else:
-            source = AttachmentSource(kind="whatsapp_media_id", value=media_id or "unknown")
-            size_bytes = None
+        source, resolved_size = _resolve_whatsapp_image_attachment_source(
+            client_id=client_id,
+            message_id=message_id,
+            media_id=media_id,
+            media_ref=media_ref,
+            image_url=image_url,
+            image_b64=image_b64,
+            mime_type=mime_type,
+        )
+        size_bytes = resolved_size if resolved_size is not None else image_obj.get("file_size")
 
         attachments.append(
             AttachmentItem(
@@ -900,8 +1000,30 @@ async def whatsapp_webhook(
     await _enforce_ingress_capacity(cost=len(normalized_messages))
 
     request_ids: list[str] = []
+    skipped_duplicates: int = 0
+
+    # dedupe messages to avoid processing the same message multiple times through retries
+    # Dedupe is done with the wamid (whatsapp message id) as the key
     try:
         for normalized in normalized_messages:
+
+            # get the wamid (whatsapp message id)
+            wamid = str(normalized.message_id or "").strip()
+
+            # get the dedupe key
+            dedupe_key = whatsapp_ingress_seen_key(wamid) if wamid else ""
+            if wamid and not claim_whatsapp_ingress_message(
+                redis_client=_redis,
+                message_id=wamid,
+                request_id=normalized.request_id,
+            ):
+                skipped_duplicates += 1
+                logger.info(
+                    "whatsapp ingress duplicate skipped: message_id=%s request_id=%s",
+                    wamid,
+                    normalized.request_id,
+                )
+                continue
             stream_fields = enrich_stream_fields(
                 {
                     "request_id": normalized.request_id,
@@ -912,14 +1034,25 @@ async def whatsapp_webhook(
                     "payload": _payload_content_json(normalized),
                 }
             )
-            msg_id = str(
-                _redis.xadd(
-                    _ORCHESTRATOR_JOB_STREAM,
-                    stream_fields,
-                    maxlen=_WORKERS_STREAM_MAXLEN,
-                    approximate=True,
+            try:
+                msg_id = str(
+                    _redis.xadd(
+                        _ORCHESTRATOR_JOB_STREAM,
+                        stream_fields,
+                        maxlen=_WORKERS_STREAM_MAXLEN,
+                        approximate=True,
+                    )
                 )
-            )
+            except redis.RedisError:
+                if dedupe_key:
+                    try:
+                        _redis.delete(dedupe_key)
+                    except redis.RedisError:
+                        logger.exception(
+                            "failed to clear whatsapp ingress dedupe after xadd error: message_id=%s",
+                            wamid,
+                        )
+                raise
             record_stream_produce(
                 stream=_ORCHESTRATOR_JOB_STREAM,
                 msg_id=msg_id,
@@ -930,6 +1063,12 @@ async def whatsapp_webhook(
     except redis.RedisError as exc:
         raise HTTPException(status_code=503, detail="Redis unavailable") from exc
 
+    if not request_ids and skipped_duplicates:
+        return {
+            "status": "already_processed",
+            "queued_count": 0,
+            "request_ids": [],
+        }
     return {"status": "queued", "queued_count": len(request_ids), "request_ids": request_ids}
 
 
