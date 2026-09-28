@@ -84,3 +84,9 @@ deploy/scripts/guidelines.md
 
 # Local run traces (LOG_FILE)
 logs/
+
+# Local Cloud SQL / billing terminal helpers (often contain passwords)
+.pgpass
+dermascan/billing/cloud_sql_session.sh
+dermascan/billing/billing.md
+dermascan/billing/*.local.sh
