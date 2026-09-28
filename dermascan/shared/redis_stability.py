@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Callable, TypeVar
 
 import redis
+from redis.connection import BlockingConnectionPool
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError
 from redis.exceptions import TimeoutError as RedisTimeoutError
@@ -44,6 +45,8 @@ class RedisStabilityConfig:
         health_check_interval_s: Periodic health-check interval in seconds.
         socket_keepalive: Whether OS keepalive is enabled.
         max_connections: Max size of Redis connection pool.
+        pool_blocking: When True, wait for a free pool slot instead of failing immediately.
+        pool_block_timeout_s: Seconds to wait for a pool slot; None blocks until one is free.
         retry_on_timeout: Whether timeout errors are retried by redis-py.
         retry_attempts: Number of operation-level retries in helper wrappers.
         retry_base_delay_s: Initial retry backoff in seconds.
@@ -56,7 +59,9 @@ class RedisStabilityConfig:
     socket_connect_timeout_s: float = 5.0
     health_check_interval_s: int = 30
     socket_keepalive: bool = True
-    max_connections: int = 200
+    max_connections: int = 32
+    pool_blocking: bool = True
+    pool_block_timeout_s: float | None = 20.0
     retry_on_timeout: bool = True
     retry_attempts: int = 4
     retry_base_delay_s: float = 0.25
@@ -85,7 +90,7 @@ def load_redis_stability_config(*, decode_responses: bool = True) -> RedisStabil
     socket_timeout_s: float = float(os.getenv("REDIS_SOCKET_TIMEOUT_S", "10"))
     socket_connect_timeout_s: float = float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT_S", "5"))
     health_check_interval_s: int = int(os.getenv("REDIS_HEALTH_CHECK_INTERVAL_S", "30"))
-    max_connections: int = int(os.getenv("REDIS_MAX_CONNECTIONS", "200"))
+    max_connections: int = int(os.getenv("REDIS_MAX_CONNECTIONS", "32"))
     retry_attempts: int = int(os.getenv("REDIS_OPERATION_RETRY_ATTEMPTS", "4"))
     retry_base_delay_s: float = float(os.getenv("REDIS_OPERATION_RETRY_BASE_S", "0.25"))
     retry_max_delay_s: float = float(os.getenv("REDIS_OPERATION_RETRY_MAX_S", "2.0"))
@@ -101,6 +106,18 @@ def load_redis_stability_config(*, decode_responses: bool = True) -> RedisStabil
         "yes",
         "on",
     }
+    pool_blocking: bool = os.getenv("REDIS_POOL_BLOCKING", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    pool_block_timeout_raw: str = os.getenv("REDIS_POOL_BLOCK_TIMEOUT_S", "20").strip().lower()
+    pool_block_timeout_s: float | None
+    if pool_block_timeout_raw in {"", "none", "forever", "inf", "infinite"}:
+        pool_block_timeout_s = None
+    else:
+        pool_block_timeout_s = float(pool_block_timeout_raw)
 
     if socket_timeout_s <= 0 or socket_connect_timeout_s <= 0:
         raise ValueError("Redis socket timeout values must be > 0")
@@ -112,6 +129,8 @@ def load_redis_stability_config(*, decode_responses: bool = True) -> RedisStabil
         raise ValueError("REDIS_OPERATION_RETRY_ATTEMPTS must be >= 1")
     if retry_base_delay_s <= 0 or retry_max_delay_s <= 0:
         raise ValueError("Redis retry delays must be > 0")
+    if pool_block_timeout_s is not None and pool_block_timeout_s <= 0:
+        raise ValueError("REDIS_POOL_BLOCK_TIMEOUT_S must be > 0, or none/forever")
 
     return RedisStabilityConfig(
         redis_url=redis_url,
@@ -121,6 +140,8 @@ def load_redis_stability_config(*, decode_responses: bool = True) -> RedisStabil
         health_check_interval_s=health_check_interval_s,
         socket_keepalive=socket_keepalive,
         max_connections=max_connections,
+        pool_blocking=pool_blocking,
+        pool_block_timeout_s=pool_block_timeout_s,
         retry_on_timeout=retry_on_timeout,
         retry_attempts=retry_attempts,
         retry_base_delay_s=retry_base_delay_s,
@@ -139,15 +160,27 @@ def create_redis_client(config: RedisStabilityConfig) -> redis.Redis:
         redis.Redis: Configured Redis client instance.
     """
 
+    pool_kwargs = {
+        "decode_responses": config.decode_responses,
+        "socket_timeout": config.socket_timeout_s,
+        "socket_connect_timeout": config.socket_connect_timeout_s,
+        "health_check_interval": config.health_check_interval_s,
+        "socket_keepalive": config.socket_keepalive,
+        "max_connections": config.max_connections,
+    }
+
+    if config.pool_blocking:
+        pool = BlockingConnectionPool.from_url(
+            config.redis_url,
+            timeout=config.pool_block_timeout_s,
+            **pool_kwargs,
+        )
+        return redis.Redis(connection_pool=pool, retry_on_timeout=config.retry_on_timeout)
+
     return redis.Redis.from_url(
         config.redis_url,
-        decode_responses=config.decode_responses,
-        socket_timeout=config.socket_timeout_s,
-        socket_connect_timeout=config.socket_connect_timeout_s,
-        health_check_interval=config.health_check_interval_s,
-        socket_keepalive=config.socket_keepalive,
-        max_connections=config.max_connections,
         retry_on_timeout=config.retry_on_timeout,
+        **pool_kwargs,
     )
 
 
@@ -168,6 +201,21 @@ def get_redis_client(*, decode_responses: bool = True, refresh: bool = False) ->
         cfg: RedisStabilityConfig = load_redis_stability_config(decode_responses=decode_responses)
         _CLIENTS[decode_responses] = create_redis_client(cfg)
     return _CLIENTS[decode_responses]
+
+
+def is_redis_max_clients_error(exc: BaseException) -> bool:
+    """
+    Return True when Redis rejected a new connection because the server client
+    limit was reached. Retrying immediately makes exhaustion worse.
+
+    Args:
+        exc: Exception raised by redis-py.
+
+    Returns:
+        bool: True for max-clients / ERR max number of clients reached.
+    """
+    message = str(exc).lower()
+    return "max number of clients reached" in message or "maxclients" in message
 
 
 def _retry_delay_s(*, attempt_index: int, base_delay_s: float, max_delay_s: float) -> float:
@@ -225,6 +273,13 @@ def run_with_redis_retries(
             return operation()
         except (RedisConnectionError, RedisTimeoutError, OSError) as exc:
             last_error = exc
+            if is_redis_max_clients_error(exc):
+                logger.error(
+                    "redis client limit reached; not retrying: op=%s err=%s",
+                    operation_name,
+                    exc,
+                )
+                raise
             is_last_attempt: bool = attempt == max_attempts - 1
             if is_last_attempt:
                 logger.exception(
@@ -278,6 +333,7 @@ __all__ = [
     "check_redis_connectivity",
     "create_redis_client",
     "get_redis_client",
+    "is_redis_max_clients_error",
     "load_redis_stability_config",
     "run_with_redis_retries",
 ]

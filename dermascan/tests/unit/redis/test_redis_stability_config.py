@@ -66,6 +66,16 @@ class TestLoadRedisStabilityConfig:
         assert cfg.socket_keepalive is False
         assert cfg.retry_on_timeout is False
 
+    def test_pool_block_timeout_forever(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """REDIS_POOL_BLOCK_TIMEOUT_S=none yields a blocking pool with no wait cap."""
+        monkeypatch.setenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+        monkeypatch.setenv("REDIS_POOL_BLOCK_TIMEOUT_S", "none")
+
+        cfg = redis_stability.load_redis_stability_config()
+
+        assert cfg.pool_blocking is True
+        assert cfg.pool_block_timeout_s is None
+
 
 @pytest.mark.unit
 class TestCreateRedisClient:
@@ -77,6 +87,48 @@ class TestCreateRedisClient:
     ) -> None:
         """Pool size, timeouts, and keepalive are forwarded to from_url."""
         monkeypatch.setenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+        cfg = redis_stability.load_redis_stability_config()
+
+        mock_pool = MagicMock()
+        mock_client = MagicMock()
+        pool_kwargs = {
+            "decode_responses": cfg.decode_responses,
+            "socket_timeout": cfg.socket_timeout_s,
+            "socket_connect_timeout": cfg.socket_connect_timeout_s,
+            "health_check_interval": cfg.health_check_interval_s,
+            "socket_keepalive": cfg.socket_keepalive,
+            "max_connections": cfg.max_connections,
+        }
+        with patch.object(
+            redis_stability.BlockingConnectionPool,
+            "from_url",
+            return_value=mock_pool,
+        ) as from_url:
+            with patch.object(
+                redis_stability.redis,
+                "Redis",
+                return_value=mock_client,
+            ) as redis_ctor:
+                client = redis_stability.create_redis_client(cfg)
+
+        assert client is mock_client
+        from_url.assert_called_once_with(
+            cfg.redis_url,
+            timeout=cfg.pool_block_timeout_s,
+            **pool_kwargs,
+        )
+        redis_ctor.assert_called_once_with(
+            connection_pool=mock_pool,
+            retry_on_timeout=cfg.retry_on_timeout,
+        )
+
+    def test_create_redis_client_non_blocking_uses_from_url(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REDIS_POOL_BLOCKING=false keeps the legacy ConnectionPool via from_url."""
+        monkeypatch.setenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+        monkeypatch.setenv("REDIS_POOL_BLOCKING", "false")
         cfg = redis_stability.load_redis_stability_config()
 
         mock_client = MagicMock()
