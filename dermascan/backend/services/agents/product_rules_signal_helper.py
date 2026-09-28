@@ -30,6 +30,8 @@ from dermascan.ai_service.postprocessing.medgemma_structured_output import resol
 from dermascan.backend.services.agents.model_fallback_chain import (
     AGENT_INVOKE_MAX_RETRIES,
     AGENT_INVOKE_RETRY_DELAY_S,
+    GEMINI_MAX_RETRIES,
+    GEMINI_REQUEST_TIMEOUT_S,
     MODEL_CHAIN_MAX_RETRIES,
     MODEL_CHAIN_RETRY_DELAY_S,
     ModelChainRunner,
@@ -42,8 +44,21 @@ from dermascan.rules_engine.confidence.decision_confidence import (
     finalize_product_report_text,
     product_report_guidance_mode_instructions,
 )
+from dermascan.backend.services.agents.rules_index_jobs import (
+    RulesIndexScheduleContext,
+    build_product_index_pending_message,
+    claim_product_final_report_sent,
+    claim_product_index_pending_sent,
+    index_results_require_async_wait,
+    is_index_batch_timed_out,
+    load_product_index_context,
+    reconcile_orphan_index_batch,
+    rules_index_inline_enabled,
+    save_product_index_context,
+)
 from dermascan.rules_engine.engine.engine import RulesEngineRequest, SkinAudit, SkinContext
 from dermascan.rules_engine.engine.rules_engine import RulesEngine
+from dermascan.shared.redis_stability import get_redis_client
 from dermascan.shared.cosmetic_feature_flags import cosmetic_guidance_mode_active
 from dermascan.shared.cosmetic_profile import (
     is_skin_snapshot_fresh,
@@ -128,7 +143,6 @@ PRODUCT_LABEL_UNREADABLE_MESSAGE: str = os.getenv(
     "well-lit close-up of the ingredients label (text in focus and fully visible) so "
     "the specialist team can review it. This is informational only, not medical advice.",
 )
-
 # Define response models
 class IngredientExtractionResponse(BaseModel):
     """Structured response model for extracted ingredients from the product ingredient extraction agent."""
@@ -172,6 +186,8 @@ def _get_report_chain_runner() -> ModelChainRunner:
             google_project=GOOGLE_PROJECT_ID,
             google_location=GOOGLE_LOCATION,
             gemini_api_key=GEMINI_API_KEY,
+            gemini_timeout_s=GEMINI_REQUEST_TIMEOUT_S,
+            gemini_max_retries=GEMINI_MAX_RETRIES,
         )
         _report_chain_runner = ModelChainRunner(
             model_chain,
@@ -1107,8 +1123,54 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
         request.has_skin_context(),
     )
 
-    # Run rules engine process with the built request
-    result = rules_engine.process(request)
+    index_schedule = RulesIndexScheduleContext(
+        request_id=request_id,
+        case_id=case_id,
+        client_id=client_id,
+        message_id=message_id,
+        channel=channel,
+    )
+    precomputed_index_results = None
+    if not rules_index_inline_enabled():
+        precomputed_index_results = rules_engine.ensure_reports_exists(
+            extraction.ingredients,
+            index_schedule=index_schedule,
+        )
+        if index_results_require_async_wait(precomputed_index_results):
+            redis_client = get_redis_client(decode_responses=True)
+            save_product_index_context(
+                redis_client,
+                request_id,
+                {
+                    "rules_request": request.model_dump(),
+                    "signal_payload": payload,
+                    "personalization_mode": personalization_mode,
+                },
+            )
+            send_interim = claim_product_index_pending_sent(redis_client, request_id)
+            logger.info(
+                "product rules deferred for async CIR indexing: request_id=%s "
+                "queued_ingredients=%s send_interim=%s",
+                request_id,
+                sum(1 for item in precomputed_index_results if item.source == "queued"),
+                send_interim,
+            )
+            return {
+                "summary": "CIR reference indexing in progress for product review.",
+                "user_friendly_report": build_product_index_pending_message(product_name),
+                "sources": [],
+                "ingredients": extraction.ingredients,
+                "indexed_ingredients": [item.model_dump() for item in precomputed_index_results],
+                "report": {},
+                "personalization_mode": personalization_mode,
+                "defer_final_report": True,
+                "skip_outbound": not send_interim,
+            }
+
+    result = rules_engine.assess_product_review(
+        request,
+        indexed_results=precomputed_index_results,
+    )
     
     logger.info(
         "rules engine completed: request_id=%s indexed_ingredients=%s "
@@ -1153,6 +1215,145 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
         "confidence_tier": result.confidence_tier,
         "guidance_mode": result.guidance_mode,
         "confidence_components": dict(result.confidence_components),
+    }
+
+
+def run_product_signal_rules_flow_index_ready(
+    fields: dict[str, Any],
+    context: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Run the final product rules pass after async CIR indexing completes.
+
+    Loads the deferred snapshot from Redis, runs CIR + optional internet fallback,
+    and builds the user-facing safety report.
+
+    Args:
+        fields: Orchestrator signal fields (``product_review_index_ready``).
+        context: Recent conversation log entries for personalization.
+
+    Returns:
+        dict[str, Any]: Same shape as ``run_product_signal_rules_flow`` for outbound.
+    """
+    payload = _safe_json_loads(str(fields.get("payload") or "{}"))
+    index_outcome = str(payload.get("index_outcome") or "success").strip().lower()
+    request_id = str(fields.get("request_id") or payload.get("request_id") or "")
+    case_id = str(fields.get("case_id") or payload.get("case_id") or request_id)
+    client_id = str(fields.get("client_id") or "anonymous")
+    message_id = str(fields.get("message_id") or request_id)
+    channel = str(fields.get("channel") or "whatsapp")
+    signal_confidence = extract_confidence_from_fields(fields)
+    signal_threshold = extract_threshold_from_fields(fields)
+
+    redis_client = get_redis_client(decode_responses=True)
+    if not claim_product_final_report_sent(redis_client, request_id):
+        logger.info(
+            "product final report already sent; skipping duplicate: request_id=%s",
+            request_id,
+        )
+        return {"skip_outbound": True, "final_product_report": True}
+
+    stored = load_product_index_context(redis_client, request_id)
+    if is_index_batch_timed_out(stored):
+        logger.warning(
+            "product index batch exceeded timeout before final pass: request_id=%s timeout_s=%s",
+            request_id,
+            stored.get("enqueued_at_ms"),
+        )
+    reconcile_orphan_index_batch(redis_client, request_id)
+
+    rules_request_raw = stored.get("rules_request")
+    if not isinstance(rules_request_raw, dict):
+        logger.error(
+            "missing product index context for final pass: request_id=%s case_id=%s",
+            request_id,
+            case_id,
+        )
+        return {
+            "summary": "Product safety review could not be resumed.",
+            "user_friendly_report": _product_report_fallback_message("personalized"),
+            "sources": [],
+            "ingredients": [],
+            "indexed_ingredients": [],
+            "report": {},
+            "final_product_report": True,
+        }
+
+    request = RulesEngineRequest.model_validate(rules_request_raw)
+    product_name = str(request.product_name or "").strip()
+    description = str(request.description or "").strip()
+    personalization_mode = normalize_personalization_mode(
+        str(stored.get("personalization_mode") or request.personalization_mode)
+    )
+    delivery = load_delivery_context(case_id, client_id)
+
+    trace_config = build_invoke_config(
+        thread_id=client_id,
+        checkpoint_ns="signal_rules:product_final",
+        run_name="signal_rules:product_index_ready",
+        channel=channel,
+        flow="signal",
+        client_id=client_id,
+        request_id=request_id,
+        case_id=case_id,
+        message_id=message_id,
+        extra_metadata={
+            "review_type": "product",
+            "index_outcome": index_outcome,
+            "personalization_mode": personalization_mode,
+            **({"confidence": signal_confidence} if signal_confidence else {}),
+            **({"threshold": signal_threshold} if signal_threshold else {}),
+        },
+        extra_tags=["product", "index_ready"],
+    )
+
+    logger.info(
+        "product index ready final pass: request_id=%s case_id=%s index_outcome=%s",
+        request_id,
+        case_id,
+        index_outcome,
+    )
+
+    rules_engine = get_rules_engine()
+    result = rules_engine.assess_product_review(
+        request,
+        index_outcome=index_outcome,
+    )
+    if isinstance(result.report, dict) and result.report.get("evidence_mode") == "internet_fallback":
+        logger.info(
+            "product final report used internet fallback: request_id=%s index_outcome=%s",
+            request_id,
+            index_outcome,
+        )
+
+    user_friendly_report = build_user_friendly_report(
+        product_name=product_name,
+        description=description,
+        ingredients=request.ingredients,
+        report=result.report,
+        sources=result.sources,
+        context=context,
+        delivery=delivery,
+        invoke_config=trace_config,
+        personalization_mode=personalization_mode,
+        guidance_mode=result.guidance_mode,
+        apply_guidance_mode=cosmetic_guidance_mode_active(),
+    )
+    outbound_sources = _limit_sources(result.sources)
+
+    return {
+        "summary": result.summary,
+        "user_friendly_report": user_friendly_report,
+        "sources": outbound_sources,
+        "ingredients": request.ingredients,
+        "indexed_ingredients": [item.model_dump() for item in result.indexed_ingredients],
+        "report": result.report,
+        "personalization_mode": personalization_mode,
+        "decision_confidence": result.decision_confidence,
+        "confidence_tier": result.confidence_tier,
+        "guidance_mode": result.guidance_mode,
+        "confidence_components": dict(result.confidence_components),
+        "final_product_report": True,
     }
 
 

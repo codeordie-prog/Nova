@@ -32,6 +32,13 @@ from dermascan.rules_engine.knowledge_agent.knowledge_agent import (
     internet_search,
 )
 from dermascan.rules_engine.knowledge_agent.prompt import system_prompt
+from dermascan.backend.services.agents.rules_index_jobs import (
+    RulesIndexScheduleContext,
+    build_index_job_payload,
+    enqueue_rules_index_job,
+    register_index_batch_pending,
+    rules_index_inline_enabled,
+)
 from dermascan.rules_engine.vector_store.build_vectorstore import VectorStore
 from dermascan.shared.load_env import bootstrap_env
 from dermascan.shared.logger import get_logger
@@ -53,6 +60,27 @@ _POSTGRES_PASSWORD_ENV_KEYS: tuple[str, ...] = (
     "CLOUD_POSTGRES_PASSWORD",
     "postgres_password",
 )
+
+
+def _extract_urls_from_text(text: str) -> list[str]:
+    """
+    Extract HTTP(S) URLs from free text or JSON-serialized search payloads.
+
+    Args:
+        text: Raw search output.
+
+    Returns:
+        list[str]: De-duplicated URLs in discovery order.
+    """
+    if not text:
+        return []
+    urls = re.findall(r"https?://[^\s\"']+", text)
+    cleaned: list[str] = []
+    for url in urls:
+        trimmed = url.rstrip(").,;]>}").strip()
+        if trimmed and trimmed not in cleaned:
+            cleaned.append(trimmed)
+    return cleaned
 
 
 def _resolve_postgres_password() -> str:
@@ -367,21 +395,140 @@ class RulesEngine(Engine):
             cur.close()
             conn.close()
 
+    def _index_ingredient_sync(
+        self,
+        *,
+        ingredient: str,
+        normalized: str,
+        row: dict[str, Any],
+    ) -> IngredientIndexResult:
+        """
+        Download and index one CIR PDF synchronously (legacy inline path).
+
+        Args:
+            ingredient: Display ingredient name.
+            normalized: Normalized lookup key.
+            row: Postgres CIR report row.
+
+        Returns:
+            IngredientIndexResult: Success or ``index_failed`` outcome.
+        """
+        ingredient_id = str(row.get("ingredient_id") or normalized)
+        try:
+            self.vector_store.index_pdf_from_firebase(
+                pdf_url=row["download_url"],
+                ingredient_id=ingredient_id,
+                cir_ingredient_name=row["cir_ingredient_name"] or ingredient,
+                function=row["function"] or "unknown",
+                report_url=row["report_url"],
+                attachment_url=row["attachment_url"] or row["download_url"],
+                storage_path=row["storage_path"] or row["download_url"],
+            )
+            self._mark_cached(normalized, ingredient_id=ingredient_id)
+            return IngredientIndexResult(
+                ingredient=ingredient,
+                normalized_name=normalized,
+                ingredient_id=ingredient_id,
+                indexed=True,
+                source="indexed_now",
+            )
+        except Exception as exc:
+            logger.exception("failed indexing ingredient=%s", ingredient)
+            return IngredientIndexResult(
+                ingredient=ingredient,
+                normalized_name=normalized,
+                ingredient_id=str(row.get("ingredient_id") or ""),
+                indexed=False,
+                source="index_failed",
+                notes=str(exc),
+            )
+
+    def _queue_ingredient_index(
+        self,
+        *,
+        ingredient: str,
+        normalized: str,
+        row: dict[str, Any],
+        schedule: RulesIndexScheduleContext,
+    ) -> IngredientIndexResult:
+        """
+        Enqueue async indexing for one ingredient and track batch membership.
+
+        Args:
+            ingredient: Display ingredient name.
+            normalized: Normalized lookup key.
+            row: Postgres CIR report row.
+            schedule: Product review metadata for the index worker.
+
+        Returns:
+            IngredientIndexResult: ``queued`` or ``queue_failed`` outcome.
+        """
+        ingredient_id = str(row.get("ingredient_id") or normalized)
+        job = build_index_job_payload(
+            schedule,
+            ingredient=ingredient,
+            normalized_name=normalized,
+            row=row,
+        )
+        try:
+            enqueue_result = enqueue_rules_index_job(self.redis, job)
+            if enqueue_result.skipped_dedupe and self._is_cached(normalized):
+                cached = self._read_cached_entry(normalized)
+                return IngredientIndexResult(
+                    ingredient=ingredient,
+                    normalized_name=normalized,
+                    ingredient_id=str(cached.get("ingredient_id") or ingredient_id),
+                    indexed=True,
+                    source="redis_cache",
+                    notes="indexed while another enqueue was in flight",
+                )
+            if enqueue_result.enqueued or enqueue_result.skipped_dedupe:
+                register_index_batch_pending(self.redis, schedule.request_id, normalized)
+            notes = ""
+            if enqueue_result.skipped_dedupe:
+                notes = "index job already queued for ingredient"
+            return IngredientIndexResult(
+                ingredient=ingredient,
+                normalized_name=normalized,
+                ingredient_id=ingredient_id,
+                indexed=False,
+                source="queued",
+                notes=notes,
+            )
+        except Exception as exc:
+            logger.exception("failed to enqueue index job: ingredient=%s", ingredient)
+            return IngredientIndexResult(
+                ingredient=ingredient,
+                normalized_name=normalized,
+                ingredient_id=ingredient_id,
+                indexed=False,
+                source="queue_failed",
+                notes=str(exc),
+            )
+
     def ensure_reports_exists(
         self,
         ingredients: list[str],
+        *,
+        index_schedule: RulesIndexScheduleContext | None = None,
     ) -> list[IngredientIndexResult]:
         """
         Ensure safety and toxicological reports for the ingredients exists.
-        If not yet indexed and reports exists, the ingredient is immedieately indexed.
+
+        When ``RULES_INDEX_INLINE`` is true (default), missing reports are indexed
+        synchronously. When false, jobs are enqueued on ``rules:index:jobs`` and
+        results use ``source=queued`` until the index worker marks the cache.
+
         Args:
-            ingredients (list[str]): List of ingredient names to check
-            
+            ingredients: List of ingredient names to check.
+            index_schedule: Required when async indexing is enabled.
+
         Returns:
-            list[IngredientIndexResult]: List of ingredient index results
+            list[IngredientIndexResult]: List of ingredient index results.
         """
         report_rows = self._fetch_report_rows(ingredients)
         results: list[IngredientIndexResult] = []
+        inline_index = rules_index_inline_enabled()
 
         for ingredient in ingredients:
 
@@ -427,40 +574,37 @@ class RulesEngine(Engine):
                 )
                 continue
 
-            try:
-                # If not indexed, download report, index and mark True
-                ingredient_id = row["ingredient_id"] or normalized
-                self.vector_store.index_pdf_from_firebase(
-                    pdf_url=row["download_url"],
-                    ingredient_id=ingredient_id,
-                    cir_ingredient_name=row["cir_ingredient_name"] or ingredient,
-                    function=row["function"] or "unknown",
-                    report_url=row["report_url"],
-                    attachment_url=row["attachment_url"] or row["download_url"],
-                    storage_path=row["storage_path"] or row["download_url"],
-                )
-                self._mark_cached(normalized, ingredient_id=ingredient_id)
+            if inline_index:
                 results.append(
-                    IngredientIndexResult(
+                    self._index_ingredient_sync(
                         ingredient=ingredient,
-                        normalized_name=normalized,
-                        ingredient_id=ingredient_id,
-                        indexed=True,
-                        source="indexed_now",
+                        normalized=normalized,
+                        row=row,
                     )
                 )
-            except Exception as exc:
-                logger.exception("failed indexing ingredient=%s", ingredient)
+                continue
+
+            if index_schedule is None:
                 results.append(
                     IngredientIndexResult(
                         ingredient=ingredient,
                         normalized_name=normalized,
-                        ingredient_id=row.get("ingredient_id", ""),
+                        ingredient_id=str(row.get("ingredient_id") or ""),
                         indexed=False,
-                        source="index_failed",
-                        notes=str(exc),
+                        source="queue_failed",
+                        notes="index_schedule required when RULES_INDEX_INLINE=false",
                     )
                 )
+                continue
+
+            results.append(
+                self._queue_ingredient_index(
+                    ingredient=ingredient,
+                    normalized=normalized,
+                    row=row,
+                    schedule=index_schedule,
+                )
+            )
 
         return results
 
@@ -809,20 +953,121 @@ class RulesEngine(Engine):
         )
         return self._serialize_matches(matches)
 
-    def assess_product_review(self, request: RulesEngineRequest) -> RulesEngineResponse:
+    @staticmethod
+    def _vector_product_evidence_empty(report: dict[str, Any]) -> bool:
+        """
+        Return True when CIR vector sections contain no matches.
+
+        Args:
+            report: Structured product report dict.
+
+        Returns:
+            bool: True when safety, contraindications, and irritation are all empty.
+        """
+        for key in ("safety", "contraindications", "irritation"):
+            section = report.get(key)
+            if isinstance(section, list) and len(section) > 0:
+                return False
+        return True
+
+    def _should_use_product_internet_fallback(
+        self,
+        request: RulesEngineRequest,
+        *,
+        indexed_results: list[IngredientIndexResult],
+        ingredient_ids: list[str],
+        index_outcome: str | None,
+        report: dict[str, Any],
+    ) -> bool:
+        """
+        Decide whether to supplement CIR evidence with product-name internet search.
+
+        Args:
+            request: Product rules request.
+            indexed_results: Ingredient index outcomes.
+            ingredient_ids: IDs used for vector retrieval.
+            index_outcome: Async batch outcome when applicable.
+            report: CIR structured report before fallback.
+
+        Returns:
+            bool: True when internet fallback should run.
+        """
+        if index_outcome in {"partial", "failed"}:
+            return True
+        if request.ingredients and not ingredient_ids:
+            return True
+        if self._vector_product_evidence_empty(report):
+            return True
+        failed_sources = {item.source for item in indexed_results}
+        if failed_sources.intersection({"index_failed", "queue_failed", "missing"}):
+            if self._vector_product_evidence_empty(report):
+                return True
+        return False
+
+    def _run_product_internet_research(self, request: RulesEngineRequest) -> tuple[str, list[str]]:
+        """
+        Fetch supplemental safety text via Tavily for product-name guided search.
+
+        Args:
+            request: Product rules request.
+
+        Returns:
+            tuple[str, list[str]]: Raw research text and source URLs.
+        """
+        name = request.product_name.strip() or "cosmetic skincare product"
+        query = f"{name} safety pregnancy contraindications side effects"
+        if request.ingredients:
+            query = f"{query} — ingredients: {', '.join(request.ingredients[:8])}"
+        research_raw = internet_search.invoke({"query": query, "max_results": 4})
+        research_text = research_raw if isinstance(research_raw, str) else str(research_raw)
+        sources: list[str] = []
+        try:
+            parsed = json.loads(research_text)
+            if isinstance(parsed, dict):
+                results = parsed.get("results")
+                if isinstance(results, list):
+                    for result in results:
+                        if isinstance(result, dict):
+                            url = result.get("url")
+                            if isinstance(url, str) and url:
+                                sources.append(url)
+        except json.JSONDecodeError:
+            pass
+        if not sources:
+            sources = _extract_urls_from_text(research_text)
+        return research_text, list(dict.fromkeys(sources))
+
+    def assess_product_review(
+        self,
+        request: RulesEngineRequest,
+        *,
+        indexed_results: list[IngredientIndexResult] | None = None,
+        index_outcome: str | None = None,
+    ) -> RulesEngineResponse:
         """
         Assess product review
 
         Args:
-            request (RulesEngineRequest): request body.
+            request: Request body.
+            indexed_results: Optional precomputed index outcomes (avoids duplicate ensure).
 
         Returns:
             RulesEngineResponse : structured response emitted to the signal stream.
         
         """
 
-        # Ensure reports exists - index them if not
-        indexed_results = self.ensure_reports_exists(request.ingredients)
+        if indexed_results is None:
+            index_schedule = RulesIndexScheduleContext(
+                request_id=request.request_id,
+                case_id=request.case_id,
+                client_id=request.client_id,
+                message_id=request.message_id,
+                channel=request.channel,
+            )
+            indexed_results = self.ensure_reports_exists(
+                request.ingredients,
+                index_schedule=index_schedule,
+            )
         ingredient_ids = [
             item.ingredient_id
             for item in indexed_results
@@ -844,6 +1089,23 @@ class RulesEngine(Engine):
             f"Indexed {len(ingredient_ids)} ingredient report(s) for evidence retrieval."
         )
 
+        sources: list[str] = ["https://cir-reports.cir-safety.org/"]
+        if self._should_use_product_internet_fallback(
+            request,
+            indexed_results=indexed_results,
+            ingredient_ids=ingredient_ids,
+            index_outcome=index_outcome,
+            report=report,
+        ):
+            research_text, web_sources = self._run_product_internet_research(request)
+            report["internet_research"] = research_text
+            report["evidence_mode"] = "internet_fallback"
+            summary = (
+                f"{summary} Supplemental internet sources were used where reference "
+                "index data was incomplete."
+            )
+            sources = list(dict.fromkeys(web_sources + sources))
+
         confidence = compute_product_decision_confidence(
             request,
             indexed_results=indexed_results,
@@ -857,7 +1119,7 @@ class RulesEngine(Engine):
             channel=request.channel,
             review_type="product",
             summary=summary,
-            sources=["https://cir-reports.cir-safety.org/"],
+            sources=sources,
             escalation_notes=request.escalation_notes,
             indexed_ingredients=indexed_results,
             report=report,
