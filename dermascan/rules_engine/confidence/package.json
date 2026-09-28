@@ -1,0 +1,12 @@
+{
+  "name": "decision-confidence-paper",
+  "private": true,
+  "description": "Build decision_confidence.pdf from markdown with KaTeX",
+  "scripts": {
+    "build:pdf": "node build_pdf.mjs"
+  },
+  "dependencies": {
+    "marked-katex-extension": "^5.1.13",
+    "md-to-pdf": "^5.2.5"
+  }
+}
