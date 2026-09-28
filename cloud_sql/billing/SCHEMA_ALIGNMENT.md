@@ -11,8 +11,16 @@ reconciling across branches; they are merged, and the split no longer exists.
 an error — write the next numbered file instead.
 
 ```bash
-python dermascan/scripts/migrate.py --dry-run   # list pending
-python dermascan/scripts/migrate.py             # apply
+poetry run python -m dermascan.scripts.migrate --dry-run   # list pending
+poetry run python -m dermascan.scripts.migrate             # apply
+```
+
+If `qutis_db` was created from the old hand-run scripts and already has
+`billing.account` et al., stamp the baseline then apply the rest:
+
+```bash
+poetry run python -m dermascan.scripts.migrate --stamp 001_billing
+poetry run python -m dermascan.scripts.migrate
 ```
 
 `cloud_sql/billing/schema.sql` and `002_align_paystack_schema.sql` were the

@@ -25,10 +25,10 @@ import threading
 import time
 from typing import Any, Final
 
-from dotenv import load_dotenv
-
+from dermascan.backend.services.agents import reclaim_logic
 from dermascan.billing import accounts, fulfilment, intents, notify, redis_wallet
 from dermascan.billing.flags import billing_enabled
+from dermascan.shared.load_env import ensure_env_loaded
 from dermascan.shared.logger import get_logger
 from dermascan.shared.redis_stability import (
     check_redis_connectivity,
@@ -36,7 +36,7 @@ from dermascan.shared.redis_stability import (
     run_with_redis_retries,
 )
 
-load_dotenv()
+ensure_env_loaded()
 
 logger = get_logger("agents")
 
@@ -50,6 +50,7 @@ BILLING_CONSUMER_NAME: Final[str] = (
 
 STREAM_BATCH_SIZE: Final[int] = int(os.getenv("WORKERS_STREAM_BATCH_SIZE", "10"))
 STREAM_BLOCK_MS: Final[int] = int(os.getenv("WORKERS_STREAM_BLOCK_MS", "5000"))
+WORKERS_STREAM_MAXLEN: Final[int] = int(os.getenv("WORKERS_STREAM_MAXLEN", "5000"))
 
 # Give the webhook a head start before polling, so the common path is not
 # duplicated by the fallback.
@@ -61,6 +62,7 @@ TRIP_REAP_INTERVAL_S: Final[int] = int(os.getenv("BILLING_TRIP_REAP_INTERVAL_S",
 TRIP_MAX_AGE_S: Final[int] = int(os.getenv("BILLING_TRIP_MAX_AGE_S", "1800"))
 
 _redis = get_redis_client(decode_responses=True)
+reclaim_logic.set_redis_client(_redis)
 
 
 def _ensure_consumer_group() -> None:
@@ -174,7 +176,12 @@ def _dlq(msg_id: str, fields: dict[str, Any]) -> None:
         fields: Original stream fields.
     """
     try:
-        _redis.xadd(BILLING_DLQ_STREAM, {**fields, "failed_msg_id": msg_id})
+        _redis.xadd(
+            BILLING_DLQ_STREAM,
+            {**fields, "failed_msg_id": msg_id},
+            maxlen=WORKERS_STREAM_MAXLEN,
+            approximate=True,
+        )
     except Exception:
         logger.exception("billing dlq write failed: msg_id=%s", msg_id)
 
@@ -216,10 +223,65 @@ def _sweep_loop(
             logger.exception("billing sweep failed: %s", name)
 
 
-def run_worker_forever() -> None:
-    """Consume ``billing:jobs`` and run the periodic sweeps."""
+def _start_reclaim_thread(stop_event: threading.Event) -> threading.Thread:
+    """Reclaim stale pending billing jobs (mirrors escalation/outbound workers)."""
+
+    def _reclaim_loop() -> None:
+        while not stop_event.is_set():
+            try:
+
+                def _reclaim_handler(reclaim_msg_id: str, reclaim_fields: dict[str, Any]) -> None:
+                    if reclaim_logic.mark_processed(BILLING_STREAM, reclaim_msg_id):
+                        try:
+                            _process_message(reclaim_msg_id, reclaim_fields)
+                        except Exception:
+                            logger.exception(
+                                "reclaim handler failed: stream=%s msg_id=%s",
+                                BILLING_STREAM,
+                                reclaim_msg_id,
+                            )
+                            _redis.delete(
+                                reclaim_logic.processed_key(BILLING_STREAM, reclaim_msg_id)
+                            )
+
+                reclaimed = reclaim_logic.reclaim_stale_pending(
+                    stream=BILLING_STREAM,
+                    group=BILLING_CONSUMER_GROUP,
+                    consumer=BILLING_CONSUMER_NAME,
+                    handler=_reclaim_handler,
+                    dlq_stream=BILLING_DLQ_STREAM,
+                )
+                if reclaimed > 0:
+                    logger.info(
+                        "reclaim pass completed: stream=%s reclaimed=%d",
+                        BILLING_STREAM,
+                        reclaimed,
+                    )
+            except Exception:
+                logger.exception("reclaim loop error: stream=%s", BILLING_STREAM)
+            stop_event.wait(timeout=reclaim_logic.RECLAIM_INTERVAL_SEC)
+
+    thread = threading.Thread(
+        target=_reclaim_loop,
+        name=f"billing-reclaim-{BILLING_STREAM}",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def run_worker_forever(stop_event: threading.Event | None = None) -> None:
+    """
+    Consume ``billing:jobs`` and run the periodic sweeps until ``stop_event`` is set.
+
+    Args:
+        stop_event: Supervisor shutdown signal from ``do_work.py``. When omitted
+            (CLI entry), a local event is used until keyboard interrupt.
+    """
+    stop = stop_event or threading.Event()
     if not billing_enabled():
-        logger.info("billing worker idle: BILLING_ENABLED is false")
+        logger.info("billing worker not started: BILLING_ENABLED is false")
+        stop.wait()
         return
 
     check_redis_connectivity(decode_responses=True)
@@ -229,7 +291,7 @@ def run_worker_forever() -> None:
         BILLING_STREAM, BILLING_CONSUMER_GROUP, BILLING_CONSUMER_NAME,
     )
 
-    stop_event = threading.Event()
+    reclaim_thread = _start_reclaim_thread(stop)
     sweeps = [
         threading.Thread(
             target=_sweep_loop,
@@ -237,7 +299,7 @@ def run_worker_forever() -> None:
                 "name": "verify_poller",
                 "interval_s": VERIFY_POLL_INTERVAL_S,
                 "action": _verify_poll_once,
-                "stop_event": stop_event,
+                "stop_event": stop,
             },
             name="billing-verify-poller",
             daemon=True,
@@ -248,7 +310,7 @@ def run_worker_forever() -> None:
                 "name": "trip_reaper",
                 "interval_s": TRIP_REAP_INTERVAL_S,
                 "action": lambda: redis_wallet.reap_stale_trips(max_age_s=TRIP_MAX_AGE_S),
-                "stop_event": stop_event,
+                "stop_event": stop,
             },
             name="billing-trip-reaper",
             daemon=True,
@@ -258,7 +320,7 @@ def run_worker_forever() -> None:
         thread.start()
 
     try:
-        while not stop_event.is_set():
+        while not stop.is_set():
             try:
                 resp = run_with_redis_retries(
                     lambda: _redis.xreadgroup(
@@ -279,7 +341,8 @@ def run_worker_forever() -> None:
                 for msg_id, fields in batch:
                     _process_message(str(msg_id), fields)
     except KeyboardInterrupt:
-        stop_event.set()
+        stop.set()
     finally:
-        stop_event.set()
+        stop.set()
+        reclaim_thread.join(timeout=reclaim_logic.RECLAIM_INTERVAL_SEC + 1)
         logger.info("billing worker stopped")

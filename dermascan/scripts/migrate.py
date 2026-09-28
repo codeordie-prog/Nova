@@ -13,6 +13,8 @@ so an edited migration is caught rather than silently skipped.
 Usage:
     poetry run python -m dermascan.scripts.migrate            # apply pending
     poetry run python -m dermascan.scripts.migrate --dry-run  # list pending
+    poetry run python -m dermascan.scripts.migrate --stamp 001_billing
+        # record a migration as applied without running SQL (hand-run Cloud SQL)
 """
 
 from __future__ import annotations
@@ -85,6 +87,48 @@ def _applied_checksums(conn) -> dict[str, str]:
     return {row["version"]: row["checksum"] for row in rows}
 
 
+def stamp_migration(version: str) -> None:
+    """
+    Record a migration version as applied without executing its SQL.
+
+    Use when the database was provisioned by hand and already matches that
+    migration (for example ``001_billing`` on legacy ``qutis_db``).
+
+    Args:
+        version: Migration stem, e.g. ``001_billing``.
+
+    Raises:
+        FileNotFoundError: When no ``{version}.sql`` exists.
+        RuntimeError: When the version is already applied with a different checksum.
+    """
+    path = MIGRATIONS_DIR / f"{version}.sql"
+    if not path.is_file():
+        raise FileNotFoundError(f"no migration file: {path}")
+
+    sql = path.read_text(encoding="utf-8")
+    digest = _checksum(sql)
+
+    pool = get_pool()
+    with pool.connection() as conn:
+        conn.execute(_BOOTSTRAP_SQL)
+        conn.commit()
+        applied = _applied_checksums(conn)
+        previous = applied.get(version)
+        if previous is not None:
+            if previous != digest:
+                raise RuntimeError(
+                    f"migration {version} already applied with a different checksum"
+                )
+            logger.info("already stamped: %s", version)
+            return
+        conn.execute(
+            "INSERT INTO billing.schema_migrations (version, checksum) VALUES (%s, %s)",
+            (version, digest),
+        )
+        conn.commit()
+    logger.info("stamped: %s", version)
+
+
 def run_migrations(*, dry_run: bool = False) -> int:
     """
     Apply every pending migration.
@@ -154,10 +198,19 @@ def main() -> int:
         action="store_true",
         help="List pending migrations without applying them.",
     )
+    parser.add_argument(
+        "--stamp",
+        metavar="VERSION",
+        help="Record VERSION as applied without running SQL (hand-run databases).",
+    )
     args = parser.parse_args()
 
     try:
-        count = run_migrations(dry_run=args.dry_run)
+        if args.stamp:
+            stamp_migration(args.stamp)
+            count = 0
+        else:
+            count = run_migrations(dry_run=args.dry_run)
     except Exception:
         logger.exception("migration run failed")
         return 1
