@@ -7,7 +7,7 @@ Step-by-step guide for **Cloud Build + Artifact Registry + Cloud Run**. Frontend
 | Cloud Run service | Image target | Role |
 |-------------------|--------------|------|
 | `dermascan-api-staging` | `api` | FastAPI ingress, webhooks, `/health` |
-| `dermascan-workers-staging` | `workers` | `do_work.py` (orchestrator, escalation, outbound) |
+| `dermascan-workers-staging` | `workers` | `do_work.py` + co-located Turn sidecar on loopback :8000 (outbound WhatsApp) |
 | `dermascan-telegram-bridge-staging` | `telegram-bridge` | Polls Telegram → forwards to API webhook |
 | `dermascan-medgemma-gateway-staging` | `medgemma-gateway` | Enqueue skin diagnosis jobs |
 | `dermascan-medgemma-worker-staging` | `medgemma-worker` | Redis consumer → Modal GPU |
@@ -273,7 +273,25 @@ Use `cloudbuild.images-only.yaml` on PRs if you only want build validation.
 | MedGemma worker | No | 0 |
 | Telegram bridge | No | 0 |
 
-Workers use `deploy/scripts/run_with_health.py` to expose `GET /health` on `$PORT` (Cloud Run requirement).
+Workers use `deploy/scripts/run_workers_with_turn_sidecar.py`:
+
+- `GET /health` on `$PORT` (Cloud Run requirement)
+- Turn sidecar on `127.0.0.1:8000` when `TURN_API_TOKEN` is set (or `WHATSAPP_SIDECAR_ENABLED=true`)
+
+Set on **`dermascan-workers-staging`** (same as local outbound):
+
+| Variable | Value |
+|----------|--------|
+| `WHATSAPP_API_BASE_URL` | `http://127.0.0.1:8000` |
+| `WHATSAPP_API_SEND_PATH` | `/send` |
+| `WHATSAPP_API_TYPING_PATH` | `/typing` |
+| `WHATSAPP_INTERNAL_API_SECRET` or `INTERNAL_API_SECRET` | Must match sidecar + ingress |
+| `TURN_API_BASE_URL` | `https://whatsapp.turn.io` |
+| `TURN_API_TOKEN` | Sandbox or production token |
+
+**Inbound WhatsApp:** register Turn’s webhook on the **API** URL (`…/v1/webhooks/whatsapp`), not workers. Leave sidecar relay unused in cloud (`NOVA_WEBHOOK_URL` only matters if Turn posts to the adapter).
+
+Disable the in-container sidecar with `WHATSAPP_SIDECAR_ENABLED=false` (Telegram-only workers).
 
 Workers image includes **Tesseract** (`TESSERACT_PATH=/usr/bin/tesseract`) for lazy PDF indexing.
 

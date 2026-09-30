@@ -27,6 +27,7 @@ RUN pip install "poetry==${POETRY_VERSION}"
 COPY pyproject.toml poetry.lock README.md ./
 COPY dermascan ./dermascan
 COPY deploy ./deploy
+COPY turn ./turn
 
 # MVP: full runtime dependency set from lockfile (torch/modal included).
 # Split optional groups later to slim api-only images.
@@ -61,7 +62,7 @@ ENV PORT=8080 \
 
 EXPOSE 8080
 
-CMD ["python", "deploy/scripts/run_with_health.py", "python", "dermascan/scripts/do_work.py"]
+CMD ["python", "deploy/scripts/run_workers_with_turn_sidecar.py"]
 
 
 # ---------------------------------------------------------------------------
