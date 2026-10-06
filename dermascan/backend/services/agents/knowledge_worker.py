@@ -39,6 +39,8 @@ from dermascan.backend.services.agents.build import (
 )
 from dermascan.backend.services.agents.model_fallback_chain import (
     build_chained_chat_model,
+    checkpoint_safe_structured_response_middleware,
+    structured_response_text,
     summarization_model_chain_spec,
 )
 from dermascan.backend.services.agents.loader import load_agent_configurations
@@ -289,6 +291,7 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         tools=knowledge_tools,
         system_prompt=system_prompt,
         middleware=[
+            checkpoint_safe_structured_response_middleware,
             dynamic_model_selection,
             SummarizationMiddleware(
                 model=summarization_model,
@@ -563,11 +566,8 @@ def _process_knowledge_job(agent: Any, msg_id: str, fields: dict[str, Any]) -> N
                     {"messages": [{"role": "user", "content": knowledge_input}]},
                     config=config,
                 )
-                reply = (
-                    res.get("structured_response").response
-                    if isinstance(res, dict) and res.get("structured_response") is not None
-                    else str(res)
-                ).strip()
+                structured = res.get("structured_response") if isinstance(res, dict) else None
+                reply = (structured_response_text(structured) or str(res)).strip()
 
                 print(reply)
                 

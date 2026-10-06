@@ -25,6 +25,7 @@ from langchain.agents.middleware import (
 )
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel
 
 from dermascan.backend.services.agents.build import build_gemini_chat_model
 from dermascan.backend.services.agents.provider_circuit_breaker import (
@@ -39,6 +40,10 @@ from dermascan.shared.vision_image_urls import (
 )
 
 logger = get_logger(__name__)
+
+
+class IncompleteStructuredOutputError(ValueError):
+    """Raised when structured JSON parses but fails application validation."""
 
 # Cost-optimized: Gemini primary, OpenAI fallback for orchestrator tool calling.
 _DEFAULT_ORCHESTRATOR_MODEL_CHAIN: str = (
@@ -145,6 +150,101 @@ def apply_serial_tool_call_request(request: ModelRequest) -> ModelRequest:
             "parallel_tool_calls": False,
         }
     )
+
+
+def checkpoint_safe_structured_value(value: Any) -> Any:
+    """
+    Convert structured agent output to JSON-serializable data for Redis checkpoints.
+
+    LangGraph's Redis checkpointer uses orjson and cannot persist live Pydantic
+    models returned as ``structured_response`` on agent state.
+
+    Args:
+        value: Structured output (Pydantic model, dict, or other).
+
+    Returns:
+        Any: ``model_dump(mode="json")`` for Pydantic models; otherwise unchanged.
+    """
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    return value
+
+
+def structured_response_text(value: Any, *, field: str = "response") -> str | None:
+    """
+    Read a string field from invoke ``structured_response`` (dict or Pydantic).
+
+    Args:
+        value: ``structured_response`` from agent invoke state.
+        field: Attribute or dict key to read.
+
+    Returns:
+        str | None: Field text, or None when missing or empty.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        raw = value.get(field)
+        return str(raw).strip() if raw is not None else None
+    if isinstance(value, BaseModel):
+        raw = getattr(value, field, None)
+        return str(raw).strip() if raw is not None else None
+    return None
+
+
+def checkpoint_safe_model_response(
+    response: Union[ModelResponse, AIMessage, ExtendedModelResponse],
+) -> Union[ModelResponse, AIMessage, ExtendedModelResponse]:
+    """
+    Ensure ``ModelResponse.structured_response`` is JSON-safe before checkpoint writes.
+
+    Args:
+        response: Middleware or model handler result.
+
+    Returns:
+        Same response type with ``structured_response`` converted when needed.
+    """
+    if isinstance(response, AIMessage):
+        return response
+
+    if isinstance(response, ExtendedModelResponse):
+        inner = checkpoint_safe_model_response(response.model_response)
+        if inner is response.model_response:
+            return response
+        return ExtendedModelResponse(
+            model_response=inner,
+            command=response.command,
+        )
+
+    structured = response.structured_response
+    if structured is None:
+        return response
+    safe = checkpoint_safe_structured_value(structured)
+    if safe is structured:
+        return response
+    return ModelResponse(result=response.result, structured_response=safe)
+
+
+@wrap_model_call
+def checkpoint_safe_structured_response_middleware(
+    request: ModelRequest,
+    handler: Callable[[ModelRequest], Any],
+) -> Any:
+    """
+    Serialize structured output for Redis-backed LangGraph checkpoints.
+
+    Use on agents with ``checkpointer=`` and ``response_format=`` (orchestrator,
+    knowledge worker). Report subagents without a checkpointer should omit this.
+
+    Args:
+        request: Outbound model request.
+        handler: Inner middleware / model handler.
+
+    Returns:
+        ModelResponse | AIMessage | ExtendedModelResponse: JSON-safe structured output.
+    """
+    response = handler(request)
+    return checkpoint_safe_model_response(response)
 
 
 def _truncate_ai_message_tool_calls(message: BaseMessage) -> BaseMessage:
@@ -436,6 +536,10 @@ def should_fallback_to_next_model(exc: Exception) -> bool:
         return True
     if is_length_limit_error(exc):
         return True
+    if is_structured_output_error(exc):
+        return True
+    if isinstance(exc, IncompleteStructuredOutputError):
+        return True
 
     text: str = str(exc).lower()
     transient_markers: tuple[str, ...] = (
@@ -510,6 +614,23 @@ def is_recursion_error(exc: Exception) -> bool:
     if exc.__class__.__name__ == "GraphRecursionError":
         return True
     return "recursion limit" in str(exc).lower()
+
+
+def _bind_structured_schema(model: Any, schema: Any) -> Any:
+    """
+    Bind a Pydantic schema using native JSON-schema decoding when supported.
+
+    Args:
+        model: Chat model from the fallback chain.
+        schema: Pydantic model or JSON schema.
+
+    Returns:
+        Any: Model bound for structured output.
+    """
+    try:
+        return model.with_structured_output(schema, method="json_schema")
+    except (TypeError, ValueError, NotImplementedError):
+        return model.with_structured_output(schema)
 
 
 def is_structured_output_error(exc: Exception) -> bool:
@@ -963,6 +1084,7 @@ class ModelChainRunner:
         schema: Any,
         config: Optional[Any] = None,
         operation: str = "structured",
+        post_parse: Optional[Callable[[Any], Any]] = None,
     ) -> Any:
         """
         Produce structured output across the model chain with no tools.
@@ -977,6 +1099,7 @@ class ModelChainRunner:
             schema: Pydantic model / schema for structured output.
             config: Optional RunnableConfig for tracing.
             operation: Label for logs.
+            post_parse: Optional validator/normalizer; may raise to try the next model.
 
         Returns:
             Any: Parsed structured output (instance of ``schema``).
@@ -1001,10 +1124,11 @@ class ModelChainRunner:
                     schema=schema,
                     config=config,
                     operation=operation,
+                    post_parse=post_parse,
                 )
             except Exception as exc:
                 last_exc = exc
-                if attempt >= self._max_retries or not should_fallback_to_next_model(exc):
+                if attempt >= self._max_retries or not should_retry_agent_invoke(exc):
                     raise
         raise last_exc if last_exc is not None else RuntimeError(
             f"{operation}: structured chain empty"
@@ -1017,6 +1141,7 @@ class ModelChainRunner:
         schema: Any,
         config: Optional[Any],
         operation: str,
+        post_parse: Optional[Callable[[Any], Any]] = None,
     ) -> Any:
         """Walk the model chain once for a structured-output invoke."""
         last_exc: Optional[Exception] = None
@@ -1039,11 +1164,13 @@ class ModelChainRunner:
 
             try:
                 logger.info("%s: invoking structured model %s (%s)", operation, name, role)
-                structured_model = model.with_structured_output(schema)
+                structured_model = _bind_structured_schema(model, schema)
                 if config is not None:
                     response = structured_model.invoke(messages, config=config)
                 else:
                     response = structured_model.invoke(messages)
+                if post_parse is not None:
+                    response = post_parse(response)
                 breaker.record_success()
                 self._record(name, True)
                 return response

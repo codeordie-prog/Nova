@@ -100,8 +100,10 @@ from dermascan.backend.services.agents.model_fallback_chain import (
     is_invalid_image_url_error,
     orchestrator_model_chain_spec,
     parse_model_chain_spec,
+    checkpoint_safe_structured_response_middleware,
     refresh_vision_urls_middleware,
     serial_tool_calls_middleware,
+    structured_response_text,
     should_retry_agent_invoke,
     summarization_model_chain_spec,
 )
@@ -1573,6 +1575,7 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         tools=orchestrator_tools,
         system_prompt=system_prompt,
         middleware=[
+            checkpoint_safe_structured_response_middleware,
             dynamic_model_selection,
             ToolCallLimitMiddleware(
                 tool_name="get_time",
@@ -2108,11 +2111,8 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         _clear_checkpoint_reset(client_id)
         agent_call_tracer.set_tool_names(agent_call_tracer.extract_tool_names(res))
         agent_call_tracer.end_turn(status="ok")
-        reply = (
-            res.get("structured_response").response
-            if isinstance(res, dict) and res.get("structured_response") is not None
-            else str(res)
-        )
+        structured = res.get("structured_response") if isinstance(res, dict) else None
+        reply = structured_response_text(structured) or str(res)
         reply = _strip_markdown_formatting(reply)
 
         print(reply)
@@ -2633,11 +2633,8 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             )
             agent_call_tracer.set_tool_names(agent_call_tracer.extract_tool_names(res))
             agent_call_tracer.end_turn(status="ok")
-            reply = (
-                res.get("structured_response").response
-                if isinstance(res, dict) and res.get("structured_response") is not None
-                else str(res)
-            )
+            structured = res.get("structured_response") if isinstance(res, dict) else None
+            reply = structured_response_text(structured) or str(res)
 
         reply = _strip_markdown_formatting(reply)
 
