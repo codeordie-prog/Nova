@@ -265,13 +265,13 @@ Use `cloudbuild.images-only.yaml` on PRs if you only want build validation.
 
 ## Cloud Run service notes
 
-| Service | Public? | min-instances (MVP) |
-|---------|---------|---------------------|
-| API | Yes (`--allow-unauthenticated`) | 0 |
-| MedGemma gateway | Yes | 0 |
-| Workers | No | 0 (scale up for demos) |
-| MedGemma worker | No | 0 |
-| Telegram bridge | No | 0 |
+| Service | Public? | min-instances (staging deploy script) |
+|---------|---------|----------------------------------------|
+| API | Yes (`--allow-unauthenticated`) | 1 |
+| MedGemma gateway | Yes | 1 |
+| Workers | No | 1 |
+| MedGemma worker | No | 1 |
+| Telegram bridge | No | 1 |
 
 Workers use `deploy/scripts/run_workers_with_turn_sidecar.py`:
 
@@ -294,6 +294,9 @@ Set on **`dermascan-workers-staging`** (same as local outbound):
 Disable the in-container sidecar with `WHATSAPP_SIDECAR_ENABLED=false` (Telegram-only workers).
 
 Workers image includes **Tesseract** (`TESSERACT_PATH=/usr/bin/tesseract`) for lazy PDF indexing.
+
+**Cloud SQL socket** (`POSTGRES_HOST=/cloudsql/...`) is attached in `deploy-staging-services.sh` to:
+API (Paystack/admin billing), MedGemma gateway (enqueue holds), workers (orchestrator billing), and MedGemma worker (settle). Telegram bridge and Redis-only paths do not need Postgres.
 
 ---
 

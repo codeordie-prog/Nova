@@ -1,4 +1,8 @@
 """
+Author: Dermascan Team
+Date: 2026-09-30
+License: MIT
+
 Cloud Run workers entrypoint: health on ``PORT``, optional Turn sidecar on :8000, then ``do_work.py``.
 
 The outbound worker expects ``WHATSAPP_API_BASE_URL=http://127.0.0.1:8000`` (or matching
@@ -15,6 +19,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from dermascan.shared.load_env import bootstrap_env
+
 from deploy.scripts.run_with_health import run_with_health
 
 logger = logging.getLogger("run_workers_with_turn_sidecar")
@@ -160,6 +166,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
+    bootstrap_env()
     run_with_health(_run_do_work)
 
 

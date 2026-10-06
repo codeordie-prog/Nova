@@ -1,0 +1,73 @@
+# .gcloudignore — controls the Cloud Build source upload.
+#
+# When this file exists, gcloud uses ONLY these rules (it no longer falls back
+# to .gitignore). Everything the Dockerfile COPYs must therefore remain
+# INCLUDED: pyproject.toml, poetry.lock, README.md, dermascan/, deploy/, turn/.
+# We exclude only build-irrelevant junk and secrets (secrets are mounted at
+# runtime via Secret Manager, never baked into the image).
+
+# Git metadata
+.git/
+.gitignore
+.gcloudignore
+
+# Python caches / virtualenvs
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+
+# Logs and local terminal dumps
+*.log
+logs/
+
+# Secrets — provided at runtime via Secret Manager mounts (see sync_staging_secrets.py)
+.env
+.env.*
+!.env_example
+dermascan/backend/services/agents/configurations/*-*.json
+**/service-account*.json
+**/service_account*.json
+*-firebase-adminsdk-*.json
+qutisai-*.json
+.pgpass
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Frontend (not part of backend images)
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+dermascan/frontend/whatsapp/
+dermascan/frontend/derma-dashboard/
+
+# Generated docs / large binaries not needed inside images
+*.pdf
+*.docx
+dermascan/docs/.generated_billing_doc_assets/
+
+# Modal local state
+.modal/
+
+# Local billing / db helpers (may contain passwords)
+dermascan/billing/cloud_sql_session.sh
+dermascan/billing/billing.md
+dermascan/billing/*.local.sh
+
+# Local SQL backups
+cir_pdfs_backup.sql

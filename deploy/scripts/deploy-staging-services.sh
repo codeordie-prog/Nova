@@ -12,6 +12,7 @@ TAG="${TAG:-latest}"
 RUN_SA="${RUN_SA:-dermascan-cloud-run@${PROJECT_ID}.iam.gserviceaccount.com}"
 # Cloud SQL over unix socket (no public-IP allowlisting; RUN_SA needs roles/cloudsql.client).
 CLOUDSQL_CONNECTION="${CLOUDSQL_CONNECTION:-${PROJECT_ID}:${REGION}:qutis}"
+POSTGRES_CLOUD_ENV="POSTGRES_HOST=/cloudsql/${CLOUDSQL_CONNECTION},POSTGRES_SSLMODE=disable"
 
 IMAGE_PREFIX="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}"
 DOTENV_SECRET="dermascan-dotenv-staging"
@@ -44,10 +45,11 @@ gcloud run deploy dermascan-api-staging \
   --port=8080 \
   --cpu=1 \
   --memory=2Gi \
-  --min-instances=0 \
+  --min-instances=1 \
   --max-instances=3 \
   --timeout=300 \
-  --set-env-vars="DERMASCAN_ENV_FILE=/secrets/env/.env,DERMASCAN_ROOT=/app" \
+  --add-cloudsql-instances="${CLOUDSQL_CONNECTION}" \
+  --set-env-vars="DERMASCAN_ENV_FILE=/secrets/env/.env,DERMASCAN_ROOT=/app,${POSTGRES_CLOUD_ENV}" \
   "${common_flags[@]}"
 
 API_URL="$(gcloud run services describe dermascan-api-staging \
@@ -67,7 +69,8 @@ gcloud run deploy dermascan-medgemma-gateway-staging \
   --min-instances=1 \
   --max-instances=2 \
   --timeout=300 \
-  --set-env-vars="DERMASCAN_ENV_FILE=/secrets/env/.env,DERMASCAN_ROOT=/app" \
+  --add-cloudsql-instances="${CLOUDSQL_CONNECTION}" \
+  --set-env-vars="DERMASCAN_ENV_FILE=/secrets/env/.env,DERMASCAN_ROOT=/app,${POSTGRES_CLOUD_ENV}" \
   "${common_flags[@]}"
 
 MEDGEMMA_GATEWAY_URL="$(gcloud run services describe dermascan-medgemma-gateway-staging \
@@ -94,14 +97,15 @@ echo "Deploying dermascan-workers-staging..."
 gcloud run deploy dermascan-workers-staging \
   --image="${IMAGE_PREFIX}/dermascan-workers:${TAG}" \
   --add-cloudsql-instances="${CLOUDSQL_CONNECTION}" \
-  --set-env-vars="${RUNTIME_OVERRIDES},POSTGRES_HOST=/cloudsql/${CLOUDSQL_CONNECTION},POSTGRES_SSLMODE=disable" \
+  --set-env-vars="${RUNTIME_OVERRIDES},${POSTGRES_CLOUD_ENV}" \
   "${worker_flags[@]}" \
   "${common_flags[@]}"
 
 echo "Deploying dermascan-medgemma-worker-staging..."
 gcloud run deploy dermascan-medgemma-worker-staging \
   --image="${IMAGE_PREFIX}/dermascan-medgemma-worker:${TAG}" \
-  --set-env-vars="${RUNTIME_OVERRIDES}" \
+  --add-cloudsql-instances="${CLOUDSQL_CONNECTION}" \
+  --set-env-vars="${RUNTIME_OVERRIDES},${POSTGRES_CLOUD_ENV}" \
   "${worker_flags[@]}" \
   "${common_flags[@]}"
 

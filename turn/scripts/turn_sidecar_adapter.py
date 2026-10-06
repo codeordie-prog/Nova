@@ -50,6 +50,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from dermascan.shared.load_env import bootstrap_env
+from dermascan.shared.turn_webhook_auth import turn_webhook_signature_valid
 
 bootstrap_env()
 
@@ -164,11 +165,11 @@ def _turn_signature_valid(raw_body: bytes, signature: str | None) -> bool:
     Returns:
         True if signature matches, False otherwise.
     """
-    if not TURN_WEBHOOK_SECRET or not signature:
-        return False
-    digest = hmac.new(TURN_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256).digest()
-    expected = base64.b64encode(digest).decode()
-    return hmac.compare_digest(expected, signature)
+    return turn_webhook_signature_valid(
+        raw_body=raw_body,
+        signature=signature,
+        webhook_secret=TURN_WEBHOOK_SECRET,
+    )
 
 
 def _build_turn_text_message(body: SendRequest) -> tuple[dict[str, Any], str | None]:

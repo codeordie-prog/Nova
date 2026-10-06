@@ -57,6 +57,7 @@ from dermascan.shared.escalation_image import (
     resolve_escalation_image_blob_path,
 )
 from dermascan.shared.firebase_storage import upload_client_image, download_client_image_bytes_by_path
+from dermascan.shared.turn_webhook_auth import verify_whatsapp_ingress_auth
 from dermascan.shared.whatsapp_ingress_dedupe import (
     claim_whatsapp_ingress_message,
     whatsapp_ingress_seen_key,
@@ -96,6 +97,7 @@ _WHATSAPP_INGRESS_SECRET: str = os.getenv(
     "WHATSAPP_INGRESS_SECRET",
     os.getenv("INTERNAL_API_SECRET", ""),
 )
+_TURN_WEBHOOK_SECRET: str = os.getenv("TURN_WEBHOOK_SECRET", "")
 _INGRESS_RETRY_AFTER_S: str = os.getenv("INGRESS_RETRY_AFTER_SECONDS", "1")
 _ORCHESTRATOR_SIGNAL_STREAM: str = os.getenv("ORCHESTRATOR_SIGNAL_STREAM", "orchestrator:signals")
 _EVENTS_STREAM: str = os.getenv("EVENTS_STREAM", "events:stream")
@@ -311,23 +313,6 @@ async def _enforce_ingress_capacity(*, cost: int = 1) -> None:
             detail="Service is overloaded. Please try again later.",
             headers={"Retry-After": _INGRESS_RETRY_AFTER_S},
         )
-
-
-def _verify_whatsapp_ingress_secret(header_value: str | None) -> None:
-    """
-    Verify shared secret for internal WhatsApp webhook ingress.
-
-    Args:
-        header_value: Value from `X-Internal-Secret` header.
-    """
-    expected = _WHATSAPP_INGRESS_SECRET.strip()
-    if not expected:
-        logger.warning(
-            "WHATSAPP_INGRESS_SECRET not configured; allowing /v1/webhooks/whatsapp without internal auth"
-        )
-        return
-    if not header_value or not hmac.compare_digest(header_value, expected):
-        raise HTTPException(status_code=401, detail="invalid ingress secret")
 
 
 # Extract whatsapp messages - This logic may change when we get the META API
@@ -946,39 +931,25 @@ async def upload_test_media(image: UploadFile = File(...)) -> dict[str, Any]:
 
 @router.post("/webhooks/whatsapp")
 async def whatsapp_webhook(
+    request: Request,
     x_internal_secret: str | None = Header(default=None, alias="X-Internal-Secret"),
-    payload: dict[str, Any] = Body(
-        ...,
-        example={
-            "entry": [
-                {
-                    "changes": [
-                        {
-                            "value": {
-                                "message": {
-                                    "id": "wamid.HBgL.image...",
-                                    "from": "254700000000",
-                                    "type": "text",
-                                    "text": {"body": "Please diagnose this"},
-                                    "attachments": [
-                                        {
-                                            "id": "img-1",
-                                            "type": "image",
-                                            "media_ref": "media:test:7f4ab7cb6d224c95ab8fd9737c511e7a",
-                                            "mime_type": "image/jpeg",
-                                            "caption": "Rash on upper arm"
-                                        }
-                                    ]
-                                }
-                            }
-                        }
-                    ]
-                }
-            ]
-        },
-    )
+    x_turn_hook_signature: str | None = Header(default=None, alias="X-Turn-Hook-Signature"),
 ) -> dict[str, Any]:
-    _verify_whatsapp_ingress_secret(x_internal_secret)
+    raw_body = await request.body()
+    verify_whatsapp_ingress_auth(
+        internal_secret_header=x_internal_secret,
+        expected_internal_secret=_WHATSAPP_INGRESS_SECRET,
+        raw_body=raw_body,
+        turn_signature_header=x_turn_hook_signature,
+        turn_webhook_secret=_TURN_WEBHOOK_SECRET,
+    )
+    try:
+        parsed = json.loads(raw_body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON body") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="webhook body must be a JSON object")
+    payload: dict[str, Any] = parsed
 
     if _redis is None:
         raise HTTPException(status_code=500, detail="REDIS_URL is not configured")
