@@ -20,10 +20,13 @@ from pydantic import BaseModel, Field
 from tavily import TavilyClient
 
 from dermascan.shared.concise_report_format import (
+    CompactReportMessage,
     MicroReportFields,
     build_static_micro_report,
+    compact_message_format_instructions,
     dermatologist_connection_guidance,
-    micro_report_format_instructions,
+    finalize_compact_report_body,
+    normalize_compact_report_message,
     render_micro_report,
 )
 from dermascan.ai_service.postprocessing.medgemma_structured_output import resolve_skin_observation_text
@@ -32,6 +35,7 @@ from dermascan.backend.services.agents.model_fallback_chain import (
     AGENT_INVOKE_RETRY_DELAY_S,
     GEMINI_MAX_RETRIES,
     GEMINI_REQUEST_TIMEOUT_S,
+    IncompleteStructuredOutputError,
     MODEL_CHAIN_MAX_RETRIES,
     MODEL_CHAIN_RETRY_DELAY_S,
     ModelChainRunner,
@@ -107,7 +111,10 @@ TAVILY_API_KEY = str(os.getenv("TAVILY_API_KEY_QUTIS", ""))
 OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY_QUTIS", ""))
 OPENAI_REQUEST_TIMEOUT_S = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"))
 GEMINI_THINKING_LEVEL = str(os.getenv("ORCHESTRATOR_GEMINI_THINKING_LEVEL", "minimal"))
-ORCHESTRATOR_MAX_TOKENS = max(256, int(os.getenv("ORCHESTRATOR_MAX_TOKENS", "2048")))
+REPORT_GEMINI_MAX_OUTPUT_TOKENS: int = max(
+    512,
+    int(os.getenv("REPORT_GEMINI_MAX_OUTPUT_TOKENS", "4096")),
+)
 GEMINI_API_KEY = str(os.getenv("GEMINI_API_KEY_QUTIS", ""))
 GOOGLE_CREDENTIALS_PATH = str(os.getenv("GOOGLE_APPLICATION_CREDENTIALS_QUTIS", ""))
 GOOGLE_PROJECT_ID = str(
@@ -152,13 +159,6 @@ class IngredientExtractionResponse(BaseModel):
     sources: list[str] = Field(default_factory=list)
 
 
-class UserFriendlyReportResponse(MicroReportFields):
-    """User-friendly final report for outbound delivery."""
-
-
-class SkinReviewResponse(MicroReportFields):
-    """Structured output from skin-review research agent."""
-
 # Global rules engine instance.
 _rules_engine_singleton: RulesEngine | None = None
 _report_chain_runner: ModelChainRunner | None = None
@@ -179,7 +179,7 @@ def _get_report_chain_runner() -> ModelChainRunner:
             openai_temperature=0.0,
             openai_timeout_s=OPENAI_REQUEST_TIMEOUT_S,
             gemini_temperature=0.0,
-            gemini_max_tokens=ORCHESTRATOR_MAX_TOKENS,
+            gemini_max_tokens=REPORT_GEMINI_MAX_OUTPUT_TOKENS,
             gemini_top_p=0.95,
             gemini_thinking_level=GEMINI_THINKING_LEVEL,
             google_credentials_path=GOOGLE_CREDENTIALS_PATH,
@@ -433,6 +433,60 @@ def _coerce_treatment_payload(value: Any) -> str:
         contraindicated_text = "|".join(contraindicated) if contraindicated else "none"
         return f"needs={needs_text};contraindicated_approaches={contraindicated_text}"
     return str(value or "").strip()
+
+
+def _invoke_compact_report(
+    *,
+    system_prompt: str,
+    prompt: str,
+    operation: str,
+    invoke_config: Optional[RunnableConfig] = None,
+) -> str:
+    """
+    Compact a rules-engine payload into a short plain-text report via the model chain.
+
+    Args:
+        system_prompt: System instructions for the formatter.
+        prompt: User prompt containing evidence already collected upstream.
+        operation: Log label.
+        invoke_config: Optional RunnableConfig for tracing.
+
+    Returns:
+        str: Model-produced message body (disclaimer appended downstream).
+
+    Raises:
+        Exception: Last model-chain failure when all models are exhausted.
+    """
+    runner = _get_report_chain_runner()
+
+    def post_parse(raw: object) -> CompactReportMessage:
+        message = normalize_compact_report_message(raw)
+        if not message:
+            logger.warning(
+                "%s: compact report message missing or too short (raw_type=%s)",
+                operation,
+                type(raw).__name__,
+            )
+            raise IncompleteStructuredOutputError(
+                f"{operation}: compact report message missing or too short"
+            )
+        return CompactReportMessage(message=message)
+
+    parsed = runner.invoke_structured_output(
+        messages=[("system", system_prompt), ("human", prompt)],
+        schema=CompactReportMessage,
+        config=invoke_config,
+        operation=operation,
+        post_parse=post_parse,
+    )
+    if isinstance(parsed, CompactReportMessage):
+        return parsed.message
+    normalized = normalize_compact_report_message(parsed)
+    if not normalized:
+        raise IncompleteStructuredOutputError(
+            f"{operation}: compact report message missing after parse"
+        )
+    return normalized
 
 
 def _render_report_response(structured: MicroReportFields) -> str:
@@ -716,15 +770,15 @@ def _product_report_system_prompt(
         "You are a cosmetic skincare product-safety assistant. "
         "Convert structured product safety evidence into a brief audit for a non-technical user. "
         "Do not claim medical diagnosis and do not prescribe treatment. "
-        "Use report_internet_search only when it meaningfully strengthens unclear or missing safety points. "
-        f"{micro_report_format_instructions()}\n"
+        "Use only the product evidence provided in the user prompt. Do not search the web. "
+        f"{compact_message_format_instructions()}\n"
         f"{dermatologist_connection_guidance()}\n"
         f"{personalization_clause}"
         "Do NOT mention filler or low-risk ingredients (water, aqua, glycerin, basic emollients, "
         "common preservatives) unless they are the main safety issue. "
         "Synthesize across the formula into a few safety themes only (contraindications, pregnancy/lactation, "
         "irritation/sensitization, photosensitivity, actives to introduce slowly). "
-        "Put the product name in the headline when known. "
+        "Put the product name in line 1 when known. "
         "Do not include URLs in the report body (sources are appended separately). "
         f"{mode_guidance}\n"
         f"{guidance_line}\n"
@@ -766,11 +820,11 @@ def _product_report_user_prompt(
         guidance_line = product_report_guidance_mode_instructions(guidance_mode)
     return (
         "Generate the final product audit using the inputs below.\n"
-        f"{micro_report_format_instructions()}\n"
+        f"{compact_message_format_instructions()}\n"
         f"{mode_line}\n"
         f"{guidance_line}\n"
-        "Put the product name in headline when available.\n"
-        "If a field is missing, state 'unknown' briefly in the nearest field and continue.\n"
+        "Put the product name in line 1 when available.\n"
+        "If evidence is missing, state 'unknown' briefly and continue.\n"
         f"product_name: {product_name}\n"
         f"description: {description}\n"
         f"ingredients: {json.dumps(ingredients, default=str)}\n"
@@ -848,15 +902,15 @@ def _skin_review_system_prompt(
         "You are a dermatology skin-audit assistant. "
         "Produce a brief image-based skin pattern review from the visible appearance summary, condition summary, "
         "and needs/treatment context. "
-        "Use skin_review_search only when it materially improves uncertain or thin evidence. "
-        f"{micro_report_format_instructions()}\n"
+        "Use only the image-review evidence provided in the user prompt. Do not search the web. "
+        f"{compact_message_format_instructions()}\n"
         f"{dermatologist_connection_guidance()}\n"
         "Do not prescribe medications, dosages, or definitive treatment plans. "
         "Use cautious language such as 'appears consistent with', 'may suggest', 'could reflect', "
         "and 'image-based review cannot confirm'. "
         "Avoid definitive phrasing such as 'has', 'is', 'diagnosis is', or 'confirms'. "
-        "If evidence is limited, state uncertainty in the headline and use seek_care to offer "
-        "in-chat dermatologist connection — not an external referral. "
+        "If evidence is limited, state uncertainty in line 1 and offer in-chat dermatologist "
+        "connection in a tip when appropriate — not an external referral. "
         "Do not include URLs in the report body (sources are appended separately). "
         f"last_conversation_entries: {json.dumps(context, default=str)}\n"
         f"{delivery_prompt}\n"
@@ -878,8 +932,8 @@ def build_skin_review_report(
     system_prompt = _skin_review_system_prompt(context, delivery_prompt)
     prompt = (
         "Generate the final image-based skin pattern review using the inputs below.\n"
-        f"{micro_report_format_instructions()}\n"
-        "If a field is missing, state 'unknown' briefly in the nearest field and continue.\n"
+        f"{compact_message_format_instructions()}\n"
+        "If evidence is missing, state 'unknown' briefly and continue.\n"
         "Personalize using client context when allergies, pregnancy, or goals are present.\n"
         f"visible_appearance_summary: {diagnosis}\n"
         f"skin_condition_summary: {summary}\n"
@@ -889,17 +943,13 @@ def build_skin_review_report(
     if delivery_prompt:
         prompt = f"{prompt}\n{delivery_prompt}\n"
     try:
-        response = _invoke_with_model_chain(
+        message = _invoke_compact_report(
             system_prompt=system_prompt,
-            tools=[skin_review_search],
-            response_format=SkinReviewResponse,
             prompt=prompt,
             operation="skin_review_report",
             invoke_config=invoke_config,
         )
-        structured = response.get("structured_response") if isinstance(response, dict) else None
-        if isinstance(structured, SkinReviewResponse) and structured.headline.strip():
-            return _render_report_response(structured)
+        return finalize_compact_report_body(message)
     except Exception:
         logger.exception("failed to build skin review report")
 
@@ -965,23 +1015,19 @@ def build_user_friendly_report(
         apply_guidance_mode=apply_guidance_mode,
     )
     try:
-        response = _invoke_with_model_chain(
+        message = _invoke_compact_report(
             system_prompt=system_prompt,
-            tools=[report_internet_search],
-            response_format=UserFriendlyReportResponse,
             prompt=prompt,
             operation="product_user_friendly_report",
             invoke_config=invoke_config,
         )
-        structured = response.get("structured_response") if isinstance(response, dict) else None
-        if isinstance(structured, UserFriendlyReportResponse) and structured.headline.strip():
-            report_text = _render_report_response(structured)
-            return finalize_product_report_text(
-                report_text,
-                personalization_mode=mode,
-                guidance_mode=guidance_mode,
-                apply_guidance_mode=apply_guidance_mode,
-            )
+        report_text = finalize_compact_report_body(message)
+        return finalize_product_report_text(
+            report_text,
+            personalization_mode=mode,
+            guidance_mode=guidance_mode,
+            apply_guidance_mode=apply_guidance_mode,
+        )
     except Exception:
         logger.exception("failed to build user-friendly product report")
 
