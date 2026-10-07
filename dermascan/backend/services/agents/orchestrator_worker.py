@@ -76,6 +76,7 @@ from dermascan.shared.redis_stability import (
     get_redis_client,
     run_with_redis_retries,
 )
+from dermascan.shared.turn_contact_api import return_to_mydawa_main_menu_sync
 from dermascan.shared.whatsapp_platform_message_id import resolve_channel_reply_target
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -331,6 +332,17 @@ WIPE_MEMORY_COMMAND: str = (
 WIPE_MEMORY_REPLY: str = os.getenv(
     "ORCHESTRATOR_WIPE_MEMORY_REPLY",
     "Your conversation memory has been reset. We are starting fresh - how can I help you today?",
+)
+
+# User chat command: return to MYDAWA Turn Main Menu without invoking the agent.
+MYDAWA_MENU_COMMAND: str = os.getenv("ORCHESTRATOR_MYDAWA_MENU_COMMAND", "/menu").strip().lower()
+MYDAWA_MENU_REPLY: str = os.getenv(
+    "ORCHESTRATOR_MYDAWA_MENU_REPLY",
+    "You are back on the MYDAWA WhatsApp services menu. Choose an option from the list to continue.",
+)
+MYDAWA_MENU_FAIL_REPLY: str = os.getenv(
+    "ORCHESTRATOR_MYDAWA_MENU_FAIL_REPLY",
+    "We could not open the MYDAWA menu just now. Please try again in a moment or contact support.",
 )
 
 # Initialize REDIS client
@@ -1820,6 +1832,56 @@ def _pending_task_description(payload_json: str) -> str:
     return "a request"
 
 
+def _ingress_payload_text(payload_json: str) -> str:
+    """
+    Extract normalized user text from a cached orchestrator ingress payload.
+
+    Args:
+        payload_json: Serialized ingress payload for the current job.
+
+    Returns:
+        Lowercase stripped message text, or empty string when unavailable.
+    """
+    try:
+        payload_obj: dict[str, Any] = json.loads(payload_json)
+    except Exception:
+        return ""
+    return str(((payload_obj.get("content") or {}).get("text") or "")).strip().lower()
+
+
+def _clear_client_conversation_state(client_id: str, *, log_prefix: str) -> None:
+    """
+    Delete LangGraph checkpoint, conversation log, and intake session for a client.
+
+    Clears the checkpoint-reset recap marker so the next Nova session starts clean.
+
+    Args:
+        client_id: Conversation thread identifier.
+        log_prefix: Short label for log messages (e.g. ``wipe_memory``).
+    """
+    if _checkpointer is not None:
+        try:
+            delete_checkpoint_thread(_checkpointer, client_id)
+        except Exception:
+            logger.exception("%s: checkpoint delete failed: client_id=%s", log_prefix, client_id)
+    try:
+        _redis.delete(_conversation_log_key(client_id))
+    except Exception:
+        logger.exception("%s: conversation log delete failed: client_id=%s", log_prefix, client_id)
+    try:
+        delete_intake_session(client_id, redis_client=_redis)
+    except Exception:
+        logger.exception("%s: intake session delete failed: client_id=%s", log_prefix, client_id)
+    _clear_checkpoint_reset(client_id)
+
+
+def _ack_command_job(msg_id: str) -> None:
+    """Ack and remove a fully handled orchestrator job stream message."""
+    _redis.xack(ORCHESTRATOR_JOB_STREAM, ORCHESTRATOR_CONSUMER_GROUP, msg_id)
+    _redis.xdel(ORCHESTRATOR_JOB_STREAM, msg_id)
+    reclaim_logic.mark_processed(ORCHESTRATOR_JOB_STREAM, msg_id)
+
+
 def _maybe_handle_wipe_memory(
     *,
     msg_id: str,
@@ -1847,34 +1909,14 @@ def _maybe_handle_wipe_memory(
     Returns:
         bool: True when the message was the wipe command and was fully handled.
     """
-    try:
-        payload_obj: dict[str, Any] = json.loads(payload_json)
-    except Exception:
-        return False
-    text = str(((payload_obj.get("content") or {}).get("text") or "")).strip().lower()
-    if text != WIPE_MEMORY_COMMAND:
+    if _ingress_payload_text(payload_json) != WIPE_MEMORY_COMMAND:
         return False
 
     logger.warning(
         "wipe_memory command received: client_id=%s request_id=%s",
         client_id, request_id,
     )
-    if _checkpointer is not None:
-        try:
-            delete_checkpoint_thread(_checkpointer, client_id)
-        except Exception:
-            logger.exception("wipe_memory: checkpoint delete failed: client_id=%s", client_id)
-    try:
-        _redis.delete(_conversation_log_key(client_id))
-    except Exception:
-        logger.exception("wipe_memory: conversation log delete failed: client_id=%s", client_id)
-    try:
-        delete_intake_session(client_id, redis_client=_redis)
-    except Exception:
-        logger.exception("wipe_memory: intake session delete failed: client_id=%s", client_id)
-    # A deliberate wipe must not trigger the post-reset context restoration
-    # (which would re-inject a recap of the conversation the user just wiped).
-    _clear_checkpoint_reset(client_id)
+    _clear_client_conversation_state(client_id, log_prefix="wipe_memory")
 
     _enqueue_outbound(
         client_id=client_id,
@@ -1885,9 +1927,75 @@ def _maybe_handle_wipe_memory(
         kind="job_reply",
         must_deliver=True,
     )
-    _redis.xack(ORCHESTRATOR_JOB_STREAM, ORCHESTRATOR_CONSUMER_GROUP, msg_id)
-    _redis.xdel(ORCHESTRATOR_JOB_STREAM, msg_id)
-    reclaim_logic.mark_processed(ORCHESTRATOR_JOB_STREAM, msg_id)
+    _ack_command_job(msg_id)
+    return True
+
+
+def _maybe_handle_mydawa_menu_command(
+    *,
+    msg_id: str,
+    payload_json: str,
+    request_id: str,
+    case_id: str,
+    client_id: str,
+    channel: str,
+    inbound_message_id: str,
+) -> bool:
+    """
+    Handle the ``/menu`` shortcut: Turn MYDAWA Main Menu handoff without the agent.
+
+    Clears Turn ``active_handler``, starts the Main Menu journey, wipes local Nova
+    session state, sends a fixed reply, and acks the job.
+
+    Args:
+        msg_id: Job stream message id.
+        payload_json: Raw ingress payload JSON.
+        request_id: Current request id.
+        case_id: Current case id.
+        client_id: WhatsApp wa_id (conversation thread id).
+        channel: Ingress channel.
+        inbound_message_id: Platform message id (wamid) for Turn journey start.
+
+    Returns:
+        bool: True when the message was the menu command and was fully handled.
+    """
+    if _ingress_payload_text(payload_json) != MYDAWA_MENU_COMMAND:
+        return False
+
+    logger.info(
+        "mydawa_menu command received: client_id=%s request_id=%s",
+        client_id,
+        request_id,
+    )
+
+    reply_text = MYDAWA_MENU_FAIL_REPLY
+    if str(channel or "").strip().lower() == "whatsapp":
+        turn_result = return_to_mydawa_main_menu_sync(
+            wa_id=client_id,
+            message_id=inbound_message_id or None,
+        )
+        if str(turn_result.get("status") or "") == "ok":
+            _clear_client_conversation_state(client_id, log_prefix="mydawa_menu")
+            reply_text = MYDAWA_MENU_REPLY
+        else:
+            logger.warning(
+                "mydawa_menu Turn handoff failed: client_id=%s detail=%s",
+                client_id,
+                turn_result.get("detail"),
+            )
+    else:
+        logger.info("mydawa_menu ignored non-whatsapp channel=%s", channel)
+
+    _enqueue_outbound(
+        client_id=client_id,
+        case_id=case_id,
+        channel=channel,
+        request_id=request_id,
+        text=reply_text,
+        kind="job_reply",
+        must_deliver=True,
+    )
+    _ack_command_job(msg_id)
     return True
 
 
@@ -1950,6 +2058,16 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
         ):
             return
 
+        if _maybe_handle_mydawa_menu_command(
+            msg_id=msg_id,
+            payload_json=payload_json,
+            request_id=request_id,
+            case_id=case_id,
+            client_id=client_id,
+            channel=channel,
+            inbound_message_id=stream_message_id,
+        ):
+            return
 
         if billing.billing_active():
             try:

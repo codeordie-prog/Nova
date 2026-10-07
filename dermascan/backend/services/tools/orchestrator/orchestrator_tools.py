@@ -67,12 +67,15 @@ from dermascan.shared.intake_session import (
 from dermascan.shared.intake_session_store import (
     IntakeSessionStoreError,
     archive_intake_session,
+    delete_intake_session,
     get_or_create_intake_session,
     load_archived_intake_session,
     load_intake_session,
     recompute_intake_session,
     save_intake_session_recomputed,
 )
+from dermascan.shared.orchestrator_checkpoint_reset import reset_orchestrator_thread_checkpoint
+from dermascan.shared.turn_contact_api import return_to_mydawa_main_menu_sync
 from dermascan.backend.services.agents.text_product_review import (
     dispatch_text_product_review_signal,
     is_text_product_review_enqueued,
@@ -3779,6 +3782,99 @@ def request_specialist_escalation(request_id: OrchestratorRequestIdArg) -> dict[
     }
 
 
+@tool
+def return_to_mydawa_main_menu(request_id: OrchestratorRequestIdArg) -> dict[str, Any]:
+    """
+    Return the user to the MYDAWA WhatsApp Main Menu on Turn.io (not the Qutis mini-menu).
+
+    Clears ``active_handler`` and starts the configured Main Menu journey. Use only after
+    the user explicitly chooses the MYDAWA platform menu over the Qutis skincare options.
+
+    Args:
+        request_id: Exact request_id from the current orchestrator turn.
+
+    Returns:
+        dict[str, Any]: Turn API outcome and agent-facing instruction text.
+    """
+    logger.info("TOOL CALL: return_to_mydawa_main_menu: request_id=%s", request_id)
+
+    envelope, ingress_error = _require_ingress_envelope(request_id)
+    if ingress_error:
+        return ingress_error
+    assert envelope is not None
+
+    channel = str(envelope.get("channel") or "").strip().lower()
+    client_id = str(envelope.get("client_id") or "").strip()
+    message_id = str(envelope.get("message_id") or "").strip() or None
+
+    if channel != "whatsapp":
+        return {
+            "status": "unsupported_channel",
+            "request_id": request_id,
+            "channel": channel,
+            "instruction": (
+                "MYDAWA main menu exit is only supported on WhatsApp. "
+                "Explain that and offer to continue helping with Qutis here."
+            ),
+        }
+
+    if not client_id:
+        return _ingress_error(request_id, "missing client_id in ingress envelope")
+
+    turn_result = return_to_mydawa_main_menu_sync(wa_id=client_id, message_id=message_id)
+    status = str(turn_result.get("status") or "error")
+
+    if status == "ok":
+        delete_intake_session(client_id)
+        checkpoint_cleared = reset_orchestrator_thread_checkpoint(client_id)
+        return {
+            "status": "ok",
+            "request_id": request_id,
+            "client_id": client_id,
+            "detail": turn_result.get("detail"),
+            "checkpoint_reset": checkpoint_cleared,
+            "instruction": (
+                "Confirm in one or two short sentences that they are returning to the "
+                "MYDAWA WhatsApp services menu (prescriptions, delivery, consultations, etc.). "
+                "Do NOT call update_intake, register_intake_image, or enqueue tools this turn. "
+                "Their next message will be handled by the MYDAWA menu on WhatsApp."
+            ),
+        }
+
+    if status == "disabled":
+        return {
+            "status": "disabled",
+            "request_id": request_id,
+            "client_id": client_id,
+            "instruction": (
+                "MYDAWA menu exit is disabled in this environment. "
+                "Apologize briefly and continue the Qutis conversation."
+            ),
+        }
+
+    if status == "misconfigured":
+        return {
+            "status": "misconfigured",
+            "request_id": request_id,
+            "client_id": client_id,
+            "instruction": (
+                "The MYDAWA menu handoff is not configured. "
+                "Tell the user support will help them reach the main menu and continue Qutis if needed."
+            ),
+        }
+
+    return {
+        "status": "error",
+        "request_id": request_id,
+        "client_id": client_id,
+        "detail": turn_result.get("detail"),
+        "instruction": (
+            "The handoff to the MYDAWA menu did not complete. Apologize briefly, "
+            "suggest trying again in a moment or typing menu once more, and do not enqueue audits."
+        ),
+    }
+
+
 orchestrator_tools: list = [
     get_time,
     get_credit_balance,
@@ -3789,6 +3885,7 @@ orchestrator_tools: list = [
     register_intake_image,
     enque_request_for_auditing_stream,
     request_specialist_escalation,
+    return_to_mydawa_main_menu,
     read_status_of_a_case,
     check_medgemma_health,
     read_soul_md,

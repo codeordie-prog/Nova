@@ -70,6 +70,13 @@ dermascan/docs/.generated_billing_doc_assets/
 dermascan/docs/*.pdf
 dermascan/docs/*.docx
 
+# Turn.io integration notes and PDF exports (Python under turn/scripts/ stays tracked)
+turn/**/*.md
+turn/**/*.pdf
+
+# Local CIR / rules PDF caches (downloaded copies, not source of truth)
+**/downloads/*.pdf
+
 # Root-level doc generator scripts — local tooling, not part of the app.
 /scripts/
 

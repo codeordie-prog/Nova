@@ -57,6 +57,7 @@ from dermascan.shared.escalation_image import (
     resolve_escalation_image_blob_path,
 )
 from dermascan.shared.firebase_storage import upload_client_image, download_client_image_bytes_by_path
+from dermascan.shared.turn_journey_routing import whatsapp_ingress_should_queue_orchestrator
 from dermascan.shared.turn_webhook_auth import verify_whatsapp_ingress_auth
 from dermascan.shared.whatsapp_ingress_dedupe import (
     claim_whatsapp_ingress_message,
@@ -959,11 +960,29 @@ async def whatsapp_webhook(
         return {"status": "ignored", "queued_count": 0, "request_ids": []}
 
     normalized_messages: list[OrchestratorIngressRequest] = []
+    turn_delegated_count: int = 0
     for message in messages:
+        wa_id_raw = str(message.get("from") or "").strip()
+        wamid_raw = str(message.get("id") or "").strip()
+        if wa_id_raw and not await whatsapp_ingress_should_queue_orchestrator(
+            wa_id=wa_id_raw,
+            message_id=wamid_raw or None,
+        ):
+            turn_delegated_count += 1
+            continue
+
         try:
             normalized_messages.append(_normalize_message(message))
         except HTTPException as exc:
             logger.warning("Skipping invalid whatsapp message: detail=%s", exc.detail)
+
+    if turn_delegated_count and not normalized_messages:
+        return {
+            "status": "delegated_turn",
+            "turn_delegated_count": turn_delegated_count,
+            "queued_count": 0,
+            "request_ids": [],
+        }
 
     if not normalized_messages:
         return {"status": "ignored", "queued_count": 0, "request_ids": []}
