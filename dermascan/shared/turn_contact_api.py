@@ -53,22 +53,37 @@ def mydawa_menu_exit_enabled() -> bool:
 
 
 def _turn_api_base_url() -> str:
+    """
+    Return the base URL for the Turn API.
+    """
     return os.getenv("TURN_API_BASE_URL", "https://whatsapp.turn.io").rstrip("/")
 
 
 def _turn_api_token() -> str:
+    """
+    Return the API token for the Turn API.
+    """
     return os.getenv("TURN_API_TOKEN", "").strip()
 
 
 def _turn_main_menu_journey_uuid() -> str:
+    """
+    Return the UUID for the Main Menu journey.
+    """
     return os.getenv("TURN_MAIN_MENU_JOURNEY_UUID", "").strip()
 
 
-def _turn_http_timeout_s() -> float:
+def _turn_http_timeout_s() -> float:    
+    """
+    Return the HTTP timeout for the Turn API.
+    """
     return float(os.getenv("TURN_HTTP_TIMEOUT_S", "15"))
 
 
 def _turn_auth_headers() -> dict[str, str]:
+    """
+    Return auth headers for turn.
+    """
     return {
         "Authorization": f"Bearer {_turn_api_token()}",
         "Accept": _TURN_ACCEPT,

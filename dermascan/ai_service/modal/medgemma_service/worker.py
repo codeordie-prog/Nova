@@ -43,6 +43,10 @@ from dermascan.shared.stream_pipeline_tracing import (
     run_traced_stream_handler,
 )
 from dermascan.backend.services.agents import reclaim_logic
+from dermascan.backend.services.agents.heartbeat import (
+    compute_heartbeat_interval_sec,
+    start_stream_heartbeat,
+)
 from dermascan.billing.flags import billing_active
 
 _redis = redis_client_from_env().get_redis()
@@ -65,6 +69,12 @@ _CONSUMER_NAME: str = f"{_CONSUMER_NAME_BASE}-{socket.gethostname()}-{os.getpid(
 _MEDGEMMA_DLQ_STREAM: str = os.environ.get("MEDGEMMA_DLQ_STREAM", "medgemma:dlq")
 _IMAGE_FETCH_TIMEOUT_S: float = float(os.environ.get("IMAGE_FETCH_TIMEOUT_S", "10"))
 _IMAGE_FETCH_MAX_WORKERS: int = max(1, int(os.environ.get("MEDGEMMA_IMAGE_FETCH_MAX_WORKERS", "8")))
+
+_MEDGEMMA_HEARTBEAT_INTERVAL_SEC: float = (
+    max(5.0, float(os.environ["MEDGEMMA_HEARTBEAT_INTERVAL_SEC"].strip()))
+    if os.environ.get("MEDGEMMA_HEARTBEAT_INTERVAL_SEC", "").strip()
+    else compute_heartbeat_interval_sec(reclaim_logic.PENDING_MIN_IDLE_MS)
+)
 
 # RPC retry configuration
 MEDGEMMA_RPC_MAX_RETRIES: int = 3
@@ -262,6 +272,7 @@ class _JobEntry:
     group_expected_count: int = 0
     image_blob_path: str = ""
     billing_context: Any | None = None
+    heartbeat_stop: threading.Event | None = None
 
 
 @dataclass
@@ -272,6 +283,41 @@ class _PendingJob:
     job_id: str
     msg_id: str
     payload: dict[str, Any]
+    heartbeat_stop: threading.Event | None = None
+
+
+def _start_msg_heartbeat(msg_id: str) -> threading.Event:
+    """
+    Keep a pending stream message alive while inference or I/O runs.
+
+    Args:
+        msg_id: Redis stream message id.
+
+    Returns:
+        threading.Event: Stop signal; set when the message is acked or failed.
+    """
+    return start_stream_heartbeat(
+        _redis,
+        stream=_JOB_STREAM,
+        group=_CONSUMER_GROUP,
+        consumer=_CONSUMER_NAME,
+        msg_id=msg_id,
+        interval_sec=_MEDGEMMA_HEARTBEAT_INTERVAL_SEC,
+    )
+
+
+def _stop_msg_heartbeat(stop: threading.Event | None) -> None:
+    """
+    Stop a message heartbeat thread if it was started.
+
+    Args:
+        stop: Event returned from :func:`_start_msg_heartbeat`.
+
+    Returns:
+        None
+    """
+    if stop is not None:
+        stop.set()
 
 
 def _to_str(value: Any) -> str:
@@ -530,6 +576,7 @@ def _build_job_entry(pending: _PendingJob, image_bytes: bytes) -> _JobEntry:
         prompt=_to_str(payload.get("prompt") or payload.get(b"prompt")),
         image_blob_path=_resolve_image_blob_path(payload),
         billing_context=_billing_context_from_payload(payload),
+        heartbeat_stop=pending.heartbeat_stop,
     )
 
 
@@ -579,6 +626,7 @@ def _resolve_pending_images(pending_jobs: list[_PendingJob]) -> dict[str, bytes]
                     finished_at=str(int(time.time())),
                 )
                 logger.error("Failed to resolve image bytes: job_id=%s error=%s", pending.job_id, exc)
+                _stop_msg_heartbeat(pending.heartbeat_stop)
                 _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, pending.msg_id)
                 _redis.xdel(_JOB_STREAM, pending.msg_id)
 
@@ -634,7 +682,14 @@ def _collect_batch() -> list[_JobEntry]:
                     _redis.xdel(_JOB_STREAM, msg_id_str)
                     continue
 
-                pending_jobs.append(_PendingJob(job_id=job_id, msg_id=msg_id_str, payload=payload))
+                pending_jobs.append(
+                    _PendingJob(
+                        job_id=job_id,
+                        msg_id=msg_id_str,
+                        payload=payload,
+                        heartbeat_stop=_start_msg_heartbeat(msg_id_str),
+                    )
+                )
 
     # Resolve the images for the pending jobs - Parallel processing of images
     resolved_images = _resolve_pending_images(pending_jobs)
@@ -649,6 +704,7 @@ def _collect_batch() -> list[_JobEntry]:
             if attempts > _MAX_ATTEMPTS:
                 _mark_status(pending.job_id, status="failed", error="Max attempts reached")
                 _settle_job_billing(pending.job_id, pending.payload, success=False)
+                _stop_msg_heartbeat(pending.heartbeat_stop)
                 _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, pending.msg_id)
                 _redis.xdel(_JOB_STREAM, pending.msg_id)
                 continue
@@ -663,9 +719,16 @@ def _collect_batch() -> list[_JobEntry]:
             )
             logger.exception("Failed to prepare job: job_id=%s", pending.job_id)
             _settle_job_billing(pending.job_id, pending.payload, success=False)
+            _stop_msg_heartbeat(pending.heartbeat_stop)
             _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, pending.msg_id)
             _redis.xdel(_JOB_STREAM, pending.msg_id)
-                
+
+    for pending in pending_jobs:
+        if pending.heartbeat_stop is not None and all(
+            entry.msg_id != pending.msg_id for entry in batch
+        ):
+            _stop_msg_heartbeat(pending.heartbeat_stop)
+
     return batch
 
 
@@ -708,24 +771,27 @@ def _collect_batch_result(batch: list[_JobEntry], call_handle: Any) -> None:
             }
 
             def _finish_job() -> None:
-                route_case_after_inference(entry, text_str, confidence_num)
-                _mark_status(
-                    entry.job_id,
-                    status="done",
-                    boot_id=boot_id,
-                    text=text_str,
-                    confidence=confidence_str,
-                    finished_at=str(int(time.time())),
-                )
-                _settle_job_billing(
-                    entry.job_id,
-                    {},
-                    success=True,
-                    billing_context=entry.billing_context,
-                )
-                _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, entry.msg_id)
-                _redis.xdel(_JOB_STREAM, entry.msg_id)
-                reclaim_logic.mark_processed(_JOB_STREAM, entry.msg_id)
+                try:
+                    route_case_after_inference(entry, text_str, confidence_num)
+                    _mark_status(
+                        entry.job_id,
+                        status="done",
+                        boot_id=boot_id,
+                        text=text_str,
+                        confidence=confidence_str,
+                        finished_at=str(int(time.time())),
+                    )
+                    _settle_job_billing(
+                        entry.job_id,
+                        {},
+                        success=True,
+                        billing_context=entry.billing_context,
+                    )
+                    _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, entry.msg_id)
+                    _redis.xdel(_JOB_STREAM, entry.msg_id)
+                    reclaim_logic.mark_processed(_JOB_STREAM, entry.msg_id)
+                finally:
+                    _stop_msg_heartbeat(entry.heartbeat_stop)
 
             run_traced_stream_handler(
                 stream=_JOB_STREAM,
@@ -741,20 +807,23 @@ def _collect_batch_result(batch: list[_JobEntry], call_handle: Any) -> None:
     except Exception as e:
         logger.exception("batch inference failed: size=%s", len(batch))
         for entry in batch:
-            _mark_status(
-                entry.job_id,
-                status="failed",
-                error=str(e),
-                finished_at=str(int(time.time())),
-            )
-            _settle_job_billing(
-                entry.job_id,
-                {},
-                success=False,
-                billing_context=entry.billing_context,
-            )
-            _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, entry.msg_id)
-            _redis.xdel(_JOB_STREAM, entry.msg_id)
+            try:
+                _mark_status(
+                    entry.job_id,
+                    status="failed",
+                    error=str(e),
+                    finished_at=str(int(time.time())),
+                )
+                _settle_job_billing(
+                    entry.job_id,
+                    {},
+                    success=False,
+                    billing_context=entry.billing_context,
+                )
+                _redis.xack(_JOB_STREAM, _CONSUMER_GROUP, entry.msg_id)
+                _redis.xdel(_JOB_STREAM, entry.msg_id)
+            finally:
+                _stop_msg_heartbeat(entry.heartbeat_stop)
 
 def _collect_result(job_id: str, msg_id: str, call_handle: Any) -> None:
     """
@@ -968,6 +1037,7 @@ def run_worker_forever() -> None:
                     except Exception as e:
                         logger.exception("batch dispatch failed: size=%s", len(batch))
                         for entry in batch:
+                            _stop_msg_heartbeat(entry.heartbeat_stop)
                             _mark_status(
                                 entry.job_id,
                                 status="failed",

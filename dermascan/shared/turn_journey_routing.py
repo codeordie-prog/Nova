@@ -277,6 +277,7 @@ async def whatsapp_ingress_should_queue_orchestrator(
 
     try:
         handler = await fetch_turn_active_handler(wa_id)
+        
     except httpx.HTTPError as exc:
         logger.warning(
             "Turn profile fetch failed for wa_id=%s: %s; delegating to Turn menu",

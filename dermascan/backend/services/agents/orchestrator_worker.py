@@ -94,7 +94,6 @@ from dermascan.backend.services.agents.model_fallback_chain import (
     ModelChainRunner,
     MODEL_CHAIN_MAX_RETRIES,
     MODEL_CHAIN_RETRY_DELAY_S,
-    build_chained_chat_model,
     build_model_chain_from_spec,
     is_recursion_error,
     is_tool_protocol_error,
@@ -107,6 +106,15 @@ from dermascan.backend.services.agents.model_fallback_chain import (
     structured_response_text,
     should_retry_agent_invoke,
     summarization_model_chain_spec,
+)
+from dermascan.backend.services.agents.model_chain_routing import (
+    begin_model_chain_turn,
+    build_selective_chained_chat_model,
+    end_model_chain_turn,
+    notify_gemini_model_failure,
+    orchestrator_alternate_chain_spec,
+    SelectiveModelChainRunner,
+    summarization_alternate_chain_spec,
 )
 from dermascan.backend.services.agents.memory.redis_checkpointer import (
     delete_thread as delete_checkpoint_thread,
@@ -537,8 +545,37 @@ def _invoke_agent_with_recursion_retry(
     if payload is None and build_payload is None:
         raise ValueError("either payload or build_payload is required")
 
-    last_exc: Optional[Exception] = None
     max_attempts = ORCHESTRATOR_RECURSION_MAX_RETRIES + 1
+
+    begin_model_chain_turn(_redis, request_id)
+    try:
+        return _invoke_agent_with_recursion_retry_body(
+            agent=agent,
+            config=config,
+            client_id=client_id,
+            request_id=request_id,
+            flow=flow,
+            payload=payload,
+            build_payload=build_payload,
+            max_attempts=max_attempts,
+        )
+    finally:
+        end_model_chain_turn()
+
+
+def _invoke_agent_with_recursion_retry_body(
+    *,
+    agent: Any,
+    config: RunnableConfig,
+    client_id: str,
+    request_id: str,
+    flow: str,
+    payload: Optional[dict[str, Any]] = None,
+    build_payload: Optional[Callable[[], dict[str, Any]]] = None,
+    max_attempts: int,
+) -> Any:
+    """Inner recursion retry loop (model chain turn context already bound)."""
+    last_exc: Optional[Exception] = None
 
     for attempt in range(max_attempts):
         if attempt > 0:
@@ -1486,8 +1523,10 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
     openai_cfg = get_config_file(CONFIG_PATH, "openai")
 
     chain_spec = orchestrator_model_chain_spec()
-    chain_entries = parse_model_chain_spec(chain_spec)
-    providers_in_chain = {provider for provider, _ in chain_entries}
+    alt_chain_spec = orchestrator_alternate_chain_spec()
+    providers_in_chain: set[str] = set()
+    for spec in (chain_spec, alt_chain_spec):
+        providers_in_chain |= {provider for provider, _ in parse_model_chain_spec(spec)}
 
     if "gemini" in providers_in_chain:
         if _use_vertex_ai():
@@ -1505,28 +1544,47 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
             "OpenAI fallback required: set OPENAI_API_KEY_QUTIS"
         )
 
-    model_chain = build_model_chain_from_spec(
-        chain_spec=chain_spec,
-        openai_api_key=OPENAI_API_KEY,
-        openai_temperature=float(openai_cfg["temperature"]),
-        openai_timeout_s=OPENAI_REQUEST_TIMEOUT_S,
-        gemini_temperature=float(google_cfg["temperature"]),
-        gemini_max_tokens=ORCHESTRATOR_MAX_TOKENS,
-        gemini_top_p=float(google_cfg["top_p"]),
-        gemini_thinking_level=ORCHESTRATOR_GEMINI_THINKING_LEVEL,
-        google_credentials_path=CRED_PATH,
-        google_project=PROJECT_ID,
-        google_location=LOCATION,
-        gemini_api_key=GEMINI_API_KEY,
-        gemini_timeout_s=GEMINI_REQUEST_TIMEOUT_S,
-        gemini_max_retries=GEMINI_MAX_RETRIES,
-    )
-    primary_model: Any = model_chain[0][1]
+    def _chain_build_kwargs(spec: str) -> dict[str, Any]:
+        return dict(
+            chain_spec=spec,
+            openai_api_key=OPENAI_API_KEY,
+            openai_temperature=float(openai_cfg["temperature"]),
+            openai_timeout_s=OPENAI_REQUEST_TIMEOUT_S,
+            gemini_temperature=float(google_cfg["temperature"]),
+            gemini_max_tokens=ORCHESTRATOR_MAX_TOKENS,
+            gemini_top_p=float(google_cfg["top_p"]),
+            gemini_thinking_level=ORCHESTRATOR_GEMINI_THINKING_LEVEL,
+            google_credentials_path=CRED_PATH,
+            google_project=PROJECT_ID,
+            google_location=LOCATION,
+            gemini_api_key=GEMINI_API_KEY,
+            gemini_timeout_s=GEMINI_REQUEST_TIMEOUT_S,
+            gemini_max_retries=GEMINI_MAX_RETRIES,
+        )
+
+    def _make_orchestrator_runner(spec: str) -> ModelChainRunner:
+        built = build_model_chain_from_spec(**_chain_build_kwargs(spec))
+        return ModelChainRunner(
+            built,
+            max_retries=MODEL_CHAIN_MAX_RETRIES,
+            retry_delay_s=MODEL_CHAIN_RETRY_DELAY_S,
+            record_attempt=lambda name, success: agent_call_tracer.record_model_attempt(
+                provider=name,
+                success=success,
+            ),
+            on_model_failure=lambda name, exc: notify_gemini_model_failure(
+                _redis, name, exc
+            ),
+        )
+
+    primary_model_chain = build_model_chain_from_spec(**_chain_build_kwargs(chain_spec))
+    primary_model: Any = primary_model_chain[0][1]
 
     logger.info(
-        "orchestrator model chain: %s (thinking_level=%s, max_tokens=%s, "
-        "chain_retries=%s, retry_delay_s=%s, gemini_timeout_s=%s)",
-        " -> ".join(name for name, _ in model_chain),
+        "orchestrator model chains: primary=%s alternate=%s (thinking_level=%s, "
+        "max_tokens=%s, chain_retries=%s, retry_delay_s=%s, gemini_timeout_s=%s)",
+        chain_spec.replace(",", " -> "),
+        alt_chain_spec.replace(",", " -> "),
         ORCHESTRATOR_GEMINI_THINKING_LEVEL,
         ORCHESTRATOR_MAX_TOKENS,
         MODEL_CHAIN_MAX_RETRIES,
@@ -1534,14 +1592,10 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         GEMINI_REQUEST_TIMEOUT_S,
     )
 
-    chain_runner = ModelChainRunner(
-        model_chain,
-        max_retries=MODEL_CHAIN_MAX_RETRIES,
-        retry_delay_s=MODEL_CHAIN_RETRY_DELAY_S,
-        record_attempt=lambda name, success: agent_call_tracer.record_model_attempt(
-            provider=name,
-            success=success,
-        ),
+    chain_runner = SelectiveModelChainRunner(
+        primary=_make_orchestrator_runner(chain_spec),
+        alternate=_make_orchestrator_runner(alt_chain_spec),
+        redis_client=_redis,
     )
 
     @wrap_model_call
@@ -1564,21 +1618,38 @@ def _build_dynamic_agent(*, checkpointer: Any) -> Any:
         max_trigger_tokens=ORCHESTRATOR_OPENAI_SUMMARIZATION_TRIGGER_TOKENS,
     )
 
-    summarization_model = build_chained_chat_model(
-        chain_spec=summarization_model_chain_spec(),
-        openai_api_key=OPENAI_API_KEY,
-        openai_temperature=float(openai_cfg["temperature"]),
-        openai_timeout_s=OPENAI_REQUEST_TIMEOUT_S,
-        gemini_temperature=0.0,
-        gemini_max_tokens=SUMMARIZATION_MAX_TOKENS,
-        gemini_top_p=float(google_cfg.get("top_p", 0.95)),
-        gemini_thinking_level=ORCHESTRATOR_GEMINI_THINKING_LEVEL,
-        google_credentials_path=CRED_PATH,
-        google_project=PROJECT_ID,
-        google_location=LOCATION,
-        gemini_api_key=GEMINI_API_KEY,
-        gemini_timeout_s=GEMINI_REQUEST_TIMEOUT_S,
-        gemini_max_retries=GEMINI_MAX_RETRIES,
+    def _make_summarization_runner(spec: str) -> ModelChainRunner:
+        built = build_model_chain_from_spec(
+            chain_spec=spec,
+            openai_api_key=OPENAI_API_KEY,
+            openai_temperature=float(openai_cfg["temperature"]),
+            openai_timeout_s=OPENAI_REQUEST_TIMEOUT_S,
+            gemini_temperature=0.0,
+            gemini_max_tokens=SUMMARIZATION_MAX_TOKENS,
+            gemini_top_p=float(google_cfg.get("top_p", 0.95)),
+            gemini_thinking_level=ORCHESTRATOR_GEMINI_THINKING_LEVEL,
+            google_credentials_path=CRED_PATH,
+            google_project=PROJECT_ID,
+            google_location=LOCATION,
+            gemini_api_key=GEMINI_API_KEY,
+            gemini_timeout_s=GEMINI_REQUEST_TIMEOUT_S,
+            gemini_max_retries=GEMINI_MAX_RETRIES,
+        )
+        return ModelChainRunner(
+            built,
+            max_retries=MODEL_CHAIN_MAX_RETRIES,
+            retry_delay_s=MODEL_CHAIN_RETRY_DELAY_S,
+            on_model_failure=lambda name, exc: notify_gemini_model_failure(
+                _redis, name, exc
+            ),
+        )
+
+    summarization_model = build_selective_chained_chat_model(
+        primary_runner=_make_summarization_runner(summarization_model_chain_spec()),
+        alternate_runner=_make_summarization_runner(
+            summarization_alternate_chain_spec()
+        ),
+        redis_client=_redis,
         label="summarization",
     )
 

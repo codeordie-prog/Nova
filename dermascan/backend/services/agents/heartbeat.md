@@ -1,6 +1,6 @@
 # Stream heartbeat (`heartbeat.py`)
 
-This document explains the **stream message heartbeat** used by the orchestrator worker, and how it fits together with the **per-client Redis lock**, the **lock lease extender**, and **reclaim logic**. The implementation lives in `heartbeat.py`; wiring is in `orchestrator_worker.py` and recovery in `reclaim_logic.py`.
+This document explains the **stream message heartbeat** used by the orchestrator worker, and how it fits together with the **per-client Redis lock**, the **lock lease extender**, and **reclaim logic**. The implementation lives in `heartbeat.py`; wiring is in `orchestrator_worker.py`, `indexing_worker.py`, the MedGemma Modal worker (`medgemma_service/worker.py`), and recovery in `reclaim_logic.py`.
 
 ---
 
@@ -13,6 +13,7 @@ Orchestrator work is driven by **Redis Streams consumer groups**:
 | `orchestrator:jobs` | User turns (WhatsApp/Telegram ingress) |
 | `orchestrator:signals` | Proactive updates (skin/product rules, reports) |
 | `rules:index:jobs` | Async CIR PDF indexing (off hot orchestrator threads) |
+| `medgemma:jobs` (Modal worker) | MedGemma inference (long Modal cold start + batch `run_batch`) |
 
 A message stays **pending** from the moment a consumer reads it until **`XACK`**. Long turns (LLM calls, Gemini 429 retries, product rules + ingredient indexing) can run **many minutes** while the message remains unacked.
 

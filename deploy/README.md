@@ -291,6 +291,8 @@ Set on **`dermascan-workers-staging`** (same as local outbound):
 
 **Inbound WhatsApp:** register Turn’s webhook on the **API** URL (`…/v1/webhooks/whatsapp`), not workers. Leave sidecar relay unused in cloud (`NOVA_WEBHOOK_URL` only matters if Turn posts to the adapter).
 
+**Paystack webhooks:** in the Paystack dashboard, set the webhook URL to the **API** service (`https://<dermascan-api-staging-…>/v1/webhooks/paystack`). Workers are IAM-private and only expose `GET /health` on `$PORT` — Paystack cannot attach a Google OIDC token, so `dermascan-workers-staging` will always return **403** at the Cloud Run layer. Do not grant `allUsers` on workers for this; security is `x-paystack-signature` verification on the API handler.
+
 Disable the in-container sidecar with `WHATSAPP_SIDECAR_ENABLED=false` (Telegram-only workers).
 
 Workers image includes **Tesseract** (`TESSERACT_PATH=/usr/bin/tesseract`) for lazy PDF indexing.

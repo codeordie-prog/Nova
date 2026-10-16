@@ -38,6 +38,11 @@ common_flags=(
   --set-secrets="${SECRETS_BLOCK}"
 )
 
+# Process-wide billing Postgres pools need CPU between HTTP requests so TCP
+# keepalives and pool checkout checks run; default Cloud Run throttling freezes
+# idle instances and stale sockets show up as psycopg OperationalError.
+no_cpu_throttle=( --no-cpu-throttling )
+
 echo "Deploying dermascan-api-staging..."
 gcloud run deploy dermascan-api-staging \
   --image="${IMAGE_PREFIX}/dermascan-api:${TAG}" \
@@ -50,6 +55,7 @@ gcloud run deploy dermascan-api-staging \
   --timeout=300 \
   --add-cloudsql-instances="${CLOUDSQL_CONNECTION}" \
   --set-env-vars="DERMASCAN_ENV_FILE=/secrets/env/.env,DERMASCAN_ROOT=/app,${POSTGRES_CLOUD_ENV}" \
+  "${no_cpu_throttle[@]}" \
   "${common_flags[@]}"
 
 API_URL="$(gcloud run services describe dermascan-api-staging \
@@ -71,6 +77,7 @@ gcloud run deploy dermascan-medgemma-gateway-staging \
   --timeout=300 \
   --add-cloudsql-instances="${CLOUDSQL_CONNECTION}" \
   --set-env-vars="DERMASCAN_ENV_FILE=/secrets/env/.env,DERMASCAN_ROOT=/app,${POSTGRES_CLOUD_ENV}" \
+  "${no_cpu_throttle[@]}" \
   "${common_flags[@]}"
 
 MEDGEMMA_GATEWAY_URL="$(gcloud run services describe dermascan-medgemma-gateway-staging \
@@ -90,7 +97,7 @@ worker_flags=(
   --min-instances=1
   --max-instances=1
   --timeout=3600
-  --no-cpu-throttling
+  "${no_cpu_throttle[@]}"
 )
 
 echo "Deploying dermascan-workers-staging..."
@@ -120,7 +127,7 @@ gcloud run deploy dermascan-telegram-bridge-staging \
   --min-instances=1 \
   --max-instances=1 \
   --timeout=3600 \
-  --no-cpu-throttling \
+  "${no_cpu_throttle[@]}" \
   "${common_flags[@]}"
 
 echo "Staging deploy complete."

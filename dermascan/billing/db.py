@@ -20,8 +20,9 @@ a vector store as a side effect.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from contextlib import contextmanager
-from typing import Any, Final, Iterator, Optional
+from typing import Any, Final, Iterator, Optional, TypeVar
 
 import psycopg
 from psycopg import Connection
@@ -45,6 +46,21 @@ _POSTGRES_PASSWORD_ENV_KEYS: Final[tuple[str, ...]] = (
 _POOL_MIN_SIZE: Final[int] = 1
 _POOL_MAX_SIZE: Final[int] = 5
 _CONNECT_TIMEOUT_S: Final[int] = 15
+# Recycle idle pool connections before Cloud SQL / proxy idle timeouts bite.
+_POOL_MAX_IDLE_S: Final[float] = max(
+    60.0, float(os.getenv("BILLING_DB_MAX_IDLE_S", "600"))
+)
+# TCP keepalives so idle Cloud Run instances (when CPU is allocated) stay visible.
+_KEEPALIVES: Final[int] = 1
+_KEEPALIVES_IDLE_S: Final[int] = max(
+    1, int(os.getenv("BILLING_DB_KEEPALIVES_IDLE_S", "60"))
+)
+_KEEPALIVES_INTERVAL_S: Final[int] = max(
+    1, int(os.getenv("BILLING_DB_KEEPALIVES_INTERVAL_S", "10"))
+)
+_KEEPALIVES_COUNT: Final[int] = max(
+    1, int(os.getenv("BILLING_DB_KEEPALIVES_COUNT", "3"))
+)
 
 _POOL: Optional[ConnectionPool] = None
 
@@ -94,7 +110,44 @@ def build_conninfo() -> str:
     )
     if sslmode:
         params["sslmode"] = sslmode
+    params["keepalives"] = _KEEPALIVES
+    params["keepalives_idle"] = _KEEPALIVES_IDLE_S
+    params["keepalives_interval"] = _KEEPALIVES_INTERVAL_S
+    params["keepalives_count"] = _KEEPALIVES_COUNT
     return make_conninfo(**params)
+
+
+def _check_pool_connection(conn: Connection) -> None:
+    """
+    Verify a pooled connection before handing it to billing code.
+
+    psycopg_pool discards dead sockets when this raises.
+    """
+    conn.execute("SELECT 1")
+
+
+def _is_transient_connection_error(exc: BaseException) -> bool:
+    """
+    Return True when a billing DB call likely failed due to a dropped socket.
+
+    Args:
+        exc: Exception from psycopg or the pool.
+
+    Returns:
+        bool: True for operational / connection-loss errors worth one retry.
+    """
+    if isinstance(exc, psycopg.OperationalError):
+        return True
+    message = str(exc).lower()
+    needles = (
+        "connection",
+        "closed",
+        "consuming input failed",
+        "server closed",
+        "broken pipe",
+        "timeout",
+    )
+    return any(needle in message for needle in needles)
 
 
 def get_pool(*, refresh: bool = False) -> ConnectionPool:
@@ -115,11 +168,17 @@ def get_pool(*, refresh: bool = False) -> ConnectionPool:
             conninfo=build_conninfo(),
             min_size=_POOL_MIN_SIZE,
             max_size=_POOL_MAX_SIZE,
+            max_idle=_POOL_MAX_IDLE_S,
+            check=_check_pool_connection,
             kwargs={"row_factory": dict_row},
             open=False,
         )
         _POOL.open()
-        logger.info("billing db pool opened: max_size=%s", _POOL_MAX_SIZE)
+        logger.info(
+            "billing db pool opened: max_size=%s max_idle_s=%s check=select_1",
+            _POOL_MAX_SIZE,
+            _POOL_MAX_IDLE_S,
+        )
     return _POOL
 
 
@@ -132,6 +191,42 @@ def reset_pool() -> None:
         except Exception:
             logger.exception("billing db pool close failed")
         _POOL = None
+
+
+_T = TypeVar("_T")
+
+
+def run_transaction(fn: Callable[[Connection], _T]) -> _T:
+    """
+    Run ``fn`` inside :func:`transaction`, retrying once on transient connection loss.
+
+    Use for short, idempotent billing mutations (e.g. ``get_or_create``) when a
+    stale pooled socket would otherwise fail the whole HTTP request.
+
+    Args:
+        fn: Callable receiving the open connection inside a transaction.
+
+    Returns:
+        _T: Return value of ``fn``.
+
+    Raises:
+        psycopg.Error: When both attempts fail or the error is not transient.
+    """
+    last_exc: BaseException | None = None
+    for attempt in (1, 2):
+        try:
+            with transaction() as conn:
+                return fn(conn)
+        except BaseException as exc:
+            if attempt == 2 or not _is_transient_connection_error(exc):
+                raise
+            last_exc = exc
+            logger.warning(
+                "billing db transient connection error; retrying transaction once: %s",
+                exc,
+            )
+    assert last_exc is not None
+    raise last_exc
 
 
 @contextmanager

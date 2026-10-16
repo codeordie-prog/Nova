@@ -9,6 +9,7 @@ import json
 import pytest
 
 from dermascan.billing import notify, paystack_client, webhook
+from dermascan.billing.db import build_conninfo
 
 pytestmark = pytest.mark.unit
 
@@ -150,3 +151,14 @@ class TestMessageCopy:
         text = notify.payment_confirmed_message(credits=100, balance=140)
         assert "140" in text
         assert "skin review" not in text
+
+
+class TestBillingDbConninfo:
+    """Billing Postgres conn string includes keepalive tuning."""
+
+    def test_build_conninfo_includes_tcp_keepalives(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("POSTGRESS_PASSWORD", "test-secret")
+        monkeypatch.setenv("POSTGRES_HOST", "10.0.0.1")
+        conninfo = build_conninfo()
+        assert "keepalives=1" in conninfo
+        assert "keepalives_idle=" in conninfo

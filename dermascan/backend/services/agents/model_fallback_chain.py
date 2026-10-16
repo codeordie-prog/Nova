@@ -88,14 +88,10 @@ OPENAI_REASONING_EFFORT: str = str(
     os.getenv("OPENAI_REASONING_EFFORT", "minimal")
 ).strip().lower()
 _PROVIDER_MAX_RETRIES_HARD_CAP: int = 3
+_DEFAULT_GEMINI_REQUEST_TIMEOUT_S: float = 45.0
 GEMINI_REQUEST_TIMEOUT_S: float = max(
     1.0,
-    float(
-        os.getenv(
-            "GEMINI_REQUEST_TIMEOUT_S",
-            os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"),
-        )
-    ),
+    float(os.getenv("GEMINI_REQUEST_TIMEOUT_S", str(_DEFAULT_GEMINI_REQUEST_TIMEOUT_S))),
 )
 GEMINI_MAX_RETRIES: int = max(
     1,
@@ -560,6 +556,9 @@ def should_fallback_to_next_model(exc: Exception) -> bool:
         "502",
         "503",
         "504",
+        "499",
+        "cancelled",
+        "canceled",
     )
     return any(marker in text for marker in transient_markers)
 
@@ -745,6 +744,9 @@ def is_provider_health_error(exc: Exception) -> bool:
         "502",
         "503",
         "504",
+        "499",
+        "cancelled",
+        "canceled",
     )
     for current in _iter_exception_chain(exc):
         class_name: str = current.__class__.__name__.lower()
@@ -878,6 +880,8 @@ class ModelChainRunner:
         max_retries: Number of times to re-walk the full chain after all models fail.
         retry_delay_s: Seconds to wait between full-chain retries.
         record_attempt: Optional callback ``(model_name, success) -> None``.
+        on_model_failure: Optional callback ``(model_name, exc) -> None`` after a
+            failed model attempt (before fall-through or re-raise).
     """
 
     def __init__(
@@ -889,6 +893,7 @@ class ModelChainRunner:
         agent_max_retries: int = AGENT_INVOKE_MAX_RETRIES,
         agent_retry_delay_s: float = AGENT_INVOKE_RETRY_DELAY_S,
         record_attempt: Optional[Callable[[str, bool], None]] = None,
+        on_model_failure: Optional[Callable[[str, Exception], None]] = None,
     ) -> None:
         if not model_chain:
             raise ValueError("model_chain must not be empty")
@@ -898,9 +903,24 @@ class ModelChainRunner:
         self._agent_max_retries = max(0, agent_max_retries)
         self._agent_retry_delay_s = max(0.0, agent_retry_delay_s)
         self._record_attempt = record_attempt
+        self._on_model_failure = on_model_failure
         self._breakers: dict[str, CircuitBreaker] = {
             name: load_model_circuit_breaker(name) for name, _ in model_chain
         }
+
+    def _emit_model_failure(self, model_name: str, exc: Exception) -> None:
+        """
+        Invoke optional failure hook for routing / observability.
+
+        Args:
+            model_name: Chain registry key for the model that failed.
+            exc: Raised exception.
+
+        Returns:
+            None
+        """
+        if self._on_model_failure is not None:
+            self._on_model_failure(model_name, exc)
 
     def invoke_middleware(
         self,
@@ -1178,6 +1198,7 @@ class ModelChainRunner:
                 last_exc = exc
                 record_breaker_outcome(breaker, exc)
                 self._record(name, False)
+                self._emit_model_failure(name, exc)
                 if is_last or not should_fallback_to_next_model(exc):
                     raise
                 logger.warning(
@@ -1231,6 +1252,7 @@ class ModelChainRunner:
                 last_exc = exc
                 record_breaker_outcome(breaker, exc)
                 self._record(name, False)
+                self._emit_model_failure(name, exc)
                 if is_last or not should_fallback_to_next_model(exc):
                     raise
                 logger.warning(
@@ -1285,6 +1307,7 @@ class ModelChainRunner:
                 last_exc = exc
                 record_breaker_outcome(breaker, exc)
                 self._record(name, False)
+                self._emit_model_failure(name, exc)
                 if is_last or not should_fallback_to_next_model(exc):
                     raise
                 logger.warning(
@@ -1345,6 +1368,7 @@ class ModelChainRunner:
             except Exception as exc:
                 last_exc = exc
                 record_breaker_outcome(breaker, exc)
+                self._emit_model_failure(name, exc)
                 if is_last or not should_fallback_to_next_model(exc):
                     raise
                 logger.warning(

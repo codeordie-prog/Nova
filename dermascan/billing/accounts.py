@@ -18,7 +18,7 @@ from typing import Any, Optional
 from psycopg import Connection
 
 from dermascan.billing import ledger, pricing
-from dermascan.billing.db import transaction
+from dermascan.billing.db import run_transaction, transaction
 from dermascan.shared.logger import get_logger
 from dermascan.shared.redis_stability import get_redis_client
 
@@ -86,7 +86,7 @@ def get_or_create(channel: str, client_id: str) -> Account:
     Returns:
         Account: Existing or newly created account.
     """
-    with transaction() as conn:
+    def _upsert(conn: Connection) -> Account:
         row = conn.execute(
             """
             INSERT INTO billing.account (channel, client_id)
@@ -96,7 +96,9 @@ def get_or_create(channel: str, client_id: str) -> Account:
             """,
             (channel, client_id),
         ).fetchone()
-    return _row_to_account(row)
+        return _row_to_account(row)
+
+    return run_transaction(_upsert)
 
 
 def get_by_id(account_id: str) -> Optional[Account]:

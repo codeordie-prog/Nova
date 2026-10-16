@@ -11,10 +11,10 @@ user (Telegram / WhatsApp)
   Backend API (FastAPI, :8088)
          │ XADD orchestrator:jobs
          ▼
-  Orchestrator worker ──► model chain (see §1)
-         │                  OpenAI: gpt-4o → gpt-4o-mini → gpt-5-mini → gpt-5
-         │                  then Gemini: gemini-3.5-flash → gemini-3.1-flash-lite
-         │                  per-model circuit breakers + full-chain retries
+  Orchestrator worker ──► model chains (see §1)
+         │                  Layer 0: primary (Gemini-first) or alternate (OpenAI-first)
+         │                  Layer 1: walk chain L→R, breakers, 499/504 fallback, retries
+         │                  Summarization uses the same Layer 0 choice per turn
          ├──► MedGemma gateway (vision, via orchestrator tools)
          ├──► rules engine (PostgreSQL) via signal enrichment
          │         report subagents: Gemini-first chain (REPORT_MODEL_CHAIN)
@@ -55,26 +55,52 @@ to the cloud. See `dermascan/docs/local-stack.md`.
 
 ## 1. LLM model chains
 
-The orchestrator and report subagents no longer use a single primary/fallback pair. Each flow runs an **ordered model chain** implemented in `dermascan/backend/services/agents/model_fallback_chain.py`.
+Orchestrator and summarization use **two stacked layers**:
 
-On each model call the worker walks the chain left to right. If a model returns 429, times out, hits a length limit, or its **per-model circuit breaker** is open, the next entry is tried. When every model in the chain fails, the worker waits (`MODEL_CHAIN_RETRY_DELAY_S`) and re-walks the full chain up to `MODEL_CHAIN_MAX_RETRIES` times.
+| Layer | Module | Question |
+|-------|--------|----------|
+| **0 — Routing** | `model_chain_routing.py` | Which ordered playlist for this **turn**? Primary (Gemini-first) or alternate (OpenAI-first)? |
+| **1 — Fallback** | `model_fallback_chain.py` | On this **step**, did model *n* fail in a retryable way → try model *n+1*? |
 
-### Orchestrator (Gemini first, then OpenAI)
+Report subagents use **Layer 1 only** (`REPORT_MODEL_CHAIN` in `product_rules_signal_helper.py`).
 
-Used for conversational tool calling in `orchestrator_worker.py`:
+### Layer 1 — Within-chain fallback
 
-```
-gemini:gemini-3.5-flash → gemini:gemini-3.1-flash-lite
-    → openai:gpt-4o → openai:gpt-5
-```
+On each LLM call the worker walks the active chain **left to right**. Retryable failures include timeouts, 504, **499/cancelled**, rate limits, and connection errors (see `should_fallback_to_next_model`). Each model has a **per-model circuit breaker** (`provider_circuit_breaker.py`); an open breaker skips that model for a short cooldown. Request-shaped errors (tool protocol, JSON parse, context length) do **not** open breakers.
 
-Configure with `ORCHESTRATOR_MODEL_CHAIN` (comma-separated `provider:model_id` entries).
+When every model in the chain fails once, the worker waits `MODEL_CHAIN_RETRY_DELAY_S` and re-walks the **same** chain up to `MODEL_CHAIN_MAX_RETRIES` times.
 
-Additional orchestrator resilience:
+### Layer 0 — Primary vs alternate chain (orchestrator + summarization)
+
+Two parallel specs (comma-separated `provider:model_id`):
+
+**Primary (default, cost-optimized)**
+
+- Orchestrator — `ORCHESTRATOR_MODEL_CHAIN`:  
+  `gemini:gemini-3.5-flash` → `gemini:gemini-3.1-flash-lite` → `openai:gpt-4o` → `openai:gpt-5`
+- Summarization — `SUMMARIZATION_MODEL_CHAIN`:  
+  `gemini:gemini-3.1-flash-lite` → `openai:gpt-4o-mini`
+
+**Alternate (OpenAI-first escape hatch)**
+
+- `ORCHESTRATOR_MODEL_CHAIN_ALT`:  
+  `openai:gpt-4o-mini` → `openai:gpt-5-mini` → `gemini:gemini-3.1-flash-lite` → `gemini:gemini-3.5-flash`
+- `SUMMARIZATION_MODEL_CHAIN_ALT`:  
+  `openai:gpt-4o-mini` → `openai:gpt-5-mini` → `gemini:gemini-3.1-flash-lite`
+
+**When alternate is selected**
+
+1. **Fleet degraded** — After `MODEL_CHAIN_GEMINI_ERROR_THRESHOLD` Gemini health-style errors within `MODEL_CHAIN_GEMINI_ERROR_WINDOW_S`, Redis sets `model_chain:gemini_degraded` for `MODEL_CHAIN_GEMINI_DEGRADED_TTL_S`. New turns bind alternate until the key expires.
+2. **Test override** — `MODEL_CHAIN_PREFER_PRIMARY=false` (or `off` / `0`) forces alternate on every turn without waiting for Redis.
+3. **Turn stickiness** — At agent invoke start (`begin_model_chain_turn`), the mode is stored for that `request_id` so all tool-loop steps and summarization in the same turn share one playlist.
+
+Gemini step failures feed the degraded counter via `ModelChainRunner.on_model_failure` → `notify_gemini_model_failure`.
+
+### Orchestrator resilience (beyond chains)
 
 - **Recursion retries** — on `GraphRecursionError`, reset the client checkpoint and retry the turn (`ORCHESTRATOR_RECURSION_MAX_RETRIES`).
 - **Tool-call caps** — limit polling tools such as `get_time` and `read_status_of_a_case`.
-- **Summarization** — checkpoint compression uses `SUMMARIZATION_MODEL_CHAIN` (Gemini-first by default).
+- **Timeouts** — `GEMINI_REQUEST_TIMEOUT_S` (default 120s) per Gemini call; OpenAI uses `OPENAI_REQUEST_TIMEOUT_S`.
 
 ### Report subagents (Gemini first, then OpenAI)
 
@@ -109,6 +135,11 @@ OpenAI reasoning models consume output tokens for hidden reasoning. Set a higher
 | `ORCHESTRATOR_MAX_TOKENS` | Default max output tokens per call (non-reasoning OpenAI) |
 | `MODEL_CB_FAILURE_THRESHOLD` / `MODEL_CB_COOLDOWN_S` | Per-model circuit breaker |
 | `MODEL_CHAIN_MAX_RETRIES` / `MODEL_CHAIN_RETRY_DELAY_S` | Full-chain retry when all models fail |
+| `ORCHESTRATOR_MODEL_CHAIN_ALT` / `SUMMARIZATION_MODEL_CHAIN_ALT` | OpenAI-first alternate playlists |
+| `MODEL_CHAIN_PREFER_PRIMARY` | `true` = normal; `false` = always alternate (testing) |
+| `MODEL_CHAIN_GEMINI_ERROR_*` / `MODEL_CHAIN_GEMINI_DEGRADED_TTL_S` | When to set fleet degraded |
+| `MODEL_CHAIN_TURN_STICKY_TTL_S` | Redis TTL for per-turn chain binding |
+| `GEMINI_REQUEST_TIMEOUT_S` | HTTP deadline for each Gemini generate call |
 
 Legacy `ORCHESTRATOR_OPENAI_MODEL`, `ORCHESTRATOR_GEMINI_MODEL`, and `REPORT_AGENT_MODEL` are ignored when the corresponding `*_MODEL_CHAIN` env vars are set.
 
@@ -164,7 +195,7 @@ This script runs:
 
 | Worker | Role |
 |---|---|
-| `orchestrator_worker` | Consumes jobs + signals; walks `ORCHESTRATOR_MODEL_CHAIN` with per-model breakers |
+| `orchestrator_worker` | Consumes jobs + signals; Layer 0 routing + Layer 1 chain walk with breakers |
 | `outbound_sender_worker` | Compacts and delivers replies to Telegram / WhatsApp |
 
 **Not included:** `knowledge_worker` (optional, start manually) and **MedGemma** (separate AI-service stack below).
@@ -210,7 +241,7 @@ See `dermascan/ai_service/modal/medgemma_service/README.md` for gateway config.
 | Directory | Purpose |
 |---|---|
 | `dermascan/backend` | API server, agent workers, orchestrator tools |
-| `dermascan/backend/services/agents` | Workers, `model_fallback_chain.py`, circuit breakers |
+| `dermascan/backend/services/agents` | Workers, `model_fallback_chain.py`, `model_chain_routing.py`, circuit breakers |
 | `dermascan/ai_service` | MedGemma Modal app, inference postprocessing |
 | `dermascan/rules_engine` | PostgreSQL-backed ingredient safety engine |
 | `dermascan/scripts` | Worker supervisor (`do_work.py`) and utility scripts |

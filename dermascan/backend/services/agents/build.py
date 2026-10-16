@@ -252,7 +252,7 @@ def build_summarization_gemini_model(
     if gemini_timeout_raw:
         summarization_timeout_s = float(gemini_timeout_raw)
     else:
-        summarization_timeout_s = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "45"))
+        summarization_timeout_s = 45.0
     return build_gemini_chat_model(
         model=model_name,
         temperature=0.0,

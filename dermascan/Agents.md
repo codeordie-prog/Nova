@@ -29,8 +29,10 @@
         │  backend/services/agents/              │
         │      orchestrator_worker.py            │
         │                                        │
-        │   LLM chain: Qwen (primary) ───────────┼──► Qwen Service (Modal vLLM)
-        │              OpenAI → Gemini (fallback)│    ai_service/modal/qwen_service/
+        │   LLM: primary or alternate chain      │
+        │   (model_chain_routing +               │
+        │    model_fallback_chain)               │
+        │   Gemini-first OR OpenAI-first         │
         │                                        │
         │   reads: orchestrator:jobs             │
         │          orchestrator:signals  <───────┼── awareness loop
@@ -84,16 +86,34 @@ This runs orchestrator and outbound-sender in one supervisor process. **MedGemma
 - **Prompt:** `dermascan/backend/services/agents/prompts/orchestrator_prompt.py`
 - **Personality / principles:** `dermascan/backend/services/agents/soul.md`
 - **Self-description:** `dermascan/backend/services/agents/awareness.md`
-- **Primary LLM:** Qwen via `QWEN_BASE_URL` (Modal vLLM OpenAI-compatible endpoint)
-- **Fallback LLMs:** OpenAI (`OPENAI_API_KEY_QUTIS`), then Gemini (`GEMINI_API_KEY_QUTIS`)
+- **LLM providers:** Gemini (Vertex AI or AI Studio) and OpenAI (`OPENAI_API_KEY_QUTIS`), wired through ordered model chains — not a single primary/fallback pair.
 
 **Role**
 - It is the **mouth and ears** of the system.
 - It consumes user messages from `orchestrator:jobs` and produces user-facing replies.
 - It also consumes internal events from `orchestrator:signals` and proactively reaches out to the user when something important has happened (a completed diagnosis, a high-confidence signal, a poison-pill case, etc.).
 
-**Model chain**
-When `QWEN_BASE_URL` is set, the orchestrator builds a middleware-backed chain: **Qwen → OpenAI → Gemini**. Qwen is the primary reasoning and tool-calling model; cloud providers act as fallbacks if Qwen is unreachable. Deploy Qwen with `dermascan/scripts/deploy_qwen_app.py`.
+**Model chains (two layers)**
+
+1. **Which playlist?** — `model_chain_routing.py` (Layer 0)  
+   At the start of each turn (`request_id`), the worker binds **primary** (Gemini-first) or **alternate** (OpenAI-first):
+   - Normal: primary unless Redis key `model_chain:gemini_degraded` is set (after enough Gemini health errors fleet-wide).
+   - Test: set `MODEL_CHAIN_PREFER_PRIMARY=false` to always use the alternate chain.
+   - The choice is **sticky for the whole turn** (orchestrator steps + checkpoint summarization).
+
+2. **Walk the playlist** — `model_fallback_chain.py` (Layer 1)  
+   On each LLM step, models are tried **left to right**. Transient failures (timeout, 504, **499/cancelled**, rate limits, etc.) fall through to the next model. Each model has a **sliding-window circuit breaker** (`provider_circuit_breaker.py`). If every model fails, the worker may **re-walk the same playlist** after `MODEL_CHAIN_RETRY_DELAY_S` (`MODEL_CHAIN_MAX_RETRIES`).
+
+**Default chain specs** (override via env):
+
+| Mode | Orchestrator (`ORCHESTRATOR_MODEL_CHAIN`) | Summarization (`SUMMARIZATION_MODEL_CHAIN`) |
+|------|---------------------------------------------|---------------------------------------------|
+| Primary | `gemini-3.5-flash` → `gemini-3.1-flash-lite` → `gpt-4o` → `gpt-5` | `gemini-3.1-flash-lite` → `gpt-4o-mini` |
+| Alternate | `gpt-4o-mini` → `gpt-5-mini` → `gemini-3.1-flash-lite` → `gemini-3.5-flash` | `gpt-4o-mini` → `gpt-5-mini` → `gemini-3.1-flash-lite` |
+
+Alternate orchestrator/summarization lists: `ORCHESTRATOR_MODEL_CHAIN_ALT`, `SUMMARIZATION_MODEL_CHAIN_ALT`. Degraded-mode tuning: `MODEL_CHAIN_GEMINI_ERROR_THRESHOLD`, `MODEL_CHAIN_GEMINI_ERROR_WINDOW_S`, `MODEL_CHAIN_GEMINI_DEGRADED_TTL_S`, `MODEL_CHAIN_TURN_STICKY_TTL_S`.
+
+Gemini failures on a step also call `notify_gemini_model_failure` (via `ModelChainRunner.on_model_failure`) to increment the Redis error counter toward degraded mode.
 
 **Two-loop design**
 1. **Job loop** — reactive: user sends something, orchestrator replies.
@@ -103,26 +123,14 @@ This dual-loop design is what `awareness.md` describes as its **internal forever
 
 ---
 
-### 2.2 Qwen Service (Primary Orchestrator LLM)
+### 2.2 Qwen Service (optional self-hosted LLM)
 - **Folder:** `dermascan/ai_service/modal/qwen_service/`
 - **Modal app:** `app.py` (`QwenService` class, GPU L40S)
-- **Config:** `config/config.json`
 - **Deploy script:** `dermascan/scripts/deploy_qwen_app.py`
-- **Smoke test:** `dermascan/scripts/qwen_langchain_agent.py`
 
 **Role**
-- Serves `Qwen/Qwen3-8B` via vLLM as an OpenAI-compatible HTTP API (`/v1/chat/completions`).
-- The orchestrator worker connects through `ChatOpenAI(base_url=QWEN_BASE_URL)` with tool-calling support.
-- Qwen3 "thinking" mode is disabled by default (`QWEN_ENABLE_THINKING=false`) so completions are clean and tool-callable.
-
-**Deploy**
-
-```bash
-modal secret create huggingface HF_TOKEN=
-poetry run python dermascan/scripts/deploy_qwen_app.py
-```
-
-Set `QWEN_BASE_URL` to the Modal HTTPS URL with `/v1` suffix. This is the **primary brain** of the orchestrator — not a side experiment.
+- Optional: serves `Qwen/Qwen3-8B` via vLLM as an OpenAI-compatible HTTP API.
+- **Not** the default orchestrator path today — production orchestrator uses `ORCHESTRATOR_MODEL_CHAIN` (Gemini/OpenAI via `model_fallback_chain.py`). Qwen remains available for experiments or a custom chain entry if you add `openai:` pointed at `QWEN_BASE_URL` in the chain spec.
 
 ---
 
@@ -226,7 +234,10 @@ These flows are invoked by the orchestrator’s **signal loop** when the corresp
 | Skin signal flow | same file (`run_skin_signal_rules_flow`) |
 | Group report aggregator | `dermascan/backend/services/agents/group_report_aggregator.py` |
 | Telegram polling bridge | `dermascan/backend/services/agents/telegram_polling_bridge.py` |
-| Agent build / checkpointer | `dermascan/backend/services/agents/build.py` |
+| Model chain (Layer 1 fallback) | `dermascan/backend/services/agents/model_fallback_chain.py` |
+| Model chain routing (Layer 0) | `dermascan/backend/services/agents/model_chain_routing.py` |
+| Per-model circuit breakers | `dermascan/backend/services/agents/provider_circuit_breaker.py` |
+| Agent build / Gemini clients | `dermascan/backend/services/agents/build.py` |
 | Config loader | `dermascan/backend/services/agents/loader.py` |
 
 ---
