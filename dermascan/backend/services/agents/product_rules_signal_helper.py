@@ -91,6 +91,12 @@ from dermascan.shared.delivery_context import (
     load_delivery_context,
     merge_profile_into_skin_audit,
 )
+from dermascan.shared.product_report_enrichment import (
+    ensure_dermatologist_connection_offer,
+    product_safety_report_format_instructions,
+    resolve_product_display_name,
+    skin_review_with_routine_format_instructions,
+)
 from dermascan.shared.skin_audit_store import (
     load_latest_skin_audit,
     parse_signal_confidence,
@@ -771,14 +777,13 @@ def _product_report_system_prompt(
         "Convert structured product safety evidence into a brief audit for a non-technical user. "
         "Do not claim medical diagnosis and do not prescribe treatment. "
         "Use only the product evidence provided in the user prompt. Do not search the web. "
-        f"{compact_message_format_instructions()}\n"
-        f"{dermatologist_connection_guidance()}\n"
+        f"{product_safety_report_format_instructions()}\n"
         f"{personalization_clause}"
         "Do NOT mention filler or low-risk ingredients (water, aqua, glycerin, basic emollients, "
         "common preservatives) unless they are the main safety issue. "
         "Synthesize across the formula into a few safety themes only (contraindications, pregnancy/lactation, "
         "irritation/sensitization, photosensitivity, actives to introduce slowly). "
-        "Put the product name in line 1 when known. "
+        "Follow the Line 1 / Function / bullets template exactly. "
         "Do not include URLs in the report body (sources are appended separately). "
         f"{mode_guidance}\n"
         f"{guidance_line}\n"
@@ -820,10 +825,9 @@ def _product_report_user_prompt(
         guidance_line = product_report_guidance_mode_instructions(guidance_mode)
     return (
         "Generate the final product audit using the inputs below.\n"
-        f"{compact_message_format_instructions()}\n"
+        f"{product_safety_report_format_instructions()}\n"
         f"{mode_line}\n"
         f"{guidance_line}\n"
-        "Put the product name in line 1 when available.\n"
         "If evidence is missing, state 'unknown' briefly and continue.\n"
         f"product_name: {product_name}\n"
         f"description: {description}\n"
@@ -903,8 +907,7 @@ def _skin_review_system_prompt(
         "Produce a brief image-based skin pattern review from the visible appearance summary, condition summary, "
         "and needs/treatment context. "
         "Use only the image-review evidence provided in the user prompt. Do not search the web. "
-        f"{compact_message_format_instructions()}\n"
-        f"{dermatologist_connection_guidance()}\n"
+        f"{skin_review_with_routine_format_instructions()}\n"
         "Do not prescribe medications, dosages, or definitive treatment plans. "
         "Use cautious language such as 'appears consistent with', 'may suggest', 'could reflect', "
         "and 'image-based review cannot confirm'. "
@@ -914,6 +917,123 @@ def _skin_review_system_prompt(
         "Do not include URLs in the report body (sources are appended separately). "
         f"last_conversation_entries: {json.dumps(context, default=str)}\n"
         f"{delivery_prompt}\n"
+    )
+
+
+def _search_product_reference_text(product_name: str, description: str) -> str:
+    """
+    Collect reference text for a product when the label INCI list is unavailable.
+
+    Args:
+        product_name: Resolved product name.
+        description: Supplemental description text.
+
+    Returns:
+        str: Search reference payload or empty string.
+    """
+    if product_name.strip():
+        inci_text = _search_incidecoder_reference(product_name)
+        if inci_text.strip():
+            return inci_text
+    query = f"{product_name or description} skincare product ingredients".strip()
+    if not query or query == "skincare product ingredients":
+        return ""
+    try:
+        return str(report_internet_search.invoke({"query": query, "max_results": 3}))
+    except Exception:
+        logger.exception("product reference web search failed")
+        return ""
+
+
+def build_best_effort_product_report_without_inci(
+    *,
+    product_name: str,
+    description: str,
+    context: list[dict[str, Any]],
+    delivery: Optional[DeliveryContext],
+    personalization_mode: PersonalizationMode,
+    latest_skin_audit: dict[str, Any],
+    invoke_config: Optional[RunnableConfig] = None,
+    guidance_mode: GuidanceMode | None = None,
+    apply_guidance_mode: bool = False,
+) -> str:
+    """
+    Build a best-effort product report when INCI extraction returned no ingredients.
+
+    Args:
+        product_name: Product name from the signal payload.
+        description: Product description from payload.
+        context: Recent conversation entries.
+        delivery: Delivery context for prompt formatting.
+        personalization_mode: Active personalization mode.
+        latest_skin_audit: Latest skin audit snapshot for the client.
+        invoke_config: Optional tracing config.
+        guidance_mode: Optional decision-confidence band.
+        apply_guidance_mode: When True, apply guidance-mode footers.
+
+    Returns:
+        str: User-facing report text.
+    """
+    mode = normalize_personalization_mode(personalization_mode)
+    resolved_name = resolve_product_display_name(
+        product_name,
+        context=context,
+        description=description,
+    )
+    reference_text = _search_product_reference_text(resolved_name, description)
+    delivery_prompt = format_delivery_context_for_prompt(delivery) if delivery else ""
+    system_prompt = _product_report_system_prompt(
+        context,
+        delivery_prompt,
+        personalization_mode=mode,
+        guidance_mode=guidance_mode,
+        apply_guidance_mode=apply_guidance_mode,
+    )
+    prompt = (
+        "The product label INCI list could not be read. Produce a best-effort safety review using "
+        "search reference text, conversation context, and skin/profile context. "
+        "Do not tell the user to resend a photo as the only outcome — give useful guidance, "
+        "alternatives when cautions apply, and note label uncertainty briefly if needed.\n"
+        f"{product_safety_report_format_instructions()}\n"
+        f"product_name: {resolved_name or product_name or 'unknown product'}\n"
+        f"description: {description}\n"
+        f"search_reference_text: {reference_text or '(no reference found)'}\n"
+        f"skin_audit_snapshot: {json.dumps(latest_skin_audit, default=str)}\n"
+    )
+    try:
+        message = _invoke_compact_report(
+            system_prompt=system_prompt,
+            prompt=prompt,
+            operation="product_best_effort_unlabeled",
+            invoke_config=invoke_config,
+        )
+        report_text = ensure_dermatologist_connection_offer(
+            finalize_compact_report_body(message)
+        )
+        return finalize_product_report_text(
+            report_text,
+            personalization_mode=mode,
+            guidance_mode=guidance_mode,
+            apply_guidance_mode=apply_guidance_mode,
+        )
+    except Exception:
+        logger.exception("failed to build best-effort unlabeled product report")
+
+    fallback_name = resolved_name or product_name or "this product"
+    report_text = ensure_dermatologist_connection_offer(
+        build_static_micro_report(
+            headline=f"{fallback_name}: Safety Review",
+            bullets=[
+                "Function: general skincare product — label details were limited.",
+                "Better for you because: consider a gentle, fragrance-free option matched to your skin concern.",
+            ],
+        )
+    )
+    return finalize_product_report_text(
+        report_text,
+        personalization_mode=mode,
+        guidance_mode=guidance_mode,
+        apply_guidance_mode=apply_guidance_mode,
     )
 
 
@@ -932,7 +1052,7 @@ def build_skin_review_report(
     system_prompt = _skin_review_system_prompt(context, delivery_prompt)
     prompt = (
         "Generate the final image-based skin pattern review using the inputs below.\n"
-        f"{compact_message_format_instructions()}\n"
+        f"{skin_review_with_routine_format_instructions()}\n"
         "If evidence is missing, state 'unknown' briefly and continue.\n"
         "Personalize using client context when allergies, pregnancy, or goals are present.\n"
         f"visible_appearance_summary: {diagnosis}\n"
@@ -949,7 +1069,7 @@ def build_skin_review_report(
             operation="skin_review_report",
             invoke_config=invoke_config,
         )
-        return finalize_compact_report_body(message)
+        return ensure_dermatologist_connection_offer(finalize_compact_report_body(message))
     except Exception:
         logger.exception("failed to build skin review report")
 
@@ -1021,7 +1141,9 @@ def build_user_friendly_report(
             operation="product_user_friendly_report",
             invoke_config=invoke_config,
         )
-        report_text = finalize_compact_report_body(message)
+        report_text = ensure_dermatologist_connection_offer(
+            finalize_compact_report_body(message)
+        )
         return finalize_product_report_text(
             report_text,
             personalization_mode=mode,
@@ -1121,17 +1243,28 @@ def run_product_signal_rules_flow(fields: dict[str, Any], context: list[dict[str
     # and produce a misleading "no info" report) and ask for a clearer label photo.
     if not extraction.ingredients:
         logger.warning(
-            "product review has no readable ingredients; skipping rules engine: "
+            "product review has no readable ingredients; using best-effort report: "
             "request_id=%s case_id=%s client_id=%s product_name=%s",
             request_id,
             case_id,
             client_id,
             product_name or "<empty>",
         )
+        apply_guidance = cosmetic_guidance_mode_active()
+        user_friendly_report = build_best_effort_product_report_without_inci(
+            product_name=product_name,
+            description=description,
+            context=context,
+            delivery=delivery,
+            personalization_mode=personalization_mode,
+            latest_skin_audit=latest_skin_audit,
+            invoke_config=trace_config,
+            apply_guidance_mode=apply_guidance,
+        )
         return {
             "summary": "",
-            "user_friendly_report": PRODUCT_LABEL_UNREADABLE_MESSAGE,
-            "sources": [],
+            "user_friendly_report": user_friendly_report,
+            "sources": _limit_sources(extraction.sources),
             "ingredients": [],
             "indexed_ingredients": [],
             "report": {},

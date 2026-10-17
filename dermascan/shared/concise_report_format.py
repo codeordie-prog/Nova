@@ -19,14 +19,14 @@ if TYPE_CHECKING:
 
 log: logging.Logger = logging.getLogger(__name__)
 
-REPORT_MAX_CHARS: int = max(280, int(os.getenv("SIGNAL_REPORT_MAX_CHARS", "600")))
+REPORT_MAX_CHARS: int = max(280, int(os.getenv("SIGNAL_REPORT_MAX_CHARS", "820")))
 REPORT_HEADLINE_MAX_CHARS: int = max(60, int(os.getenv("SIGNAL_REPORT_HEADLINE_MAX_CHARS", "120")))
-REPORT_BULLET_MAX_CHARS: int = max(40, int(os.getenv("SIGNAL_REPORT_BULLET_MAX_CHARS", "100")))
-REPORT_MAX_BULLETS: int = max(1, int(os.getenv("SIGNAL_REPORT_MAX_BULLETS", "2")))
-REPORT_FOOTER_MAX_CHARS: int = max(40, int(os.getenv("SIGNAL_REPORT_FOOTER_MAX_CHARS", "120")))
+REPORT_BULLET_MAX_CHARS: int = max(40, int(os.getenv("SIGNAL_REPORT_BULLET_MAX_CHARS", "130")))
+REPORT_MAX_BULLETS: int = max(1, int(os.getenv("SIGNAL_REPORT_MAX_BULLETS", "3")))
+REPORT_FOOTER_MAX_CHARS: int = max(40, int(os.getenv("SIGNAL_REPORT_FOOTER_MAX_CHARS", "140")))
 COMPACT_REPORT_BODY_MAX_CHARS: int = min(
     REPORT_MAX_CHARS,
-    max(200, int(os.getenv("SIGNAL_REPORT_COMPACT_BODY_MAX_CHARS", "520"))),
+    max(200, int(os.getenv("SIGNAL_REPORT_COMPACT_BODY_MAX_CHARS", "660"))),
 )
 COMPACT_REPORT_MIN_BODY_CHARS: int = max(
     20, int(os.getenv("SIGNAL_REPORT_COMPACT_MIN_BODY_CHARS", "40"))
@@ -95,7 +95,7 @@ def compact_message_format_instructions(
         "Return one plain-text `message` for WhatsApp/Telegram (not JSON with separate fields):\n"
         "- Line 1: short title or summary.\n"
         f"- Lines 2–3: exactly {REPORT_MAX_BULLETS} short tips (you may prefix with •).\n"
-        "- When dermatology input may help, weave a brief in-chat connection offer into a tip "
+        "- ALWAYS include the in-chat dermatologist connection offer in the message "
         f'(e.g. "{DERMATOLOGIST_CONNECTION_OFFER}") — not an external referral.\n'
         f"Keep the entire `message` under {max_chars} characters. "
         "Do NOT include disclaimer, legal/educational footer, or URLs (those are appended in code). "
