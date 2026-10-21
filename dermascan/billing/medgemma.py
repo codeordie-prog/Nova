@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-21
 License: MIT
@@ -7,6 +9,7 @@ MedGemma flat-SKU billing (hold at enqueue, meter + settle on worker completion)
 
 Reservation key: ``medgemma_job_id`` (the Redis stream job id).
 """
+
 
 from __future__ import annotations
 

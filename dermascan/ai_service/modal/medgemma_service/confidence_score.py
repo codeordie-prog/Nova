@@ -2,6 +2,7 @@
 Author: Dermascan Team
 Date: 2026-4-14
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 This module computes the diagnosis/product review confidence score of the model.
 The logic here is:
@@ -19,8 +20,8 @@ ELSE IF Product review:
 
 
 The mathematical description is provided in the `confidence_score_algorithm.md` file.
-
 """
+
 
 import json
 import math

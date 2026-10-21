@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Local ingress gateway for single-tunnel ngrok dev.
 
 Routes public traffic on one port to the WhatsApp sidecar (:8000) and Nova API (:8088):
@@ -11,6 +13,7 @@ Run:
 
 Then: ngrok http 9000
 """
+
 
 from __future__ import annotations
 

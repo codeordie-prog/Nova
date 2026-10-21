@@ -1,10 +1,13 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2025-10-16
 License: MIT
 
 Schemas for web endpoints, with Pydantic models for request and response validation.
 """
+
 
 from typing import List
 from typing import Optional

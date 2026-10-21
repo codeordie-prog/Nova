@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan team
 Date: 2026-03-12
 License: MIT
@@ -7,6 +9,7 @@ A decorator that times the execution of a function.
 The function is reusable across different functions.
 
 """
+
 
 import asyncio
 import time

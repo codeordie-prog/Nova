@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-07
 License: MIT
@@ -8,6 +10,7 @@ Feature flags for the cosmetic-intelligence pivot.
 All flags default to legacy (off) behavior so existing deployments are unchanged
 until each phase is explicitly enabled.
 """
+
 
 from __future__ import annotations
 

@@ -2,14 +2,15 @@
 Author: Dermascan Team
 Date: 2026-07-07
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 Description:
 
 Per-model LLM fallback chain with circuit breakers and full-chain retries.
 
 Orchestrator middleware and report subagents share this module so each model
 is tried in order (Gemini variants first for orchestrator/reports, then OpenAI
-fallback) before giving up.
-"""
+fallback) before giving up."""
+
 
 from __future__ import annotations
 

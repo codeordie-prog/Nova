@@ -1,7 +1,10 @@
-"""Integration tests: real Redis connectivity via testcontainers.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Integration tests: real Redis connectivity via testcontainers.
 
 Step 6 in redis_tests.md — confirms Docker + shared stability helpers against a live Redis 7 instance.
 """
+
 
 from __future__ import annotations
 

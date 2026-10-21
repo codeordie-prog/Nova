@@ -1,4 +1,7 @@
-"""Unit tests for model chain routing (Layer 0 primary vs alternate)."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for model chain routing (Layer 0 primary vs alternate)."""
+
 
 from __future__ import annotations
 

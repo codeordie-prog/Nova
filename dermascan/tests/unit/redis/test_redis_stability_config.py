@@ -1,7 +1,10 @@
-"""Unit tests for RedisStabilityConfig and client factory.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for RedisStabilityConfig and client factory.
 
 Source: dermascan/shared/redis_stability.py
 """
+
 
 from __future__ import annotations
 

@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-09-24
 License: MIT
@@ -6,6 +8,7 @@ License: MIT
 Consume ``rules:index:jobs``, run CIR PDF lazy indexing off the orchestrator hot path,
 and emit ``product_review_index_ready`` when a request batch completes.
 """
+
 
 from __future__ import annotations
 

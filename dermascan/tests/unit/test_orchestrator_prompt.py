@@ -1,4 +1,7 @@
-"""Snapshot tests for orchestrator cosmetic positioning (Step 4.1)."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Snapshot tests for orchestrator cosmetic positioning (Step 4.1)."""
+
 
 from __future__ import annotations
 

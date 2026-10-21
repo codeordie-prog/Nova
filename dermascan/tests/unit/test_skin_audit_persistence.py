@@ -1,4 +1,7 @@
-"""Unit tests for skin audit Redis persistence helpers."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for skin audit Redis persistence helpers."""
+
 
 from __future__ import annotations
 

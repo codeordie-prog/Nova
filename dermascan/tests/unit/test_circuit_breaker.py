@@ -1,8 +1,11 @@
-"""Unit tests for provider circuit breaker state machine.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for provider circuit breaker state machine.
 
 Concerns: R7 — provider failover; C5 — circuit-breaker thread safety.
 Source: provider_circuit_breaker.py
 """
+
 
 from __future__ import annotations
 

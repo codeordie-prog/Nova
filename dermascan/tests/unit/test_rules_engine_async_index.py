@@ -1,4 +1,7 @@
-"""Unit tests for async vs inline ingredient indexing in RulesEngine."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for async vs inline ingredient indexing in RulesEngine."""
+
 
 from __future__ import annotations
 

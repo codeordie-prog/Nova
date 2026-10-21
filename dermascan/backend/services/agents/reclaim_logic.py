@@ -2,13 +2,14 @@
 Author: Dermascan Team
 Date: 2026-05-23
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Description: Redis stream pending message recovery utilities.
 
 This module provides reusable functions for reclaiming stuck messages from
 Redis Streams consumer groups using XAUTOCLAIM, along with idempotency
-helpers to ensure reclaimed messages are not processed twice.
-"""
+helpers to ensure reclaimed messages are not processed twice."""
+
 
 import os
 import json

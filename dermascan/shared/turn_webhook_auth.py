@@ -1,6 +1,9 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Turn.io webhook HMAC verification and WhatsApp ingress auth helpers.
 """
+
 
 from __future__ import annotations
 

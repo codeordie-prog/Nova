@@ -1,8 +1,11 @@
-"""Integration tests: duplicate message idempotency.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Integration tests: duplicate message idempotency.
 
 Concerns: R1 — exactly-once-ish processing; C7 — idempotency under burst.
 Requires real Redis (testcontainers).
 """
+
 
 from __future__ import annotations
 

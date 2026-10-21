@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-20
 License: MIT
@@ -16,6 +18,7 @@ Usage:
     poetry run python -m dermascan.scripts.migrate --stamp 001_billing
         # record a migration as applied without running SQL (hand-run Cloud SQL)
 """
+
 
 from __future__ import annotations
 

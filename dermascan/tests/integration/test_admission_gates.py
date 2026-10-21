@@ -1,9 +1,12 @@
-"""Integration tests: admission gates end-to-end at ingress.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Integration tests: admission gates end-to-end at ingress.
 
 Concerns: S1 — admission caps input to drain rate; R9 — malformed ingress;
           R10 — idempotent webhook re-delivery.
 Requires real Redis (testcontainers).
 """
+
 
 from __future__ import annotations
 

@@ -2,6 +2,7 @@
 Author: Dermascan Team
 Date: 2026-08-16
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Description: This module contains implementation of the credit deduction contract that will be applied across the following credits deduction entry points:
 
@@ -44,8 +45,8 @@ FUNCTION at_tool_start(tool_name: str, input: ToolInput) -> None:
     Return token_count
 
 
-A redis billing key for a given account_id would be atomically deducted at each point of incured cost.
-"""
+A redis billing key for a given account_id would be atomically deducted at each point of incured cost."""
+
 
 from abc import ABC, abstractmethod
 from pydantic import BaseModel

@@ -1,9 +1,12 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: DermascanTeam
 Date: 2026-04-20
 Description: Orchestrator tools for the orchestrator Agent
 
 """
+
 
 import os
 import json
@@ -37,6 +40,11 @@ from dermascan.ai_service.postprocessing.escalation import (
     dispatch_consent_escalation,
     dispatch_user_requested_escalation,
     has_pending_consent_escalation_offer,
+)
+from dermascan.shared.escalation_anchor import (
+    dermatologist_escalation_readiness,
+    record_image_anchor,
+    record_ingress_media_anchor,
 )
 from dermascan.shared.cosmetic_feature_flags import (
     cosmetic_consent_escalation_active,
@@ -784,6 +792,21 @@ def cache_ingress_payload(
             _INGRESS_PAYLOAD_CACHE_TTL_SEC,
             json.dumps(cached_envelope, default=str),
         )
+        try:
+            payload_obj = json.loads(str(payload or "{}"))
+        except Exception:
+            payload_obj = {}
+        if payload_has_image_attachment(payload_obj):
+            blob_path = resolve_first_image_blob_path_from_payload(payload_obj, redis_client=_redis)
+            record_ingress_media_anchor(
+                _redis,
+                client_id=str(client_id or "anonymous"),
+                anchor_request_id=rid,
+                case_id=str(case_id or rid),
+                message_id=str(message_id or rid),
+                channel=str(channel or "whatsapp"),
+                image_blob_path=blob_path,
+            )
     except Exception:
         logger.exception("failed to cache ingress envelope: request_id=%s", rid)
 
@@ -2320,6 +2343,16 @@ def register_intake_image(
     result["status"] = "registered"
     result["registered_category"] = image_category.value
     result["registered_image_request_id"] = image_request_id
+    record_image_anchor(
+        _redis,
+        client_id=client_id,
+        category=image_category.value,
+        anchor_request_id=image_request_id,
+        case_id=case_id,
+        message_id=str(envelope.get("message_id") or request_id),
+        channel=str(envelope.get("channel") or ""),
+        image_blob_path=image_blob_path,
+    )
     return _merge_auto_dispatch_into_intake_result(
         result,
         client_id=client_id,
@@ -3624,13 +3657,68 @@ def check_medgemma_health() -> dict[str, str]:
 
 
 @tool
+def get_dermatologist_escalation_context(request_id: OrchestratorRequestIdArg) -> dict[str, Any]:
+    """
+    Read whether a human dermatologist handoff is allowed for this client.
+
+    Human dermatologist escalation is separate from enque_request_for_auditing_stream
+    (AI specialist team / MedGemma). A completed AI skin or product review is required
+    before request_specialist_escalation can succeed, unless a consent offer is pending.
+
+    Args:
+        request_id: Exact request_id from the current orchestrator turn.
+
+    Returns:
+        dict[str, Any]: Readiness flags, cached review ids, and next-step instruction.
+    """
+    envelope, ingress_error = _require_ingress_envelope(request_id)
+    if ingress_error:
+        return ingress_error
+    assert envelope is not None
+    client_id = str(envelope.get("client_id") or "anonymous").strip()
+    pending = has_pending_consent_escalation_offer(
+        client_id,
+        case_id=str(envelope.get("case_id") or "").strip() or None,
+    )
+    readiness = dermatologist_escalation_readiness(
+        _redis,
+        client_id=client_id,
+        has_pending_consent_offer=pending,
+    )
+    if pending:
+        instruction = (
+            "User accepted or requested a dermatologist. Call request_specialist_escalation "
+            "once with the current turn request_id. Do NOT call enque_request_for_auditing_stream."
+        )
+    elif readiness.get("ready_for_dermatologist"):
+        instruction = (
+            "AI review is complete. If the user wants a human dermatologist, call "
+            "request_specialist_escalation once (current turn request_id). "
+            "Do NOT use enqueue for dermatologist connection."
+        )
+    else:
+        instruction = (
+            "Complete AI review first: finish intake, then enque_request_for_auditing_stream "
+            "for skin and/or product as needed. After the user receives that report, "
+            "request_specialist_escalation connects a human dermatologist. "
+            "Do NOT call request_specialist_escalation until ready_for_dermatologist is true."
+        )
+    return {
+        "status": "ok",
+        "request_id": request_id,
+        "client_id": client_id,
+        **readiness,
+        "instruction": instruction,
+    }
+
+
+@tool
 def request_specialist_escalation(request_id: OrchestratorRequestIdArg) -> dict[str, Any]:
     """
-    Dispatch specialist review after explicit user consent.
+    Connect the user with a human dermatologist (not the AI audit enqueue path).
 
-    First tries a cached watch-tier consent offer. If none exists, builds an
-    on-demand escalation job from the client's latest skin audit and intake context
-    when a skin snapshot is already on file.
+    First tries a cached watch-tier consent offer. Otherwise dispatches using the
+    client's last completed AI skin or product review anchor.
 
     Args:
         request_id: Exact request_id from the current orchestrator turn.
@@ -3761,16 +3849,35 @@ def request_specialist_escalation(request_id: OrchestratorRequestIdArg) -> dict[
         }
 
     if dispatch_status == "missing_context":
+        readiness = dermatologist_escalation_readiness(
+            _redis,
+            client_id=client_id,
+            has_pending_consent_offer=False,
+        )
+        last_mode = str(readiness.get("last_review_mode") or "").strip()
+        if last_mode == "product_review":
+            missing_status = "missing_product_review_context"
+            missing_instruction = (
+                "Product AI review must finish before a human dermatologist can be connected. "
+                "Complete intake and enque_request_for_auditing_stream with audit_type=product, "
+                "wait for the product report, then call request_specialist_escalation again."
+            )
+        else:
+            missing_status = "missing_skin_context"
+            missing_instruction = (
+                "Skin AI review must finish before a human dermatologist can be connected. "
+                "Complete intake, register a skin photo if needed, and "
+                "enque_request_for_auditing_stream with audit_type=skin. "
+                "After the skin report is delivered, call request_specialist_escalation again. "
+                "Do NOT use enqueue to reach a dermatologist directly."
+            )
         return {
-            "status": "missing_skin_context",
+            "status": missing_status,
             "request_id": request_id,
             "case_id": case_id,
             "client_id": client_id,
-            "instruction": (
-                "There is no skin snapshot or recent skin audit on file to escalate. "
-                "Ask for a close-up skin photo, register it, and enqueue skin review first. "
-                "Do NOT call this tool again until a skin snapshot has been reviewed."
-            ),
+            "requires_ai_review_first": True,
+            "instruction": missing_instruction,
         }
 
     return {
@@ -3884,6 +3991,7 @@ orchestrator_tools: list = [
     update_intake,
     register_intake_image,
     enque_request_for_auditing_stream,
+    get_dermatologist_escalation_context,
     request_specialist_escalation,
     return_to_mydawa_main_menu,
     read_status_of_a_case,

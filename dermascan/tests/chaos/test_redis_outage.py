@@ -1,7 +1,10 @@
-"""Chaos tests: Redis outage mid-flight.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Chaos tests: Redis outage mid-flight.
 
 Concerns: R4 — Redis transient failure; R5 — Redis hard failure.
 """
+
 
 from __future__ import annotations
 

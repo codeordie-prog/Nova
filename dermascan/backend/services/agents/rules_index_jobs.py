@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-09-24
 License: MIT
@@ -8,6 +10,7 @@ Enqueue and coordinate async CIR ingredient indexing jobs on Redis streams.
 Index workers consume ``RULES_INDEX_STREAM``; product rules enqueue work here instead
 of calling ``index_pdf_from_firebase`` on orchestrator signal threads.
 """
+
 
 from __future__ import annotations
 

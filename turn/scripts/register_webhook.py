@@ -1,4 +1,7 @@
-"""Register Nova ingress as Turn primary application webhook."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Register Nova ingress as Turn primary application webhook."""
+
 
 from __future__ import annotations
 

@@ -1,4 +1,6 @@
-"""Live-stack smoke tests for the full ingress → worker → outbound pipeline.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Live-stack smoke tests for the full ingress → worker → outbound pipeline.
 
 Requires:
 - Redis with REDIS_URL
@@ -7,6 +9,7 @@ Requires:
 - Qwen/OpenAI/Gemini for orchestrator LLM calls
 - MedGemma gateway + worker for image diagnosis jobs
 """
+
 
 from __future__ import annotations
 

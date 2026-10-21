@@ -2,13 +2,14 @@
 Author: Dermascan Team
 Date: 6-26-2026
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 A pipeline tracing for Redis stream produce/consume hops.
 
 Records each stream boundary as a LangSmith ``chain`` run in the pipeline project
 so ingress → orchestrator → MedGemma → signals → outbound appears as linked spans
-filterable by ``request_id``.  
-"""
+filterable by ``request_id``.  """
+
 
 from __future__ import annotations
 

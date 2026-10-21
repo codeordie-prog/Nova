@@ -1,8 +1,11 @@
-"""Unit tests for Redis retry/backoff client.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for Redis retry/backoff client.
 
 Concerns: R4 — Redis transient failure; R5 — Redis hard failure; S7 — connection-pool ceiling.
 Source: dermascan/shared/redis_stability.py
 """
+
 
 from __future__ import annotations
 

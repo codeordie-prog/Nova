@@ -2,6 +2,7 @@
 Author: Dermascan Team
 Date: 2026-4-29
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Description: This module contains the implementation of the Escalation logic post-processing
 
@@ -13,8 +14,8 @@ to a certified Physician for further assesment.
 In-addition to this, there are other routing logic that involve passing certain cases to
 the Physician irregardless of the confidence score - This is purposefully to improve
 the quality of the product as time goes by.
-
 """
+
 import logging
 import os
 import json
@@ -31,12 +32,15 @@ from dermascan.ai_service.postprocessing.medgemma_structured_output import (
     resolve_internal_diagnosis_text,
 )
 from dermascan.shared.cosmetic_feature_flags import cosmetic_consent_escalation_active
-from dermascan.shared.cosmetic_profile import _skin_audit_has_observations
 from dermascan.shared.escalation_image import cache_escalation_image_path, resolve_escalation_image_blob_path
 from dermascan.shared.intake_session import (
     IntakeImageCategory,
     IntakeSession,
     build_collected_context_summary,
+)
+from dermascan.shared.escalation_anchor import (
+    load_completed_review_anchor,
+    record_completed_review_from_medgemma_fields,
 )
 from dermascan.shared.skin_audit_store import load_latest_skin_audit_envelope
 from dermascan.shared.stream_pipeline_tracing import enrich_stream_fields, record_stream_produce
@@ -387,6 +391,15 @@ class UserEscalationContext:
         summary: Structured summary fragment when available.
         treatment: Structured treatment fragment when available.
         confidence: Vision confidence from the latest skin audit, if known.
+        mode: Escalation job mode (``diagnose`` or ``product_review``).
+        review_type: Human-readable review label for the platform handoff.
+        product_name: Product name when mode is product review.
+        description: Product description field for product review jobs.
+        indications: Product indications field.
+        safety_in_pregnancy: Pregnancy safety notes.
+        contraindications: Contraindications text.
+        how_to_use: Usage instructions.
+        special_instructions: Special instructions text.
     """
 
     audit_case_id: str
@@ -400,6 +413,15 @@ class UserEscalationContext:
     summary: Any
     treatment: Any
     confidence: float | None
+    mode: str = "diagnose"
+    review_type: str = "Skin review"
+    product_name: str = ""
+    description: str = ""
+    indications: str = ""
+    safety_in_pregnancy: str = ""
+    contraindications: str = ""
+    how_to_use: str = ""
+    special_instructions: str = ""
 
 
 def _load_ingress_envelope(request_id: str) -> dict[str, Any]:
@@ -483,9 +505,13 @@ def resolve_user_escalation_context(
     if not normalized_client:
         return None
 
+    completed = load_completed_review_anchor(_redis, normalized_client)
+    if completed is None or completed.completed_at_ms <= 0:
+        return None
+
     envelope = load_latest_skin_audit_envelope(normalized_client)
     skin_audit = envelope.get("skin_audit") if isinstance(envelope.get("skin_audit"), dict) else {}
-    audit_request_id = str(envelope.get("request_id") or "").strip()
+    audit_request_id = completed.anchor_request_id
 
     session = intake_session
     if session is None:
@@ -498,71 +524,89 @@ def resolve_user_escalation_context(
 
     profile_map: dict[str, Any] = dict(profile or {})
     skin_ref = None
+    product_ref = None
     if session is not None:
         skin_ref = session.images.get(IntakeImageCategory.SKIN.value)
+        product_ref = session.images.get(IntakeImageCategory.PRODUCT.value)
 
-    has_audit = _skin_audit_has_observations(skin_audit) or bool(
-        str(skin_audit.get("primary_observation") or "").strip()
-    )
-    has_skin_image = skin_ref is not None
-    if not has_audit and not has_skin_image:
-        return None
-
-    audit_case_id = ""
-    for candidate in (audit_request_id, skin_ref.request_id if skin_ref else ""):
-        case_id = _ingress_case_id(candidate)
-        if case_id:
-            audit_case_id = case_id
-            break
+    audit_case_id = completed.case_id or _ingress_case_id(audit_request_id)
     if not audit_case_id and session is not None:
         audit_case_id = str(session.case_id or "").strip()
 
-    image_blob_path = resolve_escalation_image_blob_path(
+    image_blob_path = completed.image_blob_path or resolve_escalation_image_blob_path(
         _redis,
         request_id=audit_request_id,
         case_id=audit_case_id,
     )
-    if not image_blob_path and skin_ref is not None:
+    if not image_blob_path and completed.mode == "diagnose" and skin_ref is not None:
         image_blob_path = resolve_escalation_image_blob_path(
             _redis,
             request_id=skin_ref.request_id,
             case_id=_ingress_case_id(skin_ref.request_id),
         )
+    if not image_blob_path and completed.mode == "product_review" and product_ref is not None:
+        image_blob_path = resolve_escalation_image_blob_path(
+            _redis,
+            request_id=product_ref.request_id,
+            case_id=_ingress_case_id(product_ref.request_id),
+        )
 
-    diagnosis_text = (
-        resolve_internal_diagnosis_text(skin_audit)
-        or str(skin_audit.get("primary_concern") or "").strip()
-        or (str(session.primary_concern).strip() if session is not None else "")
-    )
+    diagnosis_text = completed.diagnosis_text
+    if completed.mode == "diagnose":
+        diagnosis_text = (
+            diagnosis_text
+            or resolve_internal_diagnosis_text(skin_audit)
+            or str(skin_audit.get("primary_concern") or "").strip()
+            or (str(session.primary_concern).strip() if session is not None else "")
+        )
     escalation_context = ""
     if session is not None:
         escalation_context = build_collected_context_summary(session, profile_map).strip()
     if not escalation_context:
         escalation_context = diagnosis_text
 
-    confidence_raw = skin_audit.get("confidence")
-    confidence: float | None
-    try:
-        confidence = float(confidence_raw) if confidence_raw is not None else None
-    except (TypeError, ValueError):
-        confidence = None
+    confidence = completed.confidence
+    if confidence is None and completed.mode == "diagnose":
+        confidence_raw = skin_audit.get("confidence")
+        try:
+            confidence = float(confidence_raw) if confidence_raw is not None else None
+        except (TypeError, ValueError):
+            confidence = None
 
-    current_condition = skin_audit.get("current_condition")
-    summary = current_condition if isinstance(current_condition, dict) else {}
-    treatment = skin_audit.get("treatment") if isinstance(skin_audit.get("treatment"), dict) else {}
+    summary = completed.summary
+    treatment = completed.treatment
+    if completed.mode == "diagnose" and not summary:
+        current_condition = skin_audit.get("current_condition")
+        summary = current_condition if isinstance(current_condition, dict) else {}
+    if completed.mode == "diagnose" and not treatment:
+        treatment = skin_audit.get("treatment") if isinstance(skin_audit.get("treatment"), dict) else {}
+
+    review_type = completed.review_type or (
+        "Product review" if completed.mode == "product_review" else "Skin review"
+    )
+    resolved_mode = completed.mode if completed.mode in {"diagnose", "product_review", "hybrid"} else "diagnose"
 
     return UserEscalationContext(
         audit_case_id=audit_case_id,
-        audit_request_id=audit_request_id or (skin_ref.request_id if skin_ref else ""),
-        message_id=str(message_id or "").strip(),
-        channel=str(channel or "").strip(),
+        audit_request_id=audit_request_id,
+        message_id=completed.message_id or str(message_id or "").strip(),
+        channel=completed.channel or str(channel or "").strip(),
         image_blob_path=image_blob_path,
         diagnosis_text=diagnosis_text,
         escalation_context=escalation_context,
-        risk_tier=str(skin_audit.get("risk_tier") or "cosmetic"),
+        risk_tier=completed.risk_tier or str(skin_audit.get("risk_tier") or "cosmetic"),
         summary=summary,
         treatment=treatment,
         confidence=confidence,
+        mode=resolved_mode,
+        review_type=review_type,
+        product_name=completed.product_name,
+        description=completed.description,
+        indications=completed.indications,
+        safety_in_pregnancy=completed.safety_in_pregnancy,
+        contraindications=completed.contraindications,
+        how_to_use=completed.how_to_use,
+        special_instructions=completed.special_instructions,
     )
 
 
@@ -622,21 +666,21 @@ def dispatch_user_requested_escalation(
         "message_id": context.message_id or message_id or current_request_id,
         "channel": context.channel or channel,
         "source_agent": "orchestrator",
-        "mode": "diagnose",
+        "mode": context.mode,
         "reason": "user_requested_specialist",
         "confidence": "" if context.confidence is None else str(context.confidence),
         "threshold": "",
         "diagnosis_text": context.diagnosis_text,
         "requires_human_review": "true",
-        "product_name": "",
-        "description": "",
-        "indications": "",
-        "safety_in_pregnancy": "",
-        "contraindications": "",
-        "how_to_use": "",
-        "special_instructions": "",
+        "product_name": context.product_name,
+        "description": context.description,
+        "indications": context.indications,
+        "safety_in_pregnancy": context.safety_in_pregnancy,
+        "contraindications": context.contraindications,
+        "how_to_use": context.how_to_use,
+        "special_instructions": context.special_instructions,
         "image_blob_path": context.image_blob_path,
-        "review_type": "Skin review",
+        "review_type": context.review_type,
         "rationale": context.escalation_context,
         "summary": _stream_json(context.summary),
         "treatment": _stream_json(context.treatment),
@@ -895,6 +939,27 @@ def route_case_after_inference(entry: _JobEntry, text: str, confidence: float | 
             threshold_used=threshold_used,
             base_fields=base_fields,
             text=text,
+        )
+
+    try:
+        record_completed_review_from_medgemma_fields(
+            _redis,
+            client_id=str(entry.client_id or "").strip(),
+            mode=mode,
+            anchor_request_id=str(entry.request_id or "").strip(),
+            case_id=str(entry.case_id or "").strip(),
+            message_id=str(entry.message_id or "").strip(),
+            channel=str(entry.channel or "").strip(),
+            image_blob_path=str(entry.image_blob_path or "").strip(),
+            base_fields=base_fields,
+            diagnosis_text=resolve_internal_diagnosis_text(base_fields) or text,
+            confidence=confidence,
+        )
+    except Exception:
+        _LOGGER.exception(
+            "failed to record completed review anchor: client_id=%s request_id=%s",
+            entry.client_id,
+            entry.request_id,
         )
 
     return escalate

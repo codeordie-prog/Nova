@@ -1,4 +1,7 @@
 """
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: DermascanTeam
 Date: 2026-07-09
 License: MIT
@@ -10,6 +13,7 @@ Uses langgraph's built-in RedisSaver.
 A delagated delete thread function is provided to delete the thread from the RedisSaver instance.
 This is useful to reset the checkpoint of a thread in case of a poisoning/looping conversation/state.
 """
+
 
 from typing import Any
 

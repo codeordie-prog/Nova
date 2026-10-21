@@ -1,4 +1,7 @@
-"""Image byte fixtures for media validation and ingress tests."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Image byte fixtures for media validation and ingress tests."""
+
 
 from __future__ import annotations
 

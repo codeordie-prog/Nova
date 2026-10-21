@@ -1,4 +1,7 @@
-"""Unit tests for report structured-output fallback routing."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for report structured-output fallback routing."""
+
 
 from __future__ import annotations
 

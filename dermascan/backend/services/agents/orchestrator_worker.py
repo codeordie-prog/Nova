@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-04-20
 Description: This module implements the orchestrator worker.
@@ -11,6 +13,7 @@ Transcend the traditional structure of agentic system where a user prompt is req
 
 
 """
+
 
 import os
 import time
@@ -51,6 +54,7 @@ from dermascan.backend.services.agents.rules_index_jobs import ORCHESTRATOR_SIGN
 from dermascan.ai_service.postprocessing.consent_escalation import append_escalation_offer_to_reply
 from dermascan.shared.concise_report_format import dermatologist_connection_guidance
 from dermascan.ai_service.postprocessing.escalation import resolve_client_message_for_signal
+from dermascan.shared.escalation_anchor import record_completed_review_from_signal_payload
 from dermascan.backend.services.agents.group_report_aggregator import (
     collect_and_compile_if_ready,
 )
@@ -2599,6 +2603,37 @@ def _compose_physician_reviewed_reply(payload: dict[str, Any]) -> str:
     return "\n\n".join(parts)
 
 
+def _record_delivered_review_anchor(fields: dict[str, Any], payload_obj: dict[str, Any]) -> None:
+    """
+    Persist a completed AI review anchor after a rules-based report is delivered.
+
+    Args:
+        fields: Orchestrator signal stream fields.
+        payload_obj: Parsed signal payload mapping.
+    """
+    client_id = str(fields.get("client_id") or "").strip()
+    request_id = str(fields.get("request_id") or "").strip()
+    case_id = str(fields.get("case_id") or "").strip()
+    if not client_id or not request_id or not case_id:
+        return
+    try:
+        record_completed_review_from_signal_payload(
+            _redis,
+            client_id=client_id,
+            anchor_request_id=request_id,
+            case_id=case_id,
+            message_id=str(fields.get("message_id") or request_id),
+            channel=str(fields.get("channel") or ""),
+            payload=payload_obj if isinstance(payload_obj, dict) else {},
+        )
+    except Exception:
+        logger.exception(
+            "failed to record delivered review anchor: client_id=%s request_id=%s",
+            client_id,
+            request_id,
+        )
+
+
 def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> None:
     """
     Process an internal orchestrator signal message.
@@ -2729,6 +2764,7 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             sources_text = "\n".join(str(item) for item in sources if str(item).strip())
             primary_text = friendly_report or summary
             reply = primary_text if not sources_text else f"{primary_text}\n\nSources:\n{sources_text}"
+            _record_delivered_review_anchor(fields, payload_obj)
 
         elif signal_type.startswith("product_review_"):
             logger.info(
@@ -2757,6 +2793,7 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             sources_text = "\n".join(str(item) for item in sources if str(item).strip())
             primary_text = friendly_report or summary
             reply = primary_text if not sources_text else f"{primary_text}\n\nSources:\n{sources_text}"
+            _record_delivered_review_anchor(fields, payload_obj)
 
         elif signal_type.startswith("diagnose_") or signal_type.startswith("skin_"):
             logger.info(
@@ -2778,6 +2815,8 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             reply = primary_text if not sources_text else f"{primary_text}\n\nSources:\n{sources_text}"
             if payload_obj.get("escalation_offer"):
                 reply = append_escalation_offer_to_reply(reply)
+            if not signal_type.endswith("_escalated"):
+                _record_delivered_review_anchor(fields, payload_obj)
         else:
             # Read recent conversations first and build an input for the signal
             conversation_entries = _read_conversation_log(client_id, CONVERSATION_LOG_INCLUDE_N)

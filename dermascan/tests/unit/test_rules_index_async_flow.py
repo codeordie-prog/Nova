@@ -1,4 +1,7 @@
-"""Integration-style async CIR index flow (fakeredis, no PDF/torch)."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Integration-style async CIR index flow (fakeredis, no PDF/torch)."""
+
 
 from __future__ import annotations
 

@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-20
 License: MIT
@@ -19,6 +21,7 @@ Replays are expected, not exceptional: Paystack re-sends webhooks and Redis
 streams redeliver. ``idempotency_key`` makes a repeat a no-op that returns the
 original outcome.
 """
+
 
 from __future__ import annotations
 

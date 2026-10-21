@@ -1,4 +1,7 @@
-"""Check whether Turn recorded an inbound message for a sandbox contact."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Check whether Turn recorded an inbound message for a sandbox contact."""
+
 
 from __future__ import annotations
 

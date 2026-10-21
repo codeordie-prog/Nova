@@ -1,4 +1,6 @@
-""" 
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+ 
 Author: Dermascan Team
 Date: 2026-12-03
 License: MIT
@@ -11,6 +13,7 @@ Use `modal run app.py` from the project root (where pyproject.toml lives).
 Documentation for the inference parameter configurations is provided in:
 dermascan/ai_service/docs/inference.md
 """
+
 
 import base64
 import json

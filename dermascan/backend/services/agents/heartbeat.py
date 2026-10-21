@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-09-24
 License: MIT
@@ -14,6 +16,7 @@ live turn that merely outlived the idle threshold.
 
 # ENSURE YOU UNDERSTAND RELATIONSHIP BETWEEN LOCK, LOCK EXTENDER, HEARTBEAT, IN-FLIGHT MARKER, AND RECLAIM.
 """
+
 
 from __future__ import annotations
 

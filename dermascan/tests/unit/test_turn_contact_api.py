@@ -1,4 +1,7 @@
-"""Unit tests for synchronous Turn contact / journey API helpers."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for synchronous Turn contact / journey API helpers."""
+
 
 from __future__ import annotations
 

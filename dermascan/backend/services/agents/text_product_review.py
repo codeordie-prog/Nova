@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-07
 License: MIT
@@ -9,6 +11,7 @@ Skips MedGemma label read when intake has ``product_ref_text`` and no product
 image. Emits ``product_review_completed`` on ``orchestrator:signals`` so the
 existing orchestrator signal handler runs ``run_product_signal_rules_flow``.
 """
+
 
 from __future__ import annotations
 

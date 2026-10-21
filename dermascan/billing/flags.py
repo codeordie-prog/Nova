@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-20
 License: MIT
@@ -14,6 +16,7 @@ Everything that is *tunable* rather than *operational* — credit prices, token
 rates, top-up amounts, the free-trial grant — lives in ``billing.price_list``
 and is edited from the admin portal, not from the environment.
 """
+
 
 from __future__ import annotations
 

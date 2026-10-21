@@ -1,9 +1,12 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 End-to-end billing: a payment lands, is verified, and becomes credits.
 
 Covers the failures that cost real money — replayed webhooks, forged amounts,
 a webhook that never arrives — rather than only the happy path.
 """
+
 
 from __future__ import annotations
 

@@ -1,4 +1,7 @@
-"""Unit tests for TEST_MODE Redis redirection in load_env."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for TEST_MODE Redis redirection in load_env."""
+
 
 from __future__ import annotations
 

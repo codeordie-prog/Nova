@@ -1,4 +1,6 @@
-"""Locust load-test entry point for Dermascan backend ingress.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Locust load-test entry point for Dermascan backend ingress.
 
 Run against a live stack:
     locust -f dermascan/tests/load/locustfile.py --host http://localhost:8088
@@ -6,6 +8,7 @@ Run against a live stack:
 Profiles and pass criteria: see profiles.md.
 Concerns: L1 — max sustainable RPS; S5 — throughput vs concurrency curve.
 """
+
 
 from __future__ import annotations
 

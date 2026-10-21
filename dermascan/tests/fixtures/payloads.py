@@ -1,4 +1,7 @@
-"""Valid and invalid ingress envelopes for webhook and orchestrator endpoints."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Valid and invalid ingress envelopes for webhook and orchestrator endpoints."""
+
 
 from __future__ import annotations
 

@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-09-30
 License: MIT
@@ -9,6 +11,7 @@ The outbound worker expects ``WHATSAPP_API_BASE_URL=http://127.0.0.1:8000`` (or 
 ``WHATSAPP_SIDECAR_PORT``). The sidecar binds to loopback by default so it is not exposed
 on the Cloud Run service URL (only ``PORT`` /health is).
 """
+
 
 from __future__ import annotations
 

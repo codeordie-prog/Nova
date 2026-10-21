@@ -1,4 +1,7 @@
-"""Probe 360dialog HTTPS reachability the same way the sidecar does."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Probe 360dialog HTTPS reachability the same way the sidecar does."""
+
 
 from __future__ import annotations
 

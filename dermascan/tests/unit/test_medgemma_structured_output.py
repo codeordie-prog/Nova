@@ -1,4 +1,7 @@
-"""Unit tests for MedGemma structured output parsing."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for MedGemma structured output parsing."""
+
 
 from __future__ import annotations
 

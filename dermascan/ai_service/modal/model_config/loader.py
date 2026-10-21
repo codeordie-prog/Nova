@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: DermaScan Team
 Date: 2026-03-12
 Description: Model configuration loader for the AI inference layer.
@@ -9,6 +11,7 @@ whenever Modal services need model ID, generation parameters, or image settings.
 Secrets (e.g. Hugging Face token) must be provided via environment or Modal
 secrets, not via this config file.
 """
+
 
 from __future__ import annotations
 

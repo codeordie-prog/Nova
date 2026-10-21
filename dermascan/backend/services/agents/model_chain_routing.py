@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-10-16
 License: MIT
@@ -9,6 +11,7 @@ When Vertex Gemini is degraded (error signals in Redis), new turns prefer the
 alternate chain spec. Turn stickiness keeps orchestrator steps and summarization
 on the same chain for one request_id.
 """
+
 
 from __future__ import annotations
 

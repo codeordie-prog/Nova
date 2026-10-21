@@ -1,9 +1,12 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Convert decision-confidence research markdown to PDF with KaTeX-rendered math.
 
 Preferred path: ``npm run build:pdf`` in this directory (md-to-pdf + Edge).
 This module wraps the same flow for Python callers.
 """
+
 
 from __future__ import annotations
 

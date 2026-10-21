@@ -1,9 +1,12 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-3-12
 License: MIT
 Description: Custom exceptions for MedGemma service.
 """
+
 
 from __future__ import annotations
 

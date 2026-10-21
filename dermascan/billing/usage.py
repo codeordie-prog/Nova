@@ -1,6 +1,9 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Token usage lines (balance-neutral until reservation settle).
 """
+
 
 from __future__ import annotations
 

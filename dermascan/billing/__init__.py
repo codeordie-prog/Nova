@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-25
 License: MIT
@@ -29,6 +31,7 @@ and are converted through the ``usd_kes_rate`` setting in ``billing.price_list``
 when the rate card loads. Prices and rates are data, not environment: they live
 in ``price_list`` and are edited from the admin portal.
 """
+
 
 from dermascan.billing.accounts import (
     Account,

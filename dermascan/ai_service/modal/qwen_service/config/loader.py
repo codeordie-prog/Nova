@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: DermaScan Team
 Date: 2026-06-04
 Description: Loader for Qwen Modal service static configuration.
@@ -6,6 +8,7 @@ Description: Loader for Qwen Modal service static configuration.
 Reads non-secret settings from ``config.json``. Secrets (e.g. Hugging Face token)
 must come from environment or Modal secrets, not this file.
 """
+
 
 from __future__ import annotations
 

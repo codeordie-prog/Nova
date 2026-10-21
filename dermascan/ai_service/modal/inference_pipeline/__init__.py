@@ -1,4 +1,7 @@
-"""Shared inference abstractions for Modal-backed services."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Shared inference abstractions for Modal-backed services."""
+
 
 from dermascan.ai_service.modal.inference_pipeline.modal_medgemma_provider import (
     ModalMedGemmaProvider,

@@ -1,4 +1,6 @@
-"""Minimal Turn.io webhook echo server.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Minimal Turn.io webhook echo server.
 
 Implements exactly the contract in https://whatsapp.turn.io/docs/api/webhooks:
 
@@ -14,6 +16,7 @@ Run (ngrok already targets port 8088):
 
 No Nova, Redis, or workers involved.
 """
+
 
 from __future__ import annotations
 

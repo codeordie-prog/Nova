@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: DermaScan Team
 Date: 2026-03-12
 Description: MedGemma model loader (loading only).
@@ -7,6 +9,7 @@ Loads the Hugging Face image-text-to-text pipeline once. Used by app.py in a
 Modal class `@enter` so the model is loaded a single time per container.
 Contains no inference logic.
 """
+
 
 from __future__ import annotations
 

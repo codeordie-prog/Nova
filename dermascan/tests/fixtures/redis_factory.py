@@ -1,4 +1,7 @@
-"""Redis client factory helpers for unit and integration test fixtures."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Redis client factory helpers for unit and integration test fixtures."""
+
 
 from __future__ import annotations
 

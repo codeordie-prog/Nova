@@ -1,1 +1,4 @@
-"""Frontend utilities and integration probes."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Frontend utilities and integration probes."""
+

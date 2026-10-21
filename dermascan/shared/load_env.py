@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Bootstrap environment variables for local and Cloud Run runtimes.
 
 Local dev loads ``.env`` from the repo root, and ``.env.local`` on top of it
@@ -12,6 +14,7 @@ When ``TEST_MODE=true``, ``REDIS_URL`` is redirected to ``REDIS_TEST_URL`` (or
 built from ``REDIS_TEST_HOST`` / ``REDIS_TEST_PORT`` / credentials) so local test
 runs do not share queues with the live Redis instance.
 """
+
 
 from __future__ import annotations
 

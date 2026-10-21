@@ -1,1 +1,4 @@
-"""Modal-backed GPU services."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Modal-backed GPU services."""
+

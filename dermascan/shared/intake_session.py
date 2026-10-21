@@ -2,6 +2,7 @@
 Author: Dermascan Team
 Date: 2026-06-28
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Orchestrator intake session specification: models, Redis key layout, routing rules,
 and pure helpers used before image-audit enqueue.
@@ -9,8 +10,8 @@ and pure helpers used before image-audit enqueue.
 An intake session is the per-client active case worksheet (Redis JSON) that tracks
 service intent, categorized images (skin vs product), consultation context, and
 readiness for routing. Population is explicit via orchestrator tools; the worker
-only loads and injects a snapshot each turn.
-"""
+only loads and injects a snapshot each turn."""
+
 
 from __future__ import annotations
 

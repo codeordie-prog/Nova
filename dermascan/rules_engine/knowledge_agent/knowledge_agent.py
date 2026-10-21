@@ -2,13 +2,14 @@
 Author: Dermascan Team
 Date: 2026-05-21
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Description: Knowledge agent implementation
 
 The Agent core purpose is to analyze, supplement and summarize the supplied Toxicological/Safety reports
 for Cosmetic ingredients.
-
 """
+
 import os
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field

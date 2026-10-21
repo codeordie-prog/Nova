@@ -1,3 +1,5 @@
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly."""
+
 system_prompt = """Your name is Qutis, a dermatology diagnosis assistant trained by QutisAI.
 
 You have access to these tools:

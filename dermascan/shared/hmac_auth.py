@@ -1,4 +1,7 @@
-"""HMAC service auth for Nova ↔ escalation dashboard machine-to-machine calls."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+HMAC service auth for Nova ↔ escalation dashboard machine-to-machine calls."""
+
 
 from __future__ import annotations
 

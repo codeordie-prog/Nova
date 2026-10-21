@@ -1,8 +1,11 @@
-"""Concurrency tests: rate limiter atomicity under parallel admission.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Concurrency tests: rate limiter atomicity under parallel admission.
 
 Concerns: C3 — rate-limiter atomicity (INCRBY pipeline).
 Requires real Redis (testcontainers).
 """
+
 
 from __future__ import annotations
 

@@ -1,10 +1,13 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-10-07
 License: MIT
 
 Turn.io contact routing helpers for WhatsApp ingress (Main Menu vs Dermascan).
 """
+
 
 from __future__ import annotations
 

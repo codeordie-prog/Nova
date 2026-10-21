@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-21
 License: MIT
@@ -11,6 +13,7 @@ The billing scope tells the metering hooks which account and request id this tur
 
 Since middleware doesn't have access to the request id, we use ContextVar as the bridge. Otherwise, I would have to pass the request id in every layer.
 """
+
 
 from __future__ import annotations
 

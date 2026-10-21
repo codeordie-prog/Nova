@@ -1,4 +1,7 @@
-"""Load repo ``.env`` for live API/load probes (ingress secret, REDIS_URL, etc.)."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Load repo ``.env`` for live API/load probes (ingress secret, REDIS_URL, etc.)."""
+
 
 from __future__ import annotations
 

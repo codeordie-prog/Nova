@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-04-25
 
@@ -6,6 +8,7 @@ Description: Request/response schemas for backend orchestrator ingress endpoints
 
 
 """
+
 
 from datetime import datetime
 from typing import Any, Literal, Optional

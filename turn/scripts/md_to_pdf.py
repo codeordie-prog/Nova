@@ -1,4 +1,7 @@
-"""Convert Turn relay integration markdown documentation to PDF."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Convert Turn relay integration markdown documentation to PDF."""
+
 
 from __future__ import annotations
 

@@ -1,4 +1,6 @@
-"""Ingress p95 latency probe against the FastAPI backend API.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Ingress p95 latency probe against the FastAPI backend API.
 
 Measures admission latency for backend ingress endpoints — not the MedGemma
 /diagnose inference path. Targets the surfaces defined in tests.md:
@@ -13,6 +15,7 @@ Default sweep: concurrency levels **20 and 40** (configurable via
 SLO placeholder: admission p95 < 300 ms (successful 200 responses only).
 429 throttles are reported separately and excluded from admission p95.
 """
+
 
 from __future__ import annotations
 

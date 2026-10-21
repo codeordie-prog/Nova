@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-3-12
 License: MIT
@@ -19,6 +21,7 @@ NVIDIA A10G GPU :
 
 
 """
+
 
 import json
 from pathlib import Path

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Add REDIS_HOST to .env when only REDIS_URL is configured."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Add REDIS_HOST to .env when only REDIS_URL is configured."""
+
 
 from __future__ import annotations
 

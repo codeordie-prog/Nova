@@ -1,4 +1,7 @@
-"""One-off probe for the qutis WhatsApp sidecar on WHATSAPP_API_BASE_URL."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+One-off probe for the qutis WhatsApp sidecar on WHATSAPP_API_BASE_URL."""
+
 
 from __future__ import annotations
 

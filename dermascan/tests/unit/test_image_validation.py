@@ -1,8 +1,11 @@
-"""Unit tests for image validation (magic-byte sniffing, size cap).
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for image validation (magic-byte sniffing, size cap).
 
 Concerns: L5 — max image size / payload boundary at 5 MB cap.
 Source: ingress media validation in endpoints / validators.
 """
+
 
 from __future__ import annotations
 

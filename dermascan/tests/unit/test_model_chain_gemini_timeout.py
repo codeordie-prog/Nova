@@ -1,4 +1,7 @@
-"""Unit tests for Gemini HTTP timeout on chat model construction."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for Gemini HTTP timeout on chat model construction."""
+
 
 from __future__ import annotations
 

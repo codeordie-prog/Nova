@@ -1,1 +1,4 @@
-"""Dermascan application package (frontend, backend, ai-service, shared utilities)."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Dermascan application package (frontend, backend, ai-service, shared utilities)."""
+

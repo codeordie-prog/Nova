@@ -1,8 +1,11 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-04-25
 Description: Diagnose tools for the diagnose agent.
 """
+
 
 import base64
 import os

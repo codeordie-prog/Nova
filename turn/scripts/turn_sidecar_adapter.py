@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-09-24
 License: MIT
@@ -28,6 +30,7 @@ Env (see ``.env`` / ``bootstrap_env``):
 - ``TURN_WEBHOOK_SECRET`` — required when ``NOVA_WEBHOOK_URL`` is set (verify Turn HMAC)
 - ``WHATSAPP_INGRESS_SECRET`` — injected on forward to Nova (falls back to internal secret)
 """
+
 
 from __future__ import annotations
 

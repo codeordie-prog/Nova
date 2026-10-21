@@ -2,13 +2,14 @@
 Author: Dermascan Team
 Date: 2026-08-16
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Refresh ephemeral Firebase signed URLs in multimodal LLM message content.
 
 Durable image identity is the ``client-media/...`` blob path (see escalation flow).
 Signed URLs expire after ``WORKERS_JOB_TTL_S``; LangGraph checkpoints replay them.
-This module re-signs client-media references immediately before vision model calls.
-"""
+This module re-signs client-media references immediately before vision model calls."""
+
 
 from __future__ import annotations
 

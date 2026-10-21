@@ -1,9 +1,12 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-10
 Version: 1.0.0
 Description: Mobile micro-report helpers: prompt budgets and assembly (no text rewriting).
 Mobile micro-report helpers: prompt budgets and assembly (no text rewriting)."""
+
 
 from __future__ import annotations
 

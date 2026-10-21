@@ -1,5 +1,7 @@
 
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-3-12
 License: MIT
@@ -13,6 +15,7 @@ GET endpoints are used to check the status of the jobs.
 
 The async workers process the jobs from the stream.
 """
+
 
 from __future__ import annotations
  

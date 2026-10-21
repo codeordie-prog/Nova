@@ -1,8 +1,11 @@
-"""Unit tests for global rate limiter (fixed-window RPM admission).
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for global rate limiter (fixed-window RPM admission).
 
 Concerns: S1/S2 — rate-limit window accuracy.
 Source: dermascan/shared/global_rate_limiter.py
 """
+
 
 from __future__ import annotations
 

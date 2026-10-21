@@ -2,10 +2,11 @@
 Author: Dermascan Team
 Date: 2026-05-19
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Description: This module contains reusable functions for Firebase.
-
 """
+
 import os
 from dotenv import load_dotenv
 from logging import Logger

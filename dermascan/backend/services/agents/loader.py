@@ -1,9 +1,12 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-04-21
 Description: This Module implements the loader method for loading agents configurations
 
 """
+
 
 import os
 import json

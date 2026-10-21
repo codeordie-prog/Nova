@@ -1,4 +1,6 @@
-"""Smoke-test helper: inject one low-confidence case onto escalation:jobs.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Smoke-test helper: inject one low-confidence case onto escalation:jobs.
 
 Mimics the producer so the real escalation worker enriches, relays to the dashboard,
 and populates the Redis cache the return webhook + image proxy depend on. No MedGemma needed.
@@ -6,6 +8,7 @@ and populates the Redis cache the return webhook + image proxy depend on. No Med
     poetry run python dermascan/scripts/smoke_inject.py
     SMOKE_IMAGE_BLOB=client-media/<id>/<file>.jpg poetry run python dermascan/scripts/smoke_inject.py
 """
+
 
 import json
 import os

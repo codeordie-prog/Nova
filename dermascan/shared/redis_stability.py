@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-06-20
 License: MIT
@@ -7,6 +9,7 @@ This module centralizes resilient Redis client construction and retry helpers.
 It is intended to be imported by all services that communicate with Redis so
 timeouts, retries, and connection-health behavior remain consistent.
 """
+
 
 from __future__ import annotations
 

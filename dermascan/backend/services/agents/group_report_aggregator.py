@@ -1,9 +1,12 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Group report aggregation helper for single compiled outbound delivery.
 
 This module buffers per-image rule outputs under a group id and compiles one
 final user-facing report using an LLM when the expected number of items arrives.
 """
+
 
 from __future__ import annotations
 

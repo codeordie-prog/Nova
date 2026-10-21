@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-20
 License: MIT
@@ -9,6 +11,7 @@ One account per messaging identity. The same human on WhatsApp and Telegram
 gets two accounts today; ``owner_id`` is the seam for merging them later
 without a schema change.
 """
+
 
 from __future__ import annotations
 

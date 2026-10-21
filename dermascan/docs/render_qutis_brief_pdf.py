@@ -1,10 +1,13 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Render ``qutis-mydawa-executive-brief.md`` to PDF (fpdf2).
 
 Usage:
     pip install fpdf2
     python dermascan/docs/render_qutis_brief_pdf.py
 """
+
 
 from __future__ import annotations
 

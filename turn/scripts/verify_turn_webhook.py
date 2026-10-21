@@ -1,4 +1,7 @@
-"""Verify Turn primary webhook registration and ngrok → Nova relay path."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Verify Turn primary webhook registration and ngrok → Nova relay path."""
+
 
 from __future__ import annotations
 

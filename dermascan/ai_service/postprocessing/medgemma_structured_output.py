@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-07
 License: MIT
@@ -8,6 +10,7 @@ Parse and normalize MedGemma structured JSON outputs.
 Supports legacy clinical fields and additive cosmetic-intelligence fields during
 the pivot transition (dual-write schema).
 """
+
 
 from __future__ import annotations
 

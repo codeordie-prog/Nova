@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-20
 License: MIT
@@ -15,6 +17,7 @@ Top-up orchestration: the two ways a user can add credits.
 STK is offered first because it keeps the user in the chat, and it falls back
 to the link whenever Paystack rejects the charge.
 """
+
 
 from __future__ import annotations
 

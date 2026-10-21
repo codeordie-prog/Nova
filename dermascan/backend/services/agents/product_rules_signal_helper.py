@@ -3,7 +3,10 @@ Author: Dermascan Team
 Date: 6-14-2026
 Licence: MIT
 
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
 Helpers for product-review signal enrichment via ingredient extraction + rules engine."""
+
 
 from __future__ import annotations
 

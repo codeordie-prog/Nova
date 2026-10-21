@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: DermaScan Team
 Date: 2026-06-05
 Description: Deploy the Qwen Modal app from a local script.
@@ -9,6 +11,7 @@ This script provides a stable, typed wrapper around:
 It validates repository structure, checks Modal CLI availability, and surfaces
 deployment failures with actionable error messages.
 """
+
 
 from __future__ import annotations
 

@@ -2,11 +2,12 @@
 Author:  Dermascan Team
 Date: 2026-05-18
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Description: This module contains the implementation of the logic of adding data to qutis index.
 
-
 """
+
 
 import os
 import shutil

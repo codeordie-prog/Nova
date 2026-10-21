@@ -1,8 +1,11 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Hold → settle reservations for the meter/hold lane.
 
 Orchestrator v1 keys on ``request_id``. MedGemma uses ``medgemma_job_id`` (Phase 7).
 """
+
 
 from __future__ import annotations
 

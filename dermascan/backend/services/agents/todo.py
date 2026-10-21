@@ -1,6 +1,8 @@
 
 
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 0. Get the standard Payload from MUNENE and adjust the endpoints and workers payload logic
 1. Equip the orchestrator with event tracking tools
 2. Make sure every agent appends to event stream

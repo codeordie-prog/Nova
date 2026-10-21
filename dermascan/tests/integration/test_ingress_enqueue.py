@@ -1,8 +1,11 @@
-"""Integration tests: webhook ingress → Redis stream enqueue.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Integration tests: webhook ingress → Redis stream enqueue.
 
 Requires real Redis (testcontainers). Verifies stream entry shape and ack response.
 Source: dermascan/backend/api/endpoints.py
 """
+
 
 from __future__ import annotations
 

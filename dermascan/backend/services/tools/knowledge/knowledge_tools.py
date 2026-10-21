@@ -2,9 +2,10 @@
 Author: Dermascan Team
 Date: 2026-5-10
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 Description: This module implements the tools for the knowledge agent.
-
 """
+
 
 from datetime import datetime, timezone
 import os

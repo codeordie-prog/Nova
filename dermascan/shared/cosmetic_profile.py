@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-07
 License: MIT
@@ -8,6 +10,7 @@ Pure helpers for cosmetic profile state and personalization mode derivation.
 No I/O — safe to unit test in isolation. Production callers wire Redis/Firestore
 data into these functions in later pivot steps.
 """
+
 
 from __future__ import annotations
 

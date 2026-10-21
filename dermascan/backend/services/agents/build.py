@@ -2,9 +2,10 @@
 Author: Dermascan Team
 Date: 6-26-2026
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
-A module for building agents.
-"""
+A module for building agents."""
+
 
 
 

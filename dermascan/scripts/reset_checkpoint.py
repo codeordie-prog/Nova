@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Reset a poisoned orchestrator conversation checkpoint.
 
 Deletes all persisted LangGraph checkpoint state for one or more conversation
@@ -8,6 +10,7 @@ state. Use this to recover a client stuck in a recursion/tool loop.
 Usage:
     poetry run python dermascan/scripts/reset_checkpoint.py <client_id> [<client_id> ...]
 """
+
 
 from __future__ import annotations
 

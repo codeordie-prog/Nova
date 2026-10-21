@@ -2,8 +2,10 @@
 Author: Dermascan Team
 Date: 14-6-2026
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Concrete Rules Engine implementation."""
+
 
 from __future__ import annotations
 

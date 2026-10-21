@@ -1,10 +1,13 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Cloud Run health wrapper for long-running worker containers.
 
 Cloud Run requires the container to listen on ``PORT`` for startup/liveness probes.
 Background workers (Redis consumers) do not expose HTTP by default; this script
 starts a minimal ``/health`` listener in a daemon thread, then runs the worker command.
 """
+
 
 from __future__ import annotations
 

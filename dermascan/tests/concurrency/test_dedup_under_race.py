@@ -1,8 +1,11 @@
-"""Concurrency tests: media-group batching and idempotency under burst.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Concurrency tests: media-group batching and idempotency under burst.
 
 Concerns: C6 — media-group batching race; C7 — idempotency under burst.
 Requires real Redis (testcontainers).
 """
+
 
 from __future__ import annotations
 

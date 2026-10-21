@@ -1,6 +1,9 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Testing pinecone client
 """
+
 
 import os
 from uuid import uuid4

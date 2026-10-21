@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-03-12
 License: MIT
@@ -14,6 +16,7 @@ the Telegram bridge run as three processes; pointing all three at one path puts
 a whole end-to-end run in a single chronological trace, which is why the format
 carries the process name and pid.
 """
+
 
 from __future__ import annotations
 

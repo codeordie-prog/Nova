@@ -1,8 +1,11 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Background sweeper for billing reservations.
 
 Releases held reservations past ``expires_at`` when enforcement is enabled.
 """
+
 
 from __future__ import annotations
 

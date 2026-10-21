@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-06-06
 License: MIT
@@ -10,6 +12,7 @@ the input rate < drain rate of the REDIS STREAM - this avoids, backpressure and 
 is not overwhelmed.
 
 """
+
 
 import os
 import time

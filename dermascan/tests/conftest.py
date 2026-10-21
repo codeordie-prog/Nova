@@ -1,7 +1,10 @@
-"""Shared pytest fixtures for the Dermascan pre-deployment test suite.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Shared pytest fixtures for the Dermascan pre-deployment test suite.
 
 See tests.md for fixture conventions and suite taxonomy.
 """
+
 
 from __future__ import annotations
 

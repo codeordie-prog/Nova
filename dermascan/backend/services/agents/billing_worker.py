@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-20
 License: MIT
@@ -16,6 +18,7 @@ Three loops, each closing a different failure mode:
   but never written to Postgres. This settles the debt rather than letting
   ``unsettled`` drift upward forever.
 """
+
 
 from __future__ import annotations
 

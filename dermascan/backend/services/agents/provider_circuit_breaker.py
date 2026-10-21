@@ -2,6 +2,7 @@
 Author: Dermascan Team
 Date: 6-20-2026
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Thread-safe circuit breaker for model providers.
 
@@ -11,8 +12,8 @@ the circuit opens when, within the window, the failure count and failure ratio
 both cross their thresholds and a minimum request volume has been observed. When
 open, the circuit stays open for a jittered cooldown so many workers do not probe
 in lockstep. After the cooldown a single half-open probe is allowed; success
-closes the circuit, failure re-opens it.
-"""
+closes the circuit, failure re-opens it."""
+
 
 from __future__ import annotations
 

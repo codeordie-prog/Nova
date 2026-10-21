@@ -1,8 +1,11 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: DermaScan Team
 Date: 2026-03-12
 Description: Image validation utilities for MedGemma service
 """
+
 
 from fastapi import UploadFile
 

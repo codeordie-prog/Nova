@@ -1,4 +1,7 @@
-"""Unit tests for consent-gated escalation routing (Step 8.1)."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for consent-gated escalation routing (Step 8.1)."""
+
 
 from __future__ import annotations
 
@@ -23,8 +26,31 @@ from dermascan.ai_service.postprocessing.escalation import (
     resolve_user_escalation_context,
     route_case_after_inference,
 )
+from dermascan.shared.escalation_anchor import record_completed_review_anchor
 from dermascan.shared.intake_session import IntakeImageCategory, IntakeImageRef, IntakeSession, ServiceIntent
 from dermascan.tests.unit.test_medgemma_structured_output import _COSMETIC_PAYLOAD
+
+
+def _seed_completed_skin_review_anchor(
+    fake_redis: Any,
+    *,
+    client_id: str,
+    anchor_request_id: str = "req-skin-audit",
+    case_id: str = "case-skin-audit",
+) -> None:
+    record_completed_review_anchor(
+        fake_redis,
+        client_id=client_id,
+        mode="diagnose",
+        anchor_request_id=anchor_request_id,
+        case_id=case_id,
+        message_id="msg-skin-audit",
+        channel="whatsapp",
+        diagnosis_text="inflammatory acne",
+        review_type="Skin review",
+        risk_tier="cosmetic",
+        confidence=0.82,
+    )
 
 
 @pytest.mark.unit
@@ -161,12 +187,13 @@ class TestEscalationOfferCopy:
 
     def test_appends_offer_suffix(self) -> None:
         result = append_escalation_offer_to_reply("Your skin looks dry.")
-        assert "specialist review" in result.lower()
-        assert "Reply yes" in result
+        assert "dermatologist" in result.lower()
+        assert "reply yes" in result.lower()
 
     def test_idempotent_when_already_present(self) -> None:
         text = append_escalation_offer_to_reply("Report.")
         assert append_escalation_offer_to_reply(text) == text
+        assert "dermatologist" in text.lower()
 
 
 @pytest.mark.unit
@@ -430,6 +457,10 @@ class TestOrchestratorConsentTool:
                 }
             ),
         )
+        _seed_completed_skin_review_anchor(
+            fake_redis,
+            client_id="client-user-escalation",
+        )
 
         session = IntakeSession(
             client_id="client-user-escalation",
@@ -537,6 +568,15 @@ class TestUserRequestedEscalationBuilder:
             3600,
             json.dumps({"request_id": "req-audit", "case_id": "case-audit"}),
         )
+        record_completed_review_anchor(
+            fake_redis,
+            client_id="client-builder",
+            mode="diagnose",
+            anchor_request_id="req-audit",
+            case_id="case-audit",
+            diagnosis_text="atopic dermatitis",
+            review_type="Skin review",
+        )
 
         context = resolve_user_escalation_context("client-builder")
         assert context is not None
@@ -568,6 +608,12 @@ class TestUserRequestedEscalationBuilder:
             "orchestrator:ingress_payload:req-audit",
             3600,
             json.dumps({"request_id": "req-audit", "case_id": "case-audit"}),
+        )
+        _seed_completed_skin_review_anchor(
+            fake_redis,
+            client_id="client-dedupe",
+            anchor_request_id="req-audit",
+            case_id="case-audit",
         )
 
         assert (

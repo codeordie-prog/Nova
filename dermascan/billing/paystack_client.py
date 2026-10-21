@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-20
 License: MIT
@@ -18,6 +20,7 @@ account. Whether the user pays by card in a browser or by STK on their phone,
 the reference on the webhook resolves to exactly one account — nothing here
 depends on knowing their phone number in advance.
 """
+
 
 from __future__ import annotations
 

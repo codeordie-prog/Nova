@@ -1,4 +1,7 @@
-"""Unit tests for intake session Redis persistence."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for intake session Redis persistence."""
+
 
 from __future__ import annotations
 

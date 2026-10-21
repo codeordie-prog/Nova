@@ -2,6 +2,7 @@
 Author: Dermascan Team
 Date: 2026-05-23
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Description: Firebase Storage helpers for shared use across backend and services.
 
@@ -9,8 +10,8 @@ Client chat images are uploaded under: client-media/{client_id}/{uuid}.{ext}
 
 NOTE: This module uses signed URLs to download images from Firebase Storage.
 NOTE: SIGNED URLS ARE ONLY VALID FOR 24 HOURS.
-
 """
+
 
 from __future__ import annotations
 

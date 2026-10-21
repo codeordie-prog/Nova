@@ -1,8 +1,11 @@
-"""Integration tests: crashed-consumer pending message recovery.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Integration tests: crashed-consumer pending message recovery.
 
 Concerns: R2 — crashed worker recovery; R3 — poison message → DLQ.
 Requires real Redis (testcontainers).
 """
+
 
 from __future__ import annotations
 

@@ -1,4 +1,7 @@
-"""Unit tests for async product rules defer / interim messaging."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for async product rules defer / interim messaging."""
+
 
 from __future__ import annotations
 

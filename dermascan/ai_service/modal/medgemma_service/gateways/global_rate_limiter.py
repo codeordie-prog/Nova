@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-04-12
 Description: Global rate limiter for MedGemma service
@@ -13,6 +15,7 @@ is not overwhelmed.
 By default RPM = 70, and a window of 60 seconds is used.
 This can be adjusted in the gateways/config.json file with respect to Telemetry and Performance metrics.
 """
+
 
 import json
 import os

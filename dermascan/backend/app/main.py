@@ -1,3 +1,5 @@
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly."""
+
 from fastapi import FastAPI
 
 from dermascan.backend.api.endpoints import router as orchestrator_router

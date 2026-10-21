@@ -1,1 +1,4 @@
-"""MedGemma model service for Modal."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+MedGemma model service for Modal."""
+

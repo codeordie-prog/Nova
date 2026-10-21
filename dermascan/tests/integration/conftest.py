@@ -1,4 +1,7 @@
-"""Integration-test fixtures (real Redis via testcontainers)."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Integration-test fixtures (real Redis via testcontainers)."""
+
 
 from __future__ import annotations
 

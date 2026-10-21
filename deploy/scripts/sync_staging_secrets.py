@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Upload local ``.env`` (+ credential JSON files) to GCP Secret Manager for staging.
 
 Run once before ``cloudbuild.staging.yaml`` (or whenever ``.env`` changes):
@@ -8,6 +10,7 @@ Run once before ``cloudbuild.staging.yaml`` (or whenever ``.env`` changes):
 
 Requires: gcloud CLI authenticated, Secret Manager API enabled.
 """
+
 
 from __future__ import annotations
 

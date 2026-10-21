@@ -1,4 +1,7 @@
-"""Tests for Turn WhatsApp media URL detection."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Tests for Turn WhatsApp media URL detection."""
+
 
 from __future__ import annotations
 

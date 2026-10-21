@@ -1,4 +1,7 @@
-"""End-to-end escalation loop: producer → worker → webhook → orchestrator."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+End-to-end escalation loop: producer → worker → webhook → orchestrator."""
+
 
 from __future__ import annotations
 

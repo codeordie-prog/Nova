@@ -1,6 +1,9 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 sqlite helper utilities for CIR PDF ingestion
 """
+
 
 import sqlite3
 from typing import List, Dict, Any

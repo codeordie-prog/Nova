@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 
 Author: DermaScan Team
 
@@ -47,6 +49,7 @@ Deploy from the project root (where ``pyproject.toml`` lives)::
     modal deploy dermascan/ai_service/modal/qwen_service/app.py
 
 """
+
 
 
 

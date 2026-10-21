@@ -1,8 +1,11 @@
-"""Live-stack orchestrator success probes (text-only, no images).
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Live-stack orchestrator success probes (text-only, no images).
 
 Validates that parallel text jobs produce non-empty outbound replies from the
 orchestrator at configured concurrency levels (default 20 and 40).
 """
+
 
 from __future__ import annotations
 

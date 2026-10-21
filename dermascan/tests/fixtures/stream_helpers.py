@@ -1,10 +1,13 @@
-"""Redis Stream helpers for integration tests.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Redis Stream helpers for integration tests.
 
 Mirrors production patterns from orchestrator_worker and endpoints:
 - ``XGROUP CREATE … id=0 mkstream=True`` (ignore BUSYGROUP)
 - ``XADD`` with ``maxlen`` + ``approximate=True``
 - ``XREADGROUP`` on ``>`` for new messages
 """
+
 
 from __future__ import annotations
 

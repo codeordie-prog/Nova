@@ -1,9 +1,12 @@
-"""Unit tests for pending-message recovery (XAUTOCLAIM, idempotency, DLQ).
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for pending-message recovery (XAUTOCLAIM, idempotency, DLQ).
 
 Concerns: R1 — exactly-once-ish processing; R2 — crashed worker recovery;
           R3 — poison-message → DLQ.
 Source: reclaim_logic.py
 """
+
 
 from __future__ import annotations
 

@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-21
 License: MIT
@@ -28,6 +30,7 @@ Orchestrator API call and summarization chai fallbacks are metering token usage.
 Inference is metering flat job type cost + token usage.
 
 """
+
 
 from __future__ import annotations
 

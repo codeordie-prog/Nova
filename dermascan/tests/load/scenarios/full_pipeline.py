@@ -1,8 +1,11 @@
-"""Load scenario: full pipeline ingress → worker → outbound.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Load scenario: full pipeline ingress → worker → outbound.
 
 Concerns: S5 — throughput vs concurrency curve; S6 — horizontal worker scaling.
 Requires live stack with mock inference layer.
 """
+
 
 from __future__ import annotations
 

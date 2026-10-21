@@ -1,4 +1,7 @@
-"""Tests for WhatsApp ingress wamid dedupe."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Tests for WhatsApp ingress wamid dedupe."""
+
 
 from __future__ import annotations
 

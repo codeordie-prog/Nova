@@ -1,8 +1,11 @@
-"""Concurrency tests: queue depth reads under concurrent enqueue/ack.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Concurrency tests: queue depth reads under concurrent enqueue/ack.
 
 Concerns: stable XPENDING depth under concurrent producers/consumers.
 Requires real Redis (testcontainers).
 """
+
 
 from __future__ import annotations
 

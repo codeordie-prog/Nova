@@ -1,4 +1,7 @@
-"""Unit tests for rules-engine decision confidence scoring."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for rules-engine decision confidence scoring."""
+
 
 from __future__ import annotations
 

@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-06-17
 License: MIT
@@ -9,6 +11,7 @@ Paths in ``.env`` may be absolute, relative to the repository root, or relative
 to ``DERMASCAN_ROOT`` when that variable is set explicitly on the host.
 
 """
+
 
 from __future__ import annotations
 

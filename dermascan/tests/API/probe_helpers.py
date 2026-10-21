@@ -1,4 +1,7 @@
-"""Shared helpers for live backend API load/latency probes."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Shared helpers for live backend API load/latency probes."""
+
 
 from __future__ import annotations
 

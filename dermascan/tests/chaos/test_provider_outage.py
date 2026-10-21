@@ -1,8 +1,11 @@
-"""Chaos tests: provider outage (Qwen / MedGemma).
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Chaos tests: provider outage (Qwen / MedGemma).
 
 Concerns: R7 — provider failover via circuit breaker.
 Fault injection via monkeypatch of provider clients.
 """
+
 
 from __future__ import annotations
 

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Inspect Redis streams for duplicate publishes for a case/request id."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Inspect Redis streams for duplicate publishes for a case/request id."""
+
 
 from __future__ import annotations
 

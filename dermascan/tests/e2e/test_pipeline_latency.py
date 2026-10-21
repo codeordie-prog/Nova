@@ -1,8 +1,11 @@
-"""Live-stack E2E latency probes (sequential jobs).
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Live-stack E2E latency probes (sequential jobs).
 
 Measures pipeline time from webhook acceptance to worker completion.
 Separate from ingress-only p95 probes in ``tests/API/test_ingress_p95.py``.
 """
+
 
 from __future__ import annotations
 

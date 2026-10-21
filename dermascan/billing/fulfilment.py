@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-20
 License: MIT
@@ -20,6 +22,7 @@ The order here is not negotiable:
 Every step is idempotent, because all three of Paystack retries, stream
 redelivery, and the verify poller can drive this for the same reference.
 """
+
 
 from __future__ import annotations
 

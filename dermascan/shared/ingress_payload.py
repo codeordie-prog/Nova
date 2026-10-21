@@ -2,10 +2,11 @@
 Author: Dermascan Team
 Date: 2026-06-28
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Ingress payload helpers: image attachment detection and URL resolution for
-orchestrator multimodal input and MedGemma enqueue.
-"""
+orchestrator multimodal input and MedGemma enqueue."""
+
 
 from __future__ import annotations
 

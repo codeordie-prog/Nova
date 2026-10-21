@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2025-10-13
 Description: Queue depth manager for MedGemma service
@@ -6,6 +8,7 @@ Description: Queue depth manager for MedGemma service
 This module has helper functions that check the queue depth in REDIS
 
 """
+
 
 import os
 import anyio

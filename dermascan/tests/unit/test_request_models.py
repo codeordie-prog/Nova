@@ -1,8 +1,11 @@
-"""Unit tests for ingress Pydantic request models and boundary fields.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for ingress Pydantic request models and boundary fields.
 
 Concerns: R9 — malformed/forged ingress schema validation.
 Source: request/response models used by endpoints.py.
 """
+
 
 from __future__ import annotations
 

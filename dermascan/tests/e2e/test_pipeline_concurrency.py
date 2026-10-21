@@ -1,8 +1,11 @@
-"""Live-stack E2E concurrency probes (parallel unique text jobs).
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Live-stack E2E concurrency probes (parallel unique text jobs).
 
 Uses unique provider message ids per worker thread. Image jobs disabled for now.
 Orchestrator success at scale is covered in ``test_orchestrator_success.py``.
 """
+
 
 from __future__ import annotations
 

@@ -1,9 +1,12 @@
-"""Integration tests: Redis Streams consumer group lifecycle.
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Integration tests: Redis Streams consumer group lifecycle.
 
 Concerns: R11 — stream trimming doesn't drop in-flight; C4 — single delivery per group;
           S6 — horizontal worker scaling; L7 — MAXLEN trim behavior.
 Requires real Redis (testcontainers).
 """
+
 
 from __future__ import annotations
 

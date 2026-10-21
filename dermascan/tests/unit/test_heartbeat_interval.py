@@ -1,4 +1,7 @@
-"""Tests for stream heartbeat interval computation."""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Tests for stream heartbeat interval computation."""
+
 
 from __future__ import annotations
 

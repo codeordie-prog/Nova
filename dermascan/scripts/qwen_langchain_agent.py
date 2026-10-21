@@ -1,8 +1,11 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: DermaScan Team
 Date: 2026-06-04
 Description: Minimal LangChain agent script using Qwen + Tavily + datetime tools.
 """
+
 
 from __future__ import annotations
 

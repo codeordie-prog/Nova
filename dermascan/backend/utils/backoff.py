@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: DermaScan Team
 Date: 2026-06-10
 License: MIT
@@ -13,6 +15,7 @@ Description:
     transient outbound delivery failures.
 
 """
+
 
 from __future__ import annotations
 

@@ -2,13 +2,14 @@
 Author: Dermascan Team
 Date: 2026-06-28
 Licence: MIT
+Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Redis persistence for orchestrator intake sessions.
 
 Loads and saves ``IntakeSession`` documents at the keys defined in
 ``intake_session.py``. Callers may inject a Redis client (tests) or rely on
-``REDIS_URL`` via the shared resilient client.
-"""
+``REDIS_URL`` via the shared resilient client."""
+
 
 from __future__ import annotations
 

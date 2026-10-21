@@ -68,6 +68,7 @@ cir_pdfs_backup.sql
 dermascan/docs/.generated_billing_doc_assets/
 dermascan/docs/*.pdf
 dermascan/docs/*.docx
+dermascan/docs/azure-*.md
 
 # Turn.io integration notes and PDF exports (Python under turn/scripts/ stays tracked)
 turn/**/*.md

@@ -1,8 +1,11 @@
-"""Unit tests for queue depth manager (green/yellow/red backpressure).
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+Unit tests for queue depth manager (green/yellow/red backpressure).
 
 Concerns: S3 — queue backpressure thresholds; S4 — wait-budget behavior.
 Source: dermascan/shared/queue_depth_manager.py
 """
+
 
 from __future__ import annotations
 

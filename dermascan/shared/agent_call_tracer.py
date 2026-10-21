@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-06-07
 License: MIT
@@ -6,6 +8,7 @@ Description: Per-turn agent model-call tracing.
 This module records, for each orchestrator agent turn, how many model calls were issued, which providers were attempted, how many fallbacks occurred, and which tools were invoked. Each completed turn is written as a single structured JSON line to a dedicated trace file so it can be inspected after a run to distinguish legitimate multi-step tool loops from duplicate/looping work.
 The tracer is thread-safe: per-turn state is stored in a :class:`ContextVar` (isolated per worker thread), and the file handler uses the stdlib logging lock.
 """
+
 
 from __future__ import annotations
 

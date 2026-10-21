@@ -1,9 +1,12 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Redis-backed media-group buffering helpers.
 
 This module batches channel media items that share one group identifier,
 allowing downstream workers to receive grouped metadata with expected counts.
 """
+
 
 from __future__ import annotations
 

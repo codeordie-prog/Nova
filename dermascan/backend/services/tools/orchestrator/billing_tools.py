@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-20
 License: MIT
@@ -15,6 +17,7 @@ from what the user typed in conversation — no code path extracts a number from
 a Telegram or WhatsApp payload. Without one, the user gets a checkout link,
 which works for everybody.
 """
+
 
 from __future__ import annotations
 

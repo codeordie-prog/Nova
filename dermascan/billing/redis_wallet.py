@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Qutis Team
 Date: 2026-08-20
 
@@ -29,6 +31,7 @@ Two invariants that are easy to get wrong:
   hydrate from Postgres. Treating a cache miss as "no credits" locks out
   paying users.
 """
+
 
 from __future__ import annotations
 

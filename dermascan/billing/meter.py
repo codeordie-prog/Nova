@@ -1,10 +1,13 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-08-21
 License: MIT
 
 LLM usage extraction and emit-only metering for the model fallback chain.
 """
+
 
 from __future__ import annotations
 

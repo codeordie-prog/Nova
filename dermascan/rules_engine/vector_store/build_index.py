@@ -1,4 +1,6 @@
-"""
+"""Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
+
+
 Author: Dermascan Team
 Date: 2026-05-18
 License: MIT
@@ -6,6 +8,7 @@ License: MIT
 Description: Pinecone index builder utilities.
 
 """
+
 
 from __future__ import annotations
 
