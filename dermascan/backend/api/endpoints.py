@@ -75,6 +75,11 @@ from dermascan.shared.redis_stability import get_redis_client
 from dermascan.shared.hmac_auth import SIGNATURE_HEADER, TIMESTAMP_HEADER, verify as verify_hmac
 from dermascan.shared.logger import get_logger
 from dermascan.shared.queue_depth_manager import _wait_for_queue_capacity
+from dermascan.reminders.ingress_hooks import (
+    inbound_at_from_whatsapp_message,
+    record_channel_inbound,
+    resume_reminders_after_nova_ingress,
+)
 from dermascan.shared.stream_pipeline_tracing import (
     enrich_stream_fields,
     record_stream_produce,
@@ -623,9 +628,37 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
             )
         )
 
+    elif msg_type in ("voice", "audio"):
+        media_obj: dict[str, Any] = message.get(msg_type) or message.get("voice") or message.get("audio") or {}
+        media_id = str(media_obj.get("id") or "").strip()
+        mime_type = str(media_obj.get("mime_type") or "audio/ogg")
+        if not media_id:
+            raise HTTPException(status_code=400, detail=f"Invalid WhatsApp {msg_type}: missing media id")
+        attachments.append(
+            AttachmentItem(
+                id=media_id,
+                type="audio",
+                mime_type=mime_type,
+                filename=media_obj.get("filename"),
+                size_bytes=media_obj.get("file_size"),
+                source=AttachmentSource(kind="whatsapp_media_id", value=media_id),
+            )
+        )
+
     content = MessageContent(text="\n".join([part for part in text_parts if part]).strip() or None, attachments=attachments)
     if not content.text and not content.attachments:
         raise HTTPException(status_code=400, detail=f"Unsupported or empty message type: {msg_type}")
+
+    metadata_extras: dict[str, str] = {"whatsapp_type": msg_type}
+    if msg_type == "voice":
+        metadata_extras["inbound_voice_note"] = "true"
+    elif msg_type == "audio":
+        voice_obj = message.get("audio") or {}
+        if isinstance(voice_obj, dict) and voice_obj.get("voice") in (True, "true", 1, "1"):
+            metadata_extras["inbound_voice_note"] = "true"
+        elif isinstance(voice_obj, dict) and voice_obj.get("id"):
+            # Turn/Meta PTT often arrives as type audio without a voice flag.
+            metadata_extras["inbound_voice_note"] = "true"
 
     _rid = uuid.uuid4().hex
     return OrchestratorIngressRequest(
@@ -637,7 +670,7 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
         channel="whatsapp",
         content=content,
         routing=RoutingHint(ingress_stream=_ORCHESTRATOR_JOB_STREAM, priority="normal"),
-        metadata=RequestMetadata(extras={"whatsapp_type": msg_type}),
+        metadata=RequestMetadata(extras=metadata_extras),
     )
 
 
@@ -819,6 +852,9 @@ def _enqueue_orchestrator_row(
         extra_metadata={"worker": "ingress"},
     )
 
+    # Resume reminders after Nova ingress - since NOVA now owns the conversation, we can resume reminders.
+    resume_reminders_after_nova_ingress(normalized.channel, normalized.client_id)
+
 
 async def _flush_telegram_media_group_after_window(*, channel: str, group_id: str) -> None:
     """
@@ -967,6 +1003,14 @@ async def whatsapp_webhook(
     for message in messages:
         wa_id_raw = str(message.get("from") or "").strip()
         wamid_raw = str(message.get("id") or "").strip()
+        if wa_id_raw:
+
+            # Record channel inbound - this will set the last inbound timestamp for the user.
+            record_channel_inbound(
+                "whatsapp",
+                wa_id_raw,
+                at=inbound_at_from_whatsapp_message(message),
+            )
         if wa_id_raw and not await whatsapp_ingress_should_queue_orchestrator(
             wa_id=wa_id_raw,
             message_id=wamid_raw or None,
@@ -1052,7 +1096,11 @@ async def whatsapp_webhook(
                 fields=stream_fields,
                 extra_metadata={"worker": "ingress", "flow": "whatsapp_batch"},
             )
+
+            # Resume reminders after Nova ingress - since NOVA now owns the conversation, we can resume reminders.
+            resume_reminders_after_nova_ingress(normalized.channel, normalized.client_id)
             request_ids.append(normalized.request_id)
+            
     except redis.RedisError as exc:
         raise HTTPException(status_code=503, detail="Redis unavailable") from exc
 

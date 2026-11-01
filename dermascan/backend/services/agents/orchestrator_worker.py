@@ -51,6 +51,8 @@ from dermascan.backend.services.agents.product_rules_signal_helper import (
     run_skin_signal_rules_flow,
 )
 from dermascan.backend.services.agents.rules_index_jobs import ORCHESTRATOR_SIGNAL_TYPE_INDEX_READY
+from dermascan.reminders.morning_brief import build_morning_brief_text
+from dermascan.reminders.signal_types import ORCHESTRATOR_SIGNAL_TYPE_MORNING_BRIEF
 from dermascan.ai_service.postprocessing.consent_escalation import append_escalation_offer_to_reply
 from dermascan.shared.concise_report_format import dermatologist_connection_guidance
 from dermascan.ai_service.postprocessing.escalation import resolve_client_message_for_signal
@@ -75,11 +77,17 @@ from dermascan.shared.intake_session_store import (
     load_archived_intake_session,
     load_intake_session,
 )
+from dermascan.backend.services.agents.voice.job_voice import (
+    prepare_voice_job_payload,
+    synthesize_outbound_voice_note_b64,
+)
+from dermascan.shared.voice_ingress import VOICE_TRANSCRIPT_PREFIX
 from dermascan.shared.redis_stability import (
     check_redis_connectivity,
     get_redis_client,
     run_with_redis_retries,
 )
+from dermascan.reminders.ingress_hooks import pause_reminders_after_platform_handoff
 from dermascan.shared.turn_contact_api import return_to_mydawa_main_menu_sync
 from dermascan.shared.whatsapp_platform_message_id import resolve_channel_reply_target
 from langchain_core.messages import HumanMessage
@@ -971,6 +979,8 @@ def _enqueue_outbound(
     dedupe_discriminator: str = "",
     confidence: Optional[str] = None,
     threshold: Optional[str] = None,
+    voice_audio_b64: Optional[str] = None,
+    voice_mime_type: str = "audio/ogg",
 ) -> None:
     """
     Enqueue one outbound user-facing message for ordered channel delivery.
@@ -1012,6 +1022,10 @@ def _enqueue_outbound(
         outbound_fields["confidence"] = confidence
     if threshold:
         outbound_fields["threshold"] = threshold
+    voice_b64 = str(voice_audio_b64 or "").strip()
+    if voice_b64:
+        outbound_fields["voice_audio_b64"] = voice_b64
+        outbound_fields["voice_mime_type"] = str(voice_mime_type or "audio/ogg").strip() or "audio/ogg"
     stream_fields = enrich_stream_fields(outbound_fields)
     msg_id = str(
         _redis.xadd(
@@ -1387,6 +1401,11 @@ def _build_orchestrator_text_context(
         summary_lines.append("Routing hint: text is available. You may need to just respond, confirm intention or check event progress.")
     if attachments and not text:
         summary_lines.append("Routing hint: attachment-only request. May be a follow-up image or new case. Confirm intention.")
+    if VOICE_TRANSCRIPT_PREFIX in text:
+        summary_lines.append(
+            "Voice note hint: the user's spoken words are in text above under "
+            f"\"{VOICE_TRANSCRIPT_PREFIX}\". Respond to that transcript; do not say you cannot listen to audio."
+        )
     if not text and not attachments:
         summary_lines.append("Routing hint: missing content; ask clarification.")
 
@@ -2051,6 +2070,10 @@ def _maybe_handle_mydawa_menu_command(
         )
         if str(turn_result.get("status") or "") == "ok":
             _clear_client_conversation_state(client_id, log_prefix="mydawa_menu")
+
+            # Pause reminders after platform handoff - since the platform now owns the conversation, we can pause reminders.
+            pause_reminders_after_platform_handoff(channel, client_id)
+            
             reply_text = MYDAWA_MENU_REPLY
         else:
             logger.warning(
@@ -2143,6 +2166,14 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             inbound_message_id=stream_message_id,
         ):
             return
+
+        mirror_voice_outbound = False
+        if channel == "whatsapp":
+            payload_json, mirror_voice_outbound = prepare_voice_job_payload(
+                payload_json,
+                redis_client=_redis,
+                request_id=request_id,
+            )
 
         if billing.billing_active():
             try:
@@ -2355,6 +2386,11 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             request_id=request_id,
             case_id=case_id,
         )
+        
+        # Voice note for outbound
+        voice_b64: Optional[str] = None
+        if mirror_voice_outbound and channel == "whatsapp":
+            voice_b64 = synthesize_outbound_voice_note_b64(reply)
 
         _enqueue_outbound(
             client_id=client_id,
@@ -2365,6 +2401,7 @@ def _process_stream_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
             kind="job_reply",
             must_deliver=False,
             reply_to_message_id=reply_target,
+            voice_audio_b64=voice_b64,
         )
 
         _redis.xack(ORCHESTRATOR_JOB_STREAM, ORCHESTRATOR_CONSUMER_GROUP, msg_id)
@@ -2738,6 +2775,16 @@ def _process_signal_message(agent: Any, msg_id: str, fields: dict[str, Any]) -> 
                 signal_type,
             )
             reply = escalation_reply
+        elif signal_type == ORCHESTRATOR_SIGNAL_TYPE_MORNING_BRIEF:
+            tz_name = str(payload_obj.get("timezone") or "Africa/Nairobi")
+            reply = str(payload_obj.get("draft") or "").strip() or build_morning_brief_text(
+                timezone_name=tz_name
+            )
+            logger.info(
+                "processing morning brief signal: request_id=%s client_id=%s",
+                request_id,
+                client_id,
+            )
         elif signal_type == ORCHESTRATOR_SIGNAL_TYPE_INDEX_READY:
             logger.info(
                 "processing product index ready final pass: request_id=%s case_id=%s client_id=%s",
@@ -3024,6 +3071,11 @@ def run_worker_forever() -> None:
         JOB_MAX_INFLIGHT, JOB_BATCH_MAX, JOB_BLOCK_MS,
         ORCHESTRATOR_SIGNAL_STREAM, ORCHESTRATOR_SIGNAL_CONSUMER_GROUP, ORCHESTRATOR_SIGNAL_CONSUMER_NAME,
         SIGNAL_MAX_INFLIGHT, SIGNAL_BATCH_MAX, SIGNAL_BLOCK_MS,
+    )
+    logger.info(
+        "voice inference config: VOICE_ENABLED=%s TURN_API_TOKEN_set=%s",
+        os.getenv("VOICE_ENABLED", ""),
+        bool(os.getenv("TURN_API_TOKEN", "").strip()),
     )
 
     # Per-stream capacity. Total OS thread count = sum of both, so a saturated

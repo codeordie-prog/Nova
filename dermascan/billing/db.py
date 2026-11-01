@@ -232,6 +232,40 @@ def run_transaction(fn: Callable[[Connection], _T]) -> _T:
     raise last_exc
 
 
+def run_read(fn: Callable[[Connection], _T]) -> _T:
+    """
+    Run ``fn`` with a pooled connection, retrying once on transient connection loss.
+
+    Unlike :func:`run_transaction`, does not open an explicit transaction block.
+    Use :func:`run_transaction` when the callback uses ``FOR UPDATE`` or must be
+    atomic with other statements in the same transaction.
+
+    Args:
+        fn: Callable receiving an open connection.
+
+    Returns:
+        _T: Return value of ``fn``.
+
+    Raises:
+        psycopg.Error: When both attempts fail or the error is not transient.
+    """
+    last_exc: BaseException | None = None
+    for attempt in (1, 2):
+        try:
+            with get_pool().connection() as conn:
+                return fn(conn)
+        except BaseException as exc:
+            if attempt == 2 or not _is_transient_connection_error(exc):
+                raise
+            last_exc = exc
+            logger.warning(
+                "billing db transient connection error; retrying read once: %s",
+                exc,
+            )
+    assert last_exc is not None
+    raise last_exc
+
+
 @contextmanager
 def transaction() -> Iterator[Connection]:
     """

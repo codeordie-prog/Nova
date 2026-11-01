@@ -53,3 +53,10 @@ class TestOrchestratorPromptCosmeticPositioning:
         prompt = orchestrator_prompt.system_prompt
         assert "request_specialist_escalation" in prompt.lower()
         assert "explicit" in prompt.lower()
+
+    def test_prompt_mentions_reminder_tools(self) -> None:
+        prompt = orchestrator_prompt.system_prompt
+        assert "list_routines" in prompt
+        assert "set_morning_brief" in prompt
+        assert "24 hours" in prompt.lower()
+        assert "local morning" in prompt.lower()

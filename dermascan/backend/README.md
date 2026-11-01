@@ -76,12 +76,15 @@ Use the supervisor script (recommended):
 poetry run python dermascan/scripts/do_work.py
 ```
 
-This starts two workers in one process:
+This starts core workers in one process (plus optional lanes when flags are on):
 
-| Worker | File | Stream(s) |
-|---|---|---|
-| Orchestrator | `orchestrator_worker.py` | `orchestrator:jobs`, `orchestrator:signals` |
-| Outbound sender | `outbound_sender_worker.py` | `outbound:messages` |
+| Worker | File | Stream(s) | When |
+|---|---|---|---|
+| Orchestrator | `orchestrator_worker.py` | `orchestrator:jobs`, `orchestrator:signals` | always |
+| Outbound sender | `outbound_sender_worker.py` | `outbound:messages` | always |
+| Escalation | `escalation_worker.py` | (escalation streams) | always |
+| Billing | `billing_worker.py` | `billing:jobs` | `BILLING_ENABLED=true` |
+| Reminders | `reminder_worker.py` | Postgres poll → outbound / signals | `REMINDERS_ENABLED=true` |
 
 The **knowledge worker** (`knowledge_worker.py`) is present but intentionally excluded from `do_work.py`. Start it manually if needed:
 
@@ -97,10 +100,20 @@ poetry run python dermascan/backend/services/agents/knowledge_worker.py
 
 **Outbound sender** — compacts and delivers messages to Telegram or WhatsApp with ordered, deduplicated delivery.
 
+**Reminders** — polls Postgres for due morning briefs and routine habits (WhatsApp v1). Respects the 24h customer window, MYDAWA pause, and local morning catch-up for pending briefs. Orchestrator tools: `set_morning_brief`, `set_routine_reminder`, `list_routines`, `disable_routine`.
+
+### Reminders setup
+
+1. Apply migration `dermascan/migrations/005_reminders.sql` on Postgres (same DB as billing).
+2. Set `REMINDERS_ENABLED=true` and ensure `POSTGRES_*` match billing.
+3. Restart `do_work.py` so the `reminders` thread starts.
+
+See `.env_example` for `REMINDER_TICK_INTERVAL_S`, morning delivery window, and default timezone.
+
 ## Suggested local run order
 
 1. Redis
-2. PostgreSQL (if using rules-engine flows)
+2. PostgreSQL (rules-engine flows; also reminders and billing when enabled)
 3. Deploy Qwen; set `QWEN_BASE_URL`
 4. MedGemma gateway + worker (if image / skin review flows are required)
 5. Backend API (`8088`)

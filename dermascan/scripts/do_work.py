@@ -21,6 +21,8 @@ from dermascan.backend.services.agents.billing_worker import run_worker_forever 
 from dermascan.backend.services.agents.escalation_worker import run_worker_forever as run_escalation_worker
 from dermascan.backend.services.agents.orchestrator_worker import run_worker_forever as run_orchestrator_worker
 from dermascan.backend.services.agents.outbound_sender_worker import run_worker_forever as run_outbound_sender_worker
+from dermascan.backend.services.agents.reminder_worker import run_worker_forever as run_reminder_worker
+from dermascan.reminders.flags import reminders_enabled
 from dermascan.billing.flags import billing_active, billing_enabled, validate_billing_flags
 from dermascan.billing.sweeper import start_billing_sweeper_thread
 from dermascan.shared.logger import get_logger
@@ -67,6 +69,8 @@ def main() -> None:
         workers.append(
             ("billing", partial(run_billing_worker, stop_event)),
         )
+    if reminders_enabled():
+        workers.append(("reminders", run_reminder_worker))
     if _rules_index_worker_enabled():
         from dermascan.backend.services.agents.indexing_worker import run_worker_forever as run_rules_index_worker
 

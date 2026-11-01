@@ -19,6 +19,11 @@ user (Telegram / WhatsApp)
          ├──► rules engine (PostgreSQL) via signal enrichment
          │         report subagents: Gemini-first chain (REPORT_MODEL_CHAIN)
          └──► outbound:messages ──► Telegram / WhatsApp
+
+  Reminders (optional, REMINDERS_ENABLED) ──► Postgres `reminders.*`
+         │ poll due rows, 24h WhatsApp window
+         ├──► outbound:messages (routine nudges)
+         └──► orchestrator:signals (morning brief draft → orchestrator reply)
 ```
 
 Workers are started together via `dermascan/scripts/do_work.py`. MedGemma runs as a separate AI-service stack (not included in that script).
@@ -28,7 +33,7 @@ Workers are started together via `dermascan/scripts/do_work.py`. MedGemma runs a
 - Python 3.12+
 - [Poetry](https://python-poetry.org/)
 - Redis (queues, job status, LangGraph checkpoints)
-- PostgreSQL (rules engine ingredient safety data — required for product-review flows)
+- PostgreSQL (rules engine ingredient safety data — required for product-review flows; also reminders and billing when enabled)
 - Modal CLI (MedGemma GPU inference only)
 - OpenAI API key (`OPENAI_API_KEY_QUTIS`) and Gemini credentials (`GEMINI_API_KEY_QUTIS` or Vertex AI)
 
@@ -197,8 +202,29 @@ This script runs:
 |---|---|
 | `orchestrator_worker` | Consumes jobs + signals; Layer 0 routing + Layer 1 chain walk with breakers |
 | `outbound_sender_worker` | Compacts and delivers replies to Telegram / WhatsApp |
+| `reminder_worker` | Polls Postgres for due morning briefs and routine reminders (`REMINDERS_ENABLED=true`) |
 
 **Not included:** `knowledge_worker` (optional, start manually) and **MedGemma** (separate AI-service stack below).
+
+### WhatsApp reminders (v1)
+
+Routine habits and a daily **morning brief** are stored in Postgres (`dermascan/migrations/005_reminders.sql`, schema `reminders`). The orchestrator exposes tools: `set_morning_brief`, `set_routine_reminder`, `list_routines`, `disable_routine` (see `routine_tools.py` and the reminders section in `orchestrator_prompt.py`).
+
+| Concern | Behavior |
+|---|---|
+| Channels | WhatsApp only in v1; schema and `channel` columns are ready for Telegram later |
+| Delivery window | Outbound text only while the user is inside the **24h WhatsApp customer-care window** (updated on each inbound message) |
+| MYDAWA handoff | Reminders **pause** when the user is handed to the platform; **resume** when Nova ingress receives the next user message |
+| Timezone | Default `Africa/Nairobi` (`REMINDERS_DEFAULT_TIMEZONE`) |
+| Morning brief catch-up | If a brief was missed, delivery is retried only during the **local morning band** (default 06:00–12:00, env-configurable) until grace expires |
+
+**Enable locally**
+
+1. Apply migration `005_reminders.sql` (included in `poetry run python -m dermascan.scripts.migrate`, or via `local_stack.sh` when migrations are wired).
+2. Set `REMINDERS_ENABLED=true` and the same `POSTGRES_*` as billing.
+3. Restart `do_work.py` — a `reminders` thread runs beside orchestrator and outbound workers.
+
+Ingress touches (`record_channel_inbound`, pause/resume hooks) live in `dermascan/reminders/ingress_hooks.py` and are wired from WhatsApp webhooks and orchestrator handoff paths. Worker detail, env vars, and tick intervals: **`dermascan/backend/README.md`** (Reminders setup).
 
 ### Suggested local run order
 
@@ -244,7 +270,9 @@ See `dermascan/ai_service/modal/medgemma_service/README.md` for gateway config.
 | `dermascan/backend/services/agents` | Workers, `model_fallback_chain.py`, `model_chain_routing.py`, circuit breakers |
 | `dermascan/ai_service` | MedGemma Modal app, inference postprocessing |
 | `dermascan/rules_engine` | PostgreSQL-backed ingredient safety engine |
-| `dermascan/scripts` | Worker supervisor (`do_work.py`) and utility scripts |
+| `dermascan/reminders` | Morning brief + routine reminders (Postgres, WhatsApp v1) |
+| `dermascan/migrations` | SQL migrations (`005_reminders.sql` for reminders schema) |
+| `dermascan/scripts` | Worker supervisor (`do_work.py`), `migrate.py`, utilities |
 | `dermascan/shared` | Firebase storage, logging utilities |
 | `dermascan/frontend` | Web UI and client-side application |
 

@@ -83,6 +83,7 @@ from dermascan.shared.intake_session_store import (
     save_intake_session_recomputed,
 )
 from dermascan.shared.orchestrator_checkpoint_reset import reset_orchestrator_thread_checkpoint
+from dermascan.reminders.ingress_hooks import pause_reminders_after_platform_handoff
 from dermascan.shared.turn_contact_api import return_to_mydawa_main_menu_sync
 from dermascan.backend.services.agents.text_product_review import (
     dispatch_text_product_review_signal,
@@ -463,6 +464,12 @@ from dermascan.billing.meter import job_credits_shortfall, record_job_charge
 from dermascan.backend.services.tools.orchestrator.billing_tools import (
     create_topup,
     get_credit_balance,
+)
+from dermascan.backend.services.tools.orchestrator.routine_tools import (
+    disable_routine,
+    list_routines,
+    set_morning_brief,
+    set_routine_reminder,
 )
 
 OrchestratorClientIdArg = Annotated[
@@ -3934,6 +3941,10 @@ def return_to_mydawa_main_menu(request_id: OrchestratorRequestIdArg) -> dict[str
     if status == "ok":
         delete_intake_session(client_id)
         checkpoint_cleared = reset_orchestrator_thread_checkpoint(client_id)
+
+        # Pause reminders after platform handoff - since the platform now owns the conversation, we can pause reminders.
+        pause_reminders_after_platform_handoff(channel, client_id)
+        
         return {
             "status": "ok",
             "request_id": request_id,
@@ -3986,6 +3997,10 @@ orchestrator_tools: list = [
     get_time,
     get_credit_balance,
     create_topup,
+    set_morning_brief,
+    set_routine_reminder,
+    list_routines,
+    disable_routine,
     skin_profile_is_available,
     get_skin_profile,
     update_intake,
