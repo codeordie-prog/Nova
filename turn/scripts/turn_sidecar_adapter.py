@@ -86,8 +86,10 @@ class SendRequest(BaseModel):
     """Sidecar ``/send`` body."""
 
     to: str = Field(..., description="Recipient wa_id (E.164 digits, optional leading +).")
-    kind: str = Field(default="text", description="Message kind; only text is supported.")
+    kind: str = Field(default="text", description="Message kind: ``text`` or ``audio``.")
     text: str = Field(default="", description="Plain text body when kind is text.")
+    audio_b64: str | None = Field(default=None, description="Base64 audio when kind is audio.")
+    audio_mime_type: str = Field(default="audio/ogg", description="MIME type for audio upload.")
     reply_to_wamid: str | None = Field(default=None, description="Optional inbound wamid for threading.")
 
 
@@ -173,6 +175,82 @@ def _turn_signature_valid(raw_body: bytes, signature: str | None) -> bool:
         signature=signature,
         webhook_secret=TURN_WEBHOOK_SECRET,
     )
+
+
+async def _upload_turn_media(
+    client: httpx.AsyncClient,
+    *,
+    audio_bytes: bytes,
+    mime_type: str,
+) -> str:
+    """
+    Upload binary media to Turn ``POST /v1/media``.
+
+    Args:
+        client: Shared HTTP client.
+        audio_bytes: Raw file bytes.
+        mime_type: Content-Type for the upload (e.g. ``audio/ogg``).
+
+    Returns:
+        str: Turn media id.
+
+    Raises:
+        HTTPException: When upload fails or response lacks an id.
+    """
+    url = f"{TURN_API_BASE_URL}/v1/media"
+    headers = _turn_auth_headers()
+    headers["Content-Type"] = mime_type
+    response = await client.post(url, headers=headers, content=audio_bytes)
+    if response.status_code >= 400:
+        logger.error(
+            "Turn media upload failed: HTTP %s mime=%s body=%s",
+            response.status_code,
+            mime_type,
+            response.text[:300],
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"turn media upload HTTP {response.status_code}: {response.text[:200]}",
+        )
+    try:
+        payload = response.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="turn media upload returned non-JSON") from exc
+
+    media_list = payload.get("media")
+    if isinstance(media_list, list) and media_list:
+        media_id = str((media_list[0] or {}).get("id") or "").strip()
+        if media_id:
+            return media_id
+    media_id = str(payload.get("id") or "").strip()
+    if media_id:
+        return media_id
+    raise HTTPException(status_code=502, detail="turn media upload missing id")
+
+
+def _build_turn_audio_message(body: SendRequest, media_id: str) -> tuple[dict[str, Any], str | None]:
+    """
+    Map sidecar audio send payload to Turn Messages API JSON.
+
+    Args:
+        body: Validated sidecar request with ``audio_b64`` already uploaded.
+        media_id: Turn media id from ``_upload_turn_media``.
+
+    Returns:
+        Tuple of Turn message JSON and optional reply wamid.
+    """
+    to_wa = _normalize_wa_id(body.to)
+    if not to_wa:
+        raise HTTPException(status_code=400, detail="missing or invalid to")
+
+    message: dict[str, Any] = {
+        "recipient_type": "individual",
+        "to": to_wa,
+        "type": "audio",
+        "audio": {"id": media_id},
+    }
+    reply_wamid = str(body.reply_to_wamid or "").strip() or None
+    return message, reply_wamid
 
 
 def _build_turn_text_message(body: SendRequest) -> tuple[dict[str, Any], str | None]:
@@ -349,18 +427,40 @@ async def send_message(
         HTTPException: On auth, validation, or Turn API errors.
     """
     _verify_internal_secret(x_internal_secret)
-    turn_body, reply_wamid = _build_turn_text_message(body)
+    kind = body.kind.strip().lower()
     url = f"{TURN_API_BASE_URL}/v1/messages"
     post_headers = _turn_auth_headers()
 
     async with httpx.AsyncClient(timeout=TURN_HTTP_TIMEOUT_S) as client:
-        response = await _post_turn_text_message(
-            client,
-            url=url,
-            headers=post_headers,
-            base_body=turn_body,
-            reply_wamid=reply_wamid,
-        )
+        if kind == "audio":
+            audio_b64 = str(body.audio_b64 or "").strip()
+            if not audio_b64:
+                raise HTTPException(status_code=400, detail="missing audio_b64 for audio kind")
+            try:
+                audio_bytes = base64.b64decode(audio_b64, validate=True)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail="invalid audio_b64") from exc
+            mime_type = str(body.audio_mime_type or "audio/ogg").strip() or "audio/ogg"
+            media_id = await _upload_turn_media(client, audio_bytes=audio_bytes, mime_type=mime_type)
+            turn_body, reply_wamid = _build_turn_audio_message(body, media_id)
+            response = await _post_turn_text_message(
+                client,
+                url=url,
+                headers=post_headers,
+                base_body=turn_body,
+                reply_wamid=reply_wamid,
+            )
+        elif kind == "text":
+            turn_body, reply_wamid = _build_turn_text_message(body)
+            response = await _post_turn_text_message(
+                client,
+                url=url,
+                headers=post_headers,
+                base_body=turn_body,
+                reply_wamid=reply_wamid,
+            )
+        else:
+            raise HTTPException(status_code=501, detail=f"unsupported kind: {body.kind!r}")
 
     if response.status_code >= 400:
         logger.error(

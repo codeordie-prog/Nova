@@ -331,6 +331,59 @@ def _send_whatsapp(case_id: str, text: str, reply_to_wamid: str | None = None) -
         raise RuntimeError(f"whatsapp send non-sent response: {response_payload}")
 
 
+def _send_whatsapp_audio(
+    case_id: str,
+    audio_b64: str,
+    *,
+    mime_type: str = "audio/ogg",
+    reply_to_wamid: str | None = None,
+) -> None:
+    """
+    Send a WhatsApp audio message (voice note) through the Turn sidecar.
+
+    Args:
+        case_id: Recipient phone (E.164 digits).
+        audio_b64: Base64-encoded audio bytes (Opus OGG from ElevenLabs).
+        mime_type: MIME type for Turn media upload.
+        reply_to_wamid: Optional inbound wamid for threading.
+    """
+    if not WHATSAPP_INTERNAL_API_SECRET:
+        raise RuntimeError("WHATSAPP_INTERNAL_API_SECRET (or INTERNAL_API_SECRET) is missing")
+
+    to = _normalize_whatsapp_recipient(case_id)
+    if not to:
+        raise ValueError("missing case_id for whatsapp audio outbound")
+
+    verify = _whatsapp_tls_verify()
+    base_url = WHATSAPP_API_BASE_URL.rstrip("/")
+    send_path = WHATSAPP_API_SEND_PATH if WHATSAPP_API_SEND_PATH.startswith("/") else f"/{WHATSAPP_API_SEND_PATH}"
+    url = f"{base_url}{send_path}"
+    payload: dict[str, Any] = {
+        "to": to,
+        "kind": "audio",
+        "audio_b64": audio_b64,
+        "audio_mime_type": mime_type,
+    }
+    reply_target = str(reply_to_wamid or "").strip()
+    if reply_target:
+        payload["reply_to_wamid"] = reply_target
+
+    response = post_with_outbound_retry(
+        url=url,
+        max_retries=OUTBOUND_SEND_MAX_RETRIES,
+        base_delay_s=OUTBOUND_SEND_RETRY_BASE_DELAY_S,
+        json=payload,
+        headers=_whatsapp_internal_headers(),
+        timeout=WHATSAPP_HTTP_TIMEOUT_S,
+        verify=verify,
+    )
+    response.raise_for_status()
+    response_payload = response.json() if response.content else {}
+    status_value = str(response_payload.get("status") or "").strip().lower()
+    if status_value != "sent":
+        raise RuntimeError(f"whatsapp audio send non-sent response: {response_payload}")
+
+
 def _to_int(value: Any) -> int | None:
     """
     Convert a value to an integer.
@@ -398,7 +451,25 @@ def _deliver(fields: dict[str, Any], reply_to_message_id: int | None = None) -> 
         return
 
     if channel == "whatsapp":
-        _send_whatsapp(recipient, text, reply_to_wamid=_whatsapp_reply_wamid(fields))
+        reply_wamid = _whatsapp_reply_wamid(fields)
+        _send_whatsapp(recipient, text, reply_to_wamid=reply_wamid)
+        voice_b64 = str(fields.get("voice_audio_b64") or "").strip()
+        if voice_b64:
+            voice_mime = str(fields.get("voice_mime_type") or "audio/ogg").strip() or "audio/ogg"
+            try:
+                _send_whatsapp_audio(
+                    recipient,
+                    voice_b64,
+                    mime_type=voice_mime,
+                    reply_to_wamid=reply_wamid,
+                )
+            except Exception:
+                logger.warning(
+                    "whatsapp voice mirror failed after text sent: client_id=%s kind=%s",
+                    recipient,
+                    _kind(fields),
+                    exc_info=True,
+                )
         return
     raise ValueError(f"unsupported channel: {channel}")
 

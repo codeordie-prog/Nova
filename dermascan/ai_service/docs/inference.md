@@ -882,3 +882,67 @@ Suggested table to populate via load test:
    called out.
 9. Future levers (FP8 KV, quantization, speculative decoding, swap) are
    listed without prescribing.
+
+---
+
+# 28. ElevenLabs voice inference (WhatsApp voice notes)
+
+This section documents **batch** speech inference used by the orchestrator on
+Turn.io WhatsApp. It is separate from MedGemma/vLLM in §1–§27: no GPU, no
+`ai_service` worker queue for vision—only HTTP calls to ElevenLabs from the
+orchestrator and outbound path.
+
+## 28.1 Scope (v1)
+
+| Direction | Behaviour |
+|-----------|-----------|
+| Inbound | User sends a **voice note** (`type: voice`) → download via Turn `GET /v1/media/{id}` → **Scribe v2** STT → transcript merged into job text. |
+| Outbound | **Only when** the inbound turn was a voice note: full **text** reply plus a **mirrored voice note** (TTS). Proactive signal messages stay **text-only**. |
+| Storage | Outbound audio is **not** stored in Firebase: TTS bytes → Turn `POST /v1/media` → send → discard local bytes. Conversation truth remains **text** in checkpoints and logs. |
+
+Implementation modules:
+
+- `dermascan/ai_service/speech/elevenlabs_inference.py` — STT/TTS clients
+- `dermascan/ai_service/speech/text_for_speech.py` — strip URLs/markdown before TTS
+- `dermascan/backend/services/agents/voice/job_voice.py` — orchestrator hooks
+- `dermascan/shared/voice_ingress.py` — ingress payload helpers
+
+## 28.2 Environment
+
+| Variable | Purpose |
+|----------|---------|
+| `VOICE_ENABLED` | `true` to enable STT/TTS on WhatsApp job flow |
+| `ELEVENLABS_API_KEY` | Secret key (`sk_...`) with **Speech to Text** and **Text to Speech** permissions |
+| `ELEVENLABS_VOICE_ID` | TTS voice (default Laura) |
+| `ELEVENLABS_STT_MODEL` | Default `scribe_v2` |
+| `ELEVENLABS_TTS_MODEL` | Default `eleven_v4_turbo` (English + Swahili) |
+| `ELEVENLABS_TTS_OUTPUT_FORMAT` | Default `opus_48000_32` (WhatsApp-compatible Opus OGG) |
+| `ELEVENLABS_TTS_LANGUAGE_CODE` | Optional ISO 639-1 override |
+| `VOICE_STT_CACHE_TTL_SEC` | Redis cache TTL for STT by Turn media id |
+| `VOICE_OUTBOUND_MAX_BYTES` | Cap TTS payload size before skipping voice mirror |
+| `VOICE_TTS_MAX_CHARS` | Max speakable characters after `prepare_text_for_speech` |
+| `ELEVENLABS_API_MAX_RETRIES` | Retries after first attempt on 429/5xx (default 3) |
+| `ELEVENLABS_API_RETRY_BASE_DELAY_S` | Exponential backoff base delay (default 0.5s); honors `Retry-After` on 429 |
+
+Turn credentials (`TURN_API_TOKEN`, sidecar secrets) are unchanged; outbound
+audio is uploaded by `turn/scripts/turn_sidecar_adapter.py` (`kind: audio`).
+
+## 28.3 Flow
+
+```text
+Turn webhook (voice) → Nova normalize → orchestrator job
+  → fetch Turn media → ElevenLabs STT → agent (text)
+  → reply text → ElevenLabs TTS → outbound stream (text + voice_audio_b64)
+  → sidecar: text message, then upload media + audio message
+```
+
+STT results are cached under Redis key `voice:stt:{media_id}` so duplicate
+webhook delivery does not double-bill Scribe.
+
+## 28.4 What we do not use
+
+- **ElevenAgents / Speech Engine** — realtime WebSocket; not used for async
+  WhatsApp voice notes.
+- **Firebase** for outbound voice blobs in v1.
+
+Local smoke test: `poetry run python dermascan/backend/services/agents/voice/elevenlabs_api.py`
