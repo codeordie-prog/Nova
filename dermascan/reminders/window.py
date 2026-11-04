@@ -1,9 +1,11 @@
-"""Author: Dermascan Team
+"""
+Author: Dermascan Team
 Date: 11-1-2026
 Licence: MIT
 Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
-WhatsApp customer service window policy (24h after last user inbound)."""
+WhatsApp customer service window policy (24h after last user inbound).
+"""
 
 from __future__ import annotations
 

@@ -39,26 +39,25 @@ All safety reports for the ingredients are hosted in a unified medical literatur
 - Handle null values in metadata (e.g., convert `page=None` to `-1`)
 
 **7. Retrieval Policy**
+
 - Query the vector store with user questions using cosine similarity
 - Filter results by ingredient IDs to limit search scope
 - Apply score threshold to filter low-relevance matches
 - Over-fetch candidates (multiplier × top_k) and re-rank to prioritize substantive content over references
 
-**Mathematical Retrieval Formula**
+#### Mathematical retrieval formula
 
-The retrieval uses cosine similarity with a score threshold:
+Retrieval keeps only chunks whose **cosine similarity** to the query is at or above the score threshold **τ**:
 
-$$
-\text{similarity} = \frac{\vec{Q} \cdot \vec{C}}{\|\vec{Q}\| \times \|\vec{C}\|} \geq \tau
-$$
+> **sim(Q, C) = (Q · C) / (‖Q‖ · ‖C‖) ≥ τ**
 
-Where:
-- $\vec{Q}$ = Query vector (embedded user question)
-- $\vec{C}$ = Target chunk vector (embedded safety report chunk)
-- $\cdot$ = Dot product
-- $\|\vec{Q}\|$ = Magnitude of query vector
-- $\|\vec{C}\|$ = Magnitude of chunk vector
-- $\tau$ = Relevance score threshold (e.g., 0.1)
+| Symbol | Meaning |
+| --- | --- |
+| **Q** | Query vector (embedded user question), 1536 dimensions |
+| **C** | Chunk vector (embedded safety-report chunk) |
+| **Q · C** | Dot product of the two vectors |
+| **‖Q‖**, **‖C‖** | L2 norms (vector magnitudes) |
+| **τ** | Minimum relevance score (e.g. 0.1) |
 
 **8. Internet Supplementation**
 - Retrieved information is supplemented with real-time web search for any additional context required

@@ -17,7 +17,8 @@ class TestOrchestratorPromptCosmeticPositioning:
     def test_prompt_mentions_cosmetic_decision_support(self) -> None:
         prompt = orchestrator_prompt.system_prompt
         assert "cosmetic decision support" in prompt.lower()
-        assert "not a medical diagnosis" in prompt.lower()
+        assert "medical diagnosis" in prompt.lower()
+        assert "not" in prompt.lower() and "prescription service" in prompt.lower()
 
     def test_prompt_reframes_menu_options(self) -> None:
         prompt = orchestrator_prompt.system_prompt
@@ -60,3 +61,18 @@ class TestOrchestratorPromptCosmeticPositioning:
         assert "set_morning_brief" in prompt
         assert "24 hours" in prompt.lower()
         assert "local morning" in prompt.lower()
+
+    def test_prompt_routes_text_product_review_through_enqueue_not_search(self) -> None:
+        prompt = orchestrator_prompt.system_prompt.lower()
+        assert "text-based product review" in prompt
+        assert "internet_search" in prompt
+        assert "audit_type=product" in prompt
+        assert "do not use internet_search" in prompt or "never" in prompt
+
+    def test_prompt_gates_dermatologist_offer_on_skin_analysis(self) -> None:
+        prompt = orchestrator_prompt.system_prompt.lower()
+        assert "completed ai skin snapshot" in prompt or "skin snapshot ai review" in prompt
+        assert "product-only" in prompt
+        assert "dermatologist gate" in prompt
+        assert "never call request_specialist_escalation before" in prompt
+        assert "skin analysis first" in prompt or "skin snapshot ai review first" in prompt

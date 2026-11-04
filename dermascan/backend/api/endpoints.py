@@ -61,11 +61,13 @@ from dermascan.shared.escalation_image import (
 )
 from dermascan.shared.firebase_storage import upload_client_image, download_client_image_bytes_by_path
 from dermascan.shared.turn_journey_routing import whatsapp_ingress_should_queue_orchestrator
+from dermascan.shared.turn_messages import send_turn_whatsapp_text_sync
 from dermascan.shared.turn_webhook_auth import verify_whatsapp_ingress_auth
 from dermascan.shared.whatsapp_ingress_dedupe import (
     claim_whatsapp_ingress_message,
     whatsapp_ingress_seen_key,
 )
+from dermascan.shared.whatsapp_ingress_media_policy import rejection_message_for_whatsapp_message
 from dermascan.shared.whatsapp_turn_media import (
     fetch_turn_media_bytes,
     is_whatsapp_protected_media_url,
@@ -1000,6 +1002,7 @@ async def whatsapp_webhook(
 
     normalized_messages: list[OrchestratorIngressRequest] = []
     turn_delegated_count: int = 0
+    media_rejected_count: int = 0
     for message in messages:
         wa_id_raw = str(message.get("from") or "").strip()
         wamid_raw = str(message.get("id") or "").strip()
@@ -1018,12 +1021,43 @@ async def whatsapp_webhook(
             turn_delegated_count += 1
             continue
 
+        rejection_text = rejection_message_for_whatsapp_message(message)
+        if rejection_text is not None and wa_id_raw:
+            if wamid_raw and not claim_whatsapp_ingress_message(
+                redis_client=_redis,
+                message_id=wamid_raw,
+                request_id="rejected:media",
+            ):
+                media_rejected_count += 1
+                continue
+            try:
+                await asyncio.to_thread(
+                    send_turn_whatsapp_text_sync,
+                    wa_id=wa_id_raw,
+                    text=rejection_text,
+                    reply_to_wamid=wamid_raw or None,
+                )
+            except RuntimeError as exc:
+                logger.warning(
+                    "whatsapp media rejection not sent (Turn unavailable): wa_id=%s detail=%s",
+                    wa_id_raw,
+                    exc,
+                )
+            except Exception:
+                logger.exception(
+                    "whatsapp media rejection Turn send failed: wa_id=%s wamid=%s",
+                    wa_id_raw,
+                    wamid_raw,
+                )
+            media_rejected_count += 1
+            continue
+
         try:
             normalized_messages.append(_normalize_message(message))
         except HTTPException as exc:
             logger.warning("Skipping invalid whatsapp message: detail=%s", exc.detail)
 
-    if turn_delegated_count and not normalized_messages:
+    if turn_delegated_count and not normalized_messages and not media_rejected_count:
         return {
             "status": "delegated_turn",
             "turn_delegated_count": turn_delegated_count,
@@ -1032,6 +1066,13 @@ async def whatsapp_webhook(
         }
 
     if not normalized_messages:
+        if media_rejected_count:
+            return {
+                "status": "rejected_media",
+                "media_rejected_count": media_rejected_count,
+                "queued_count": 0,
+                "request_ids": [],
+            }
         return {"status": "ignored", "queued_count": 0, "request_ids": []}
 
     await _enforce_ingress_capacity(cost=len(normalized_messages))

@@ -636,28 +636,6 @@ class RulesEngine(Engine):
             )
         return serialized
 
-    def evaluate_safety(self, ingredient_ids: list[str]) -> list[dict[str, Any]]:
-        """
-        Evaluate safety of the ingredients by Querying the Toxicological reports.
-
-        Its important to consider the Query text, since a good query text will help to get more relevant results.
-        Read the Search Policy in `search.md` file to understand how the Algorithm works.
-        Args:
-            ingredient_ids: List of ingredient IDs to evaluate
-            
-        Returns:
-            List of dictionaries containing safety evaluation results
-        """
-        if not ingredient_ids:
-            return []
-
-        matches = self.vector_store.query_safety_report(
-            query_text="safety assessment toxicology irritation sensitization mutagenicity carcinogenicity reproductive toxicity dermal exposure concentration of use NOAEL adverse effects CIR conclusion.",
-            ingredient_ids=ingredient_ids,
-            top_k=12,
-            score_threshold=0.4,
-        )
-        return self._serialize_matches(matches)
 
     @staticmethod
     def _extract_primary_concern(diagnosis: str) -> str:
@@ -911,6 +889,30 @@ class RulesEngine(Engine):
             derive_skin_needs=self._derive_skin_needs,
             score_skin_audit_completeness=self._score_skin_audit_completeness,
         )
+
+    def evaluate_safety(self, ingredient_ids: list[str]) -> list[dict[str, Any]]:
+        """
+        Evaluate safety of the ingredients by Querying the Toxicological reports.
+
+        Its important to consider the Query text, since a good query text will help to get more relevant results.
+        Read the Search Policy in `search.md` file to understand how the Algorithm works.
+        Args:
+            ingredient_ids: List of ingredient IDs to evaluate
+            
+        Returns:
+            List of dictionaries containing safety evaluation results
+        """
+        if not ingredient_ids:
+            return []
+
+        matches = self.vector_store.query_safety_report(
+            query_text="safety assessment toxicology irritation sensitization mutagenicity carcinogenicity reproductive toxicity dermal exposure concentration of use NOAEL adverse effects CIR conclusion.",
+            ingredient_ids=ingredient_ids,
+            top_k=12,
+            score_threshold=0.4,
+        )
+        return self._serialize_matches(matches)
+
 
     def evaluate_contraindications(self, ingredient_ids: list[str]) -> list[dict[str, Any]]:
         """
