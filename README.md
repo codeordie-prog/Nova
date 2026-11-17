@@ -226,7 +226,7 @@ Routine habits and a daily **morning brief** are stored in Postgres (`dermascan/
 |---|---|
 | Channels | WhatsApp only in v1; schema and `channel` columns are ready for Telegram later |
 | Delivery window | Outbound text only while the user is inside the **24h WhatsApp customer-care window** (updated on each inbound message) |
-| Journey handoff | Reminders **pause** when the user leaves Nova for an external WhatsApp journey; **resume** when Nova ingress receives the next inbound user message |
+| Dispatch pause | Proactive reminders stay paused until the user sends another inbound WhatsApp message to Nova (see `ingress_hooks.py`) |
 | Timezone | Default `Africa/Nairobi` (`REMINDERS_DEFAULT_TIMEZONE`) |
 | Morning brief catch-up | If a brief was missed, delivery is retried only during the **local morning band** (default 06:00–12:00, env-configurable) until grace expires |
 
@@ -236,7 +236,7 @@ Routine habits and a daily **morning brief** are stored in Postgres (`dermascan/
 2. Set `REMINDERS_ENABLED=true` and the same `POSTGRES_*` as billing.
 3. Restart `do_work.py` — a `reminders` thread runs beside orchestrator and outbound workers.
 
-Ingress touches (`record_channel_inbound`, pause/resume hooks) live in `dermascan/reminders/ingress_hooks.py` and are wired from WhatsApp webhooks and orchestrator handoff paths. Worker detail, env vars, and tick intervals: **`dermascan/backend/README.md`** (Reminders setup).
+Ingress touches (`record_channel_inbound`, pause/resume hooks) live in `dermascan/reminders/ingress_hooks.py` and are wired from WhatsApp webhooks and orchestrator routing-exit hooks. Worker detail, env vars, and tick intervals: **`dermascan/backend/README.md`** (Reminders setup).
 
 ### Suggested local run order
 

@@ -100,7 +100,7 @@ poetry run python dermascan/backend/services/agents/knowledge_worker.py
 
 **Outbound sender** — compacts and delivers messages to Telegram or WhatsApp with ordered, deduplicated delivery.
 
-**Reminders** — polls Postgres for due morning briefs and routine habits (WhatsApp v1). Respects the 24h customer window, MYDAWA pause, and local morning catch-up for pending briefs. Orchestrator tools: `set_morning_brief`, `set_routine_reminder`, `list_routines`, `disable_routine`.
+**Reminders** — polls Postgres for due morning briefs and routine habits (WhatsApp v1). Respects the 24h customer window, dispatch pause while the user is away from Nova, and local morning catch-up for pending briefs. Orchestrator tools: `set_morning_brief`, `set_routine_reminder`, `list_routines`, `disable_routine`.
 
 ### Reminders setup
 
