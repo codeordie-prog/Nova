@@ -1,7 +1,7 @@
 """
 Author: Dermascan Team
 Date: 2026-08-16
-Licence: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Description: This module contains implementation of the credit deduction contract that will be applied across the following credits deduction entry points:

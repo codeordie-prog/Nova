@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-03-12
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Single application logger for tracing across backend, ai-service, and scripts.
 

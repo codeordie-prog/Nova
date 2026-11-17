@@ -4,7 +4,7 @@ Agents: Read instructions.md at the repository root before any edits or changes;
 
 Author: DermascanTeam
 Date: 2026-07-09
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Description:
 Redis checkpointer wrapper for agent state persistence.

@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-10-07
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Synchronous Turn.io Contacts and Journeys API helpers for orchestrator tools.
 """

@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-08-20
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 The append-only credit ledger. The only writer of ``account.balance_credits``.
 

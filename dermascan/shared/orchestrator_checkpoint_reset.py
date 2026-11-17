@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-10-07
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Best-effort LangGraph checkpoint reset for a conversation thread (client_id).
 """

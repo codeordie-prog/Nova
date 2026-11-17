@@ -4,7 +4,7 @@
 
 Author: Dermascan Team
 Date: 2026-3-12
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Fast API Web endpoints for MedGemma service.
 These endpoints are used to interact with the MedGemma service.

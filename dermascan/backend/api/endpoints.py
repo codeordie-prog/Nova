@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-09-24
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Backend API endpoint drafts for orchestrator request intake.
 
@@ -646,6 +646,31 @@ def _normalize_message(message: dict[str, Any]) -> OrchestratorIngressRequest:
                 source=AttachmentSource(kind="whatsapp_media_id", value=media_id),
             )
         )
+
+    elif msg_type == "interactive":
+        interactive_obj: dict[str, Any] = message.get("interactive") or {}
+        interactive_kind = str(interactive_obj.get("type") or "").strip().lower()
+        if interactive_kind == "button_reply":
+            reply_obj = interactive_obj.get("button_reply") or {}
+            label = str(reply_obj.get("title") or reply_obj.get("id") or "").strip()
+            if label:
+                text_parts.append(label)
+        elif interactive_kind == "list_reply":
+            reply_obj = interactive_obj.get("list_reply") or {}
+            label = str(reply_obj.get("title") or reply_obj.get("id") or "").strip()
+            if label:
+                text_parts.append(label)
+        elif interactive_kind == "nfm_reply":
+            reply_obj = interactive_obj.get("nfm_reply") or {}
+            label = str(reply_obj.get("body") or reply_obj.get("response_json") or "").strip()
+            if label:
+                text_parts.append(label)
+
+    elif msg_type == "button":
+        button_obj: dict[str, Any] = message.get("button") or {}
+        label = str(button_obj.get("text") or button_obj.get("payload") or "").strip()
+        if label:
+            text_parts.append(label)
 
     content = MessageContent(text="\n".join([part for part in text_parts if part]).strip() or None, attachments=attachments)
     if not content.text and not content.attachments:

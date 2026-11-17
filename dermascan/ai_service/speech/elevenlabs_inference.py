@@ -1,7 +1,7 @@
 """
 Author: Dermascan Team
 Date: 2026-10-31
-Licence: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 ElevenLabs batch STT (Scribe v2) and TTS for orchestrator voice-note mirroring.

@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-06-20
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 Description:
 This module centralizes resilient Redis client construction and retry helpers.
 It is intended to be imported by all services that communicate with Redis so

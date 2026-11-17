@@ -1,7 +1,7 @@
 """
 Author: Dermascan Team
 Date: 2026-05-21
-Licence: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Description: Knowledge agent implementation

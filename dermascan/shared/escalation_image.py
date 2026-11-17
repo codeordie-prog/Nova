@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-07-16
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 Description:
 Resolve durable Firebase blob paths for escalation dashboard image serving.
 

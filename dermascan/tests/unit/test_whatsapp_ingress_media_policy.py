@@ -47,6 +47,20 @@ def test_rejects_image_sent_as_document_type() -> None:
     assert "Photo" in msg or "photo" in msg
 
 
+def test_accepts_interactive_journey_handoff() -> None:
+    """Menu button taps from Turn Journey must not trigger media rejection."""
+    payload = {
+        "type": "interactive",
+        "from": "254700000000",
+        "id": "wamid.interactive",
+        "interactive": {
+            "type": "button_reply",
+            "button_reply": {"id": "skin_snapshot", "title": "Skin snapshot"},
+        },
+    }
+    assert rejection_message_for_whatsapp_message(payload) is None
+
+
 def test_rejects_non_image_attachments_array() -> None:
     """Legacy attachments[] with document type is rejected."""
     msg = rejection_message_for_whatsapp_message(

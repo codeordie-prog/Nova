@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-10-17
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Product and skin report prompt helpers: template structure, brand priority, name resolution.
 """

@@ -3,7 +3,7 @@
 
 Author: DermaScan Team
 Date: 2026-06-10
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 Description:
     Retry and backoff helpers for outbound HTTP delivery.
 

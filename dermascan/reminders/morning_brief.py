@@ -1,6 +1,6 @@
 """Author: Dermascan Team
 Date: 11-1-2026
-Licence: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Morning briefing copy (v1 template; replace with weather/UV enrichment later)."""

@@ -3,7 +3,7 @@
  
 Author: Dermascan Team
 Date: 2026-12-03
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Modal app for MedGemma inference.
 

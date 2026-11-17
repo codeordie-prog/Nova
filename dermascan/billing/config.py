@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-08-21
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Billing configuration and enums locked in Phase 0.
 

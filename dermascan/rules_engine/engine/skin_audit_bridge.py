@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-08-07
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Build SkinAudit bridge objects from legacy and cosmetic MedGemma fields.
 """

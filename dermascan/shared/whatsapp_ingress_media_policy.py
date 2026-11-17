@@ -1,7 +1,7 @@
 """
 Author: Dermascan Team
 Date: 11-4-2026
-Licence: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 WhatsApp ingress media policy: allow photos and voice; reject documents and video."""
@@ -10,7 +10,10 @@ from __future__ import annotations
 
 from typing import Any, Final
 
-_ACCEPTED_TYPES: Final[frozenset[str]] = frozenset({"text", "image", "audio", "voice"})
+# ``interactive`` / ``button``: Turn Journey menu taps and MYDAWA handoff to Nova.
+_ACCEPTED_TYPES: Final[frozenset[str]] = frozenset(
+    {"text", "image", "audio", "voice", "interactive", "button"}
+)
 
 _MSG_VIDEO: Final[str] = (
     "Videos aren't supported for skin or product review. "

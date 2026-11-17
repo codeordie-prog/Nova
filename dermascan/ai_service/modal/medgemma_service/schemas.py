@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2025-10-16
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Schemas for web endpoints, with Pydantic models for request and response validation.
 """

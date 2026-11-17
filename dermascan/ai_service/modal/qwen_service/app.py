@@ -6,7 +6,7 @@ Author: DermaScan Team
 
 Date: 2026-06-04
 
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 
 

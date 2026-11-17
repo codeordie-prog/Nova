@@ -3,7 +3,7 @@
 
 Author: Dermascan team
 Date: 2026-03-12
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 A decorator that times the execution of a function.
 The function is reusable across different functions.

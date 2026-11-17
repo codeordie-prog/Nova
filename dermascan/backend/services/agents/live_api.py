@@ -6,7 +6,7 @@ Author: Dermascan Team
 
 Date: 2026-08-30
 
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Terminal smoke test for Gemini Live API (Vertex or Developer API).
 

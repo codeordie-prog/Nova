@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-09-24
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Consume ``rules:index:jobs``, run CIR PDF lazy indexing off the orchestrator hot path,
 and emit ``product_review_index_ready`` when a request batch completes.

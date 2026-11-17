@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-08-20
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 Description:
 Billing worker: consume billing:jobs, fulfil verified payments, and run the
 periodic sweeps that stop money going quietly missing.

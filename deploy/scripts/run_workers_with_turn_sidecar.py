@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-09-30
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Cloud Run workers entrypoint: health on ``PORT``, optional Turn sidecar on :8000, then ``do_work.py``.
 

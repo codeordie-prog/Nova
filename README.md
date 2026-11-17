@@ -332,3 +332,15 @@ See `dermascan/ai_service/modal/medgemma_service/README.md` for gateway config.
 - `dermascan/Agents.md` — full agent map, signal flows, safety pipeline
 - `dermascan/backend/README.md` — API, webhooks, worker details
 - `dermascan/ai_service/docs/inference.md` — inference pipeline overview
+
+## License
+
+This project is licensed under the **PolyForm Noncommercial License 1.0.0**.
+
+You are free to use, study, modify, and distribute this software for permitted non-commercial purposes, subject to the terms of the licence.
+
+Commercial use, including commercial deployment, integration into commercial products, and commercial distribution, requires a separate written licence from the copyright holder.
+
+For commercial licensing enquiries, contact: [kelvinndeti3142@gmail.com](mailto:kelvinndeti3142@gmail.com).
+
+See [LICENSE](./LICENSE) for the complete licence terms.

@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-09-24
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Fetch inbound WhatsApp media from Turn.io for Nova ingress.
 

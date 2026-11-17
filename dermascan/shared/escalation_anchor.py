@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-10-20
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Redis-backed anchors linking client media and completed AI reviews to dermatologist escalation.
 

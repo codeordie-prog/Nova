@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-06-06
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 Description: Global rate limiter for Dermascan
 This module implements a global rate limiter for the Dermascan service.
 It uses Redis to track the number of requests per user and limits the number of requests per minute.

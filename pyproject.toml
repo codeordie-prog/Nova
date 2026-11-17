@@ -3,7 +3,7 @@ name = "dermascan"
 version = "0.1.0"
 description = "AI agents network for medical diagnosis"
 authors = ["Kelvin Ndeti <kelvinndeti3142@gmail.com>"]
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 readme = "README.md"
 packages = [{ include = "dermascan" }]
 

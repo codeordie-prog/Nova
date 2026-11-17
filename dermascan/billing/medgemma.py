@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-08-21
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 MedGemma flat-SKU billing (hold at enqueue, meter + settle on worker completion).
 

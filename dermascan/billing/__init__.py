@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-08-25
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Billing: credit accounts, the append-only ledger, metering, and Paystack top-ups.
 

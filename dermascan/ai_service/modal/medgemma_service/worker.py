@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-3-12
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 MedGemma service worker.
 This worker processes jobs from a Redis stream.

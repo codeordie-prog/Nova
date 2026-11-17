@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-10-16
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Layer-0 model chain routing: primary (Gemini-first) vs alternate (OpenAI-first).
 

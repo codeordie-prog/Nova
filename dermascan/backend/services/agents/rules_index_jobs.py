@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-09-24
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Enqueue and coordinate async CIR ingredient indexing jobs on Redis streams.
 

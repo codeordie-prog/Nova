@@ -1,6 +1,6 @@
 """Author: Dermascan Team
 Date: 11-1-2026
-Licence: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Reminder worker: poll Postgres for due reminders and dispatch routine outbound or morning signals."""

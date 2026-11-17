@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-06-17
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Description: Resolve filesystem paths from environment variables for local and deployed runs.
 

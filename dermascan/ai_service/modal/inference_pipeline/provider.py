@@ -1,7 +1,7 @@
 """
 Author: Dermascan AI team
 Date: 2026-03-03
-Licence: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 

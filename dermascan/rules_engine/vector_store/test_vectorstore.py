@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-05-21
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Description: Smoke test utilities for vector store integration tests.
 

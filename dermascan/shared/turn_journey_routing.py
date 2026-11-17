@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-10-07
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 
 Turn.io contact routing helpers for WhatsApp ingress (Main Menu vs Dermascan).
 """

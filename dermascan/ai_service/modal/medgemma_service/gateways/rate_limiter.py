@@ -3,7 +3,7 @@
 
 Author: Dermascan Team
 Date: 2026-3-12
-License: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 Description: Rate limiter for MedGemma service, with concurrency control and timeout handling.
 
 Semaphore (Concurrency): Limits the number of concurrent requests to prevent resource exhaustion.

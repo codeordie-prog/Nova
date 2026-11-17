@@ -1,7 +1,7 @@
 """
 Author: Dermascan Team
 Date: 14-6-2026
-Licence: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Typed interface contracts for the Rules Engine."""

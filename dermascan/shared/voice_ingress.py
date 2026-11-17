@@ -1,7 +1,7 @@
 """
 Author: Dermascan Team
 Date: 2026-10-31
-Licence: MIT
+Licence: PolyForm Noncommercial License 1.0.0
 Agents: Read instructions.md at the repository root before any edits or changes; follow it strictly.
 
 Ingress payload helpers for WhatsApp voice notes (Turn ``type: voice``).
