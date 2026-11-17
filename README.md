@@ -208,6 +208,16 @@ This script runs:
 
 **Not included:** `knowledge_worker` (optional, start manually) and **MedGemma** (separate AI-service stack below).
 
+### WhatsApp vs Telegram (v1)
+
+| Capability | WhatsApp | Telegram |
+|---|---|---|
+| Orchestration & text outbound | Yes | Yes |
+| Routine reminders & morning brief | Yes | Not yet — integration planned |
+| Voice (ElevenLabs: voice notes in, TTS outbound) | Yes | Not yet — integration planned |
+
+Telegram today supports the core chat path (text, images). **Reminders** and **voice** are implemented on **WhatsApp only**; Telegram support for both is on the roadmap.
+
 ### WhatsApp reminders (v1)
 
 Routine habits and a daily **morning brief** are stored in Postgres (`dermascan/migrations/005_reminders.sql`, schema `reminders`). The orchestrator exposes tools: `set_morning_brief`, `set_routine_reminder`, `list_routines`, `disable_routine` (see `routine_tools.py` and the reminders section in `orchestrator_prompt.py`).
@@ -216,7 +226,7 @@ Routine habits and a daily **morning brief** are stored in Postgres (`dermascan/
 |---|---|
 | Channels | WhatsApp only in v1; schema and `channel` columns are ready for Telegram later |
 | Delivery window | Outbound text only while the user is inside the **24h WhatsApp customer-care window** (updated on each inbound message) |
-| MYDAWA handoff | Reminders **pause** when the user is handed to the platform; **resume** when Nova ingress receives the next user message |
+| Journey handoff | Reminders **pause** when the user leaves Nova for an external WhatsApp journey; **resume** when Nova ingress receives the next inbound user message |
 | Timezone | Default `Africa/Nairobi` (`REMINDERS_DEFAULT_TIMEZONE`) |
 | Morning brief catch-up | If a brief was missed, delivery is retried only during the **local morning band** (default 06:00–12:00, env-configurable) until grace expires |
 
@@ -273,7 +283,7 @@ Optional tuning: `TELEGRAM_HTTP_TIMEOUT_S`, `TELEGRAM_TLS_VERIFY`, `TELEGRAM_CA_
 
 - Do not run BotFather `setWebhook` at the same time as the polling bridge — the bridge clears webhook mode on startup so `getUpdates` works.
 - Photos: the API downloads the largest `photo[]` size via `getFile` and stores attachments for orchestrator / MedGemma paths (same as documented in `dermascan/backend/README.md`).
-- **Reminders (v1):** routine reminders and morning brief are **WhatsApp-only**; Telegram chat works for orchestration and outbound text but not reminder tools delivery.
+- **Reminders & voice:** see **§4 — WhatsApp vs Telegram (v1)**; Telegram does not deliver reminders or ElevenLabs voice yet.
 - **Cloud staging** (when Cloud Run is deployed): a `dermascan-telegram-bridge-staging` service polls and forwards to the API URL; see `deploy/README.md`. No polling bridge needed on your laptop in that setup.
 
 **Quick ingress check (without the bridge)**
