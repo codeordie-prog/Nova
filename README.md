@@ -1,5 +1,7 @@
 # Dermascan Agents
 
+![Sample Telegram conversation with Qutis](dermascan/docs/tg.png)
+
 AI agent network for dermatology: conversational orchestration, image diagnosis, product safety review, and multi-channel delivery (Telegram / WhatsApp).
 
 ## Architecture at a Glance
@@ -233,7 +235,56 @@ Ingress touches (`record_channel_inbound`, pause/resume hooks) live in `dermasca
 3. MedGemma gateway + worker (if image / skin review flows are needed)
 4. Backend API (`8088`)
 5. `poetry run python dermascan/scripts/do_work.py`
-6. (Optional) `telegram_polling_bridge.py` for local Telegram testing
+6. (Optional) Telegram — see **§4.1 Run Telegram (local)** below
+
+### 4.1 Run Telegram (local)
+
+Telegram is **not** wired through Turn. For development you use **long polling** into the same ingress path production uses via webhook: `POST /v1/webhooks/telegram`. Replies go out through `outbound_sender_worker` in `do_work.py` via the Bot API `sendMessage`.
+
+**Configure `.env`**
+
+| Variable | Purpose |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Bot token from [@BotFather](https://t.me/BotFather) |
+| `TELEGRAM_LOCAL_WEBHOOK_URL` | Defaults to `http://127.0.0.1:8088/v1/webhooks/telegram` |
+| `TELEGRAM_TEST_BOT_TOKEN` | Optional; when `TEST_MODE=true`, `load_env` can point outbound at a separate test bot |
+
+Optional tuning: `TELEGRAM_HTTP_TIMEOUT_S`, `TELEGRAM_TLS_VERIFY`, `TELEGRAM_CA_BUNDLE`, `TELEGRAM_POLL_TIMEOUT_S`, `TELEGRAM_POLL_LIMIT`, `TELEGRAM_RETRY_DELAY_S`, `TELEGRAM_MEDIA_GROUP_WINDOW_S` (see `.env_example`).
+
+**Run (typical dev)**
+
+1. Redis up (`local_stack.sh` or `REDIS_URL` to Redis Cloud).
+2. Start the API (§3).
+3. Start workers — **orchestrator + outbound sender** are required for replies:
+
+   ```bash
+   poetry run python dermascan/scripts/do_work.py
+   ```
+
+4. In another terminal, start the **polling bridge** (calls `deleteWebhook`, then `getUpdates` → forwards each update to the local webhook):
+
+   ```bash
+   poetry run python dermascan/backend/services/agents/telegram_polling_bridge.py
+   ```
+
+5. Message your bot in Telegram (text or photo). Jobs land on `orchestrator:jobs`; replies are published to `outbound:messages` and sent back to the chat.
+
+**Notes**
+
+- Do not run BotFather `setWebhook` at the same time as the polling bridge — the bridge clears webhook mode on startup so `getUpdates` works.
+- Photos: the API downloads the largest `photo[]` size via `getFile` and stores attachments for orchestrator / MedGemma paths (same as documented in `dermascan/backend/README.md`).
+- **Reminders (v1):** routine reminders and morning brief are **WhatsApp-only**; Telegram chat works for orchestration and outbound text but not reminder tools delivery.
+- **Cloud staging** (when Cloud Run is deployed): a `dermascan-telegram-bridge-staging` service polls and forwards to the API URL; see `deploy/README.md`. No polling bridge needed on your laptop in that setup.
+
+**Quick ingress check (without the bridge)**
+
+```bash
+curl -X POST http://127.0.0.1:8088/v1/webhooks/telegram \
+  -H "Content-Type: application/json" \
+  -d "{\"message\":{\"message_id\":1,\"from\":{\"id\":10001,\"username\":\"test_user\"},\"chat\":{\"id\":10001,\"type\":\"private\"},\"date\":1713000000,\"text\":\"Hello\"}}"
+```
+
+Expect `{"status":"queued",...}` when Redis is configured.
 
 ## 5. MedGemma (vision diagnosis — separate)
 

@@ -73,6 +73,8 @@ dermascan/docs/azure-*.md
 # Turn.io integration notes and PDF exports (Python under turn/scripts/ stays tracked)
 turn/**/*.md
 turn/**/*.pdf
+# MYDAWA journey exports and local Turn workspace — not for public repo
+turn/mydawaai/
 
 # Local CIR / rules PDF caches (downloaded copies, not source of truth)
 **/downloads/*.pdf
