@@ -2,13 +2,76 @@
 
 AI agent network for dermatology: conversational orchestration, image diagnosis, product safety review, and multi-channel delivery (Telegram / WhatsApp).
 
-### Qutis product demo
+### Try Qutis on Telegram
 
-<video controls width="100%" preload="metadata" poster="dermascan/docs/tg.png">
-  <source src="dermascan/docs/qutisdemo2.mp4" type="video/mp4" />
-</video>
+Chat with the hosted bot (no local setup): **[@Qutisbot](https://t.me/Qutisbot)**
 
 ![Sample Telegram conversation with Qutis](dermascan/docs/tg.png)
+
+**We recommend Telegram for testing and first onboarding.** You can try the product in one click ([@Qutisbot](https://t.me/Qutisbot)), run your own bot locally with BotFather + the polling bridge (see below), and exercise text and image flows without a WhatsApp Business or [Turn.io](https://turn.io/) setup.
+
+**WhatsApp** is integrated through **Turn.io’s architecture**: Turn is the transport and onboarding layer (Journeys, menus, handoff), while this repo’s backend owns the full multi-turn conversation after handoff. That path needs `TURN_API_TOKEN`, webhook registration, and Journey configuration — details in [`turn/relay_integration.md`](turn/relay_integration.md) and [`turnio.md`](turnio.md). Use WhatsApp when you are wiring staging or production; use **Telegram** to learn the stack and validate agents first.
+
+### Run locally after cloning
+
+A full local run needs **Redis**, **PostgreSQL**, and your own **API credentials** (OpenAI, Google Gemini / Vertex, and optionally Modal for MedGemma). The rules engine and product-safety flows query Postgres for ingredient safety data (`cir_pdfs` and related migrations). **A curated Postgres dataset for developers will be published soon**; until then you can still run the stack with an empty local database (chat, orchestration, and image paths work; rich product-ingredient review needs that data).
+
+**Step-by-step (use your credentials, not production secrets):**
+
+1. **Clone and install**
+   ```bash
+   git clone https://github.com/codeordie-prog/Nova.git
+   cd Nova
+   poetry install
+   ```
+
+2. **Create `.env` from the template**
+   ```bash
+   cp .env_example .env
+   ```
+   Edit `.env` and set at least:
+
+   | You need | Variables (see `.env_example`) |
+   |----------|--------------------------------|
+   | OpenAI | `OPENAI_API_KEY_QUTIS` |
+   | Gemini (API key *or* Vertex) | `GEMINI_API_KEY_QUTIS` **or** `GOOGLE_APPLICATION_CREDENTIALS_QUTIS`, `GOOGLE_CLOUD_PROJECT_QUTIS`, `GOOGLE_CLOUD_LOCATION` |
+   | Your Telegram bot (local dev) | `TELEGRAM_BOT_TOKEN` from [@BotFather](https://t.me/BotFather) |
+
+3. **Start local Redis and Postgres** (Docker or Homebrew — see `dermascan/docs/local-stack.md`)
+   ```bash
+   ./dermascan/scripts/local_stack.sh up
+   ```
+   This writes `.env.local` with `REDIS_URL` and `POSTGRES_*` pointing at your machine and applies SQL migrations. Your API keys stay in `.env` only.
+
+4. **(Optional) MedGemma for skin-image inference** — not started by `do_work.py`. After [Modal](https://modal.com/) is installed and logged in:
+   ```bash
+   modal secret create huggingface HF_TOKEN=<your-hf-token>
+   modal secret create redis REDIS_HOST=127.0.0.1 REDIS_PORT=6379 REDIS_USERNAME= REDIS_PASSWORD= REDIS_DB=0
+   ```
+   In two terminals:
+   ```bash
+   poetry run python -m uvicorn dermascan.ai_service.modal.medgemma_service.gateways.endpoints:web_app --host 0.0.0.0 --port 8080 --reload
+   poetry run python dermascan/ai_service/modal/medgemma_service/worker.py
+   ```
+   Set `MEDGEMMA_GATEWAY_URL=http://127.0.0.1:8080` in `.env`. Details: `dermascan/ai_service/modal/medgemma_service/README.md`.
+
+5. **Start the API** (port **8088**)
+   ```bash
+   poetry run uvicorn dermascan.backend.app.main:app --host 0.0.0.0 --port 8088 --reload
+   ```
+
+6. **Start workers** (orchestrator + outbound Telegram/WhatsApp replies)
+   ```bash
+   poetry run python dermascan/scripts/do_work.py
+   ```
+
+7. **Wire Telegram to your bot** — long-polling bridge forwards updates to the local webhook (do not use BotFather `setWebhook` while this runs):
+   ```bash
+   poetry run python dermascan/backend/services/agents/telegram_polling_bridge.py
+   ```
+   Message your bot in Telegram. Health check: `GET http://127.0.0.1:8088/health`.
+
+When the shared **Postgres rules dataset** is available, you will point `POSTGRES_*` (or keep using `local_stack.sh` with an import script we will document) so product review and CIR ingredient lookup match production. Until then, treat Postgres as required infrastructure with schema only.
 
 ## Architecture at a Glance
 
@@ -214,15 +277,19 @@ This script runs:
 
 **Not included:** `knowledge_worker` (optional, start manually) and **MedGemma** (separate AI-service stack below).
 
-### WhatsApp vs Telegram (v1)
+### WhatsApp (Turn.io) vs Telegram (v1)
 
-| Capability | WhatsApp | Telegram |
+| | **Telegram** (recommended for dev) | **WhatsApp** (Turn.io) |
 |---|---|---|
-| Orchestration & text outbound | Yes | Yes |
-| Routine reminders & morning brief | Yes | Not yet — integration planned |
-| Voice (ElevenLabs: voice notes in, TTS outbound) | Yes | Not yet — integration planned |
+| **Integration model** | Direct [Bot API](https://core.telegram.org/bots/api): `POST /v1/webhooks/telegram` + polling bridge locally | [Turn.io](https://whatsapp.turn.io) webhooks → `POST /v1/webhooks/whatsapp`; outbound via Turn `POST /v1/messages` (`TURN_API_TOKEN`) |
+| **Local ergonomics** | BotFather token + `telegram_polling_bridge.py` — no third-party messaging account | Requires Turn sandbox/production, Journey handoff from menu stack, and signed webhooks (see `turn/relay_integration.md`) |
+| **Orchestration & text outbound** | Yes | Yes (after Journey handoff to Dermascan) |
+| **Routine reminders & morning brief** | Not yet — planned | Yes (24h customer-care window rules apply) |
+| **Voice (ElevenLabs)** | Not yet — planned | Yes |
 
-Telegram today supports the core chat path (text, images). **Reminders** and **voice** are implemented on **WhatsApp only**; Telegram support for both is on the roadmap.
+**How Turn.io fits in (high level):** Turn delivers inbound WhatsApp events to the Dermascan API and sends replies the workers publish to `outbound:messages`. Short **Journeys** on Turn handle welcome, menus, and **handoff** into the backend orchestrator; the long-running agent conversation must **not** live inside Journey `post()` loops (Turn’s HTTP ceiling and session routing). Dermascan keeps agents, MedGemma, Postgres rules enrichment, and session memory. Optional sidecar/relay patterns for workers are documented under `turn/` and in `.env_example` (`TURN_*`, `WHATSAPP_SIDECAR_*`).
+
+**Practical guidance:** Clone the repo → configure keys → run **Telegram** locally (§4.1). Add **WhatsApp / Turn** when you are ready to mirror production ingress and test menu exit, media fetch via Turn, and reminder windows.
 
 ### WhatsApp reminders (v1)
 
@@ -251,7 +318,8 @@ Ingress touches (`record_channel_inbound`, pause/resume hooks) live in `dermasca
 3. MedGemma gateway + worker (if image / skin review flows are needed)
 4. Backend API (`8088`)
 5. `poetry run python dermascan/scripts/do_work.py`
-6. (Optional) Telegram — see **§4.1 Run Telegram (local)** below
+6. **Telegram** — polling bridge (§4.1); preferred path for first successful end-to-end test
+7. **WhatsApp / Turn.io** — only when you need channel parity with production (`turn/relay_integration.md`)
 
 ### 4.1 Run Telegram (local)
 
@@ -345,10 +413,11 @@ See `dermascan/ai_service/modal/medgemma_service/README.md` for gateway config.
 
 ## Further reading
 
+- `turn/relay_integration.md` — WhatsApp via Turn.io (webhooks, handoff, outbound messages)
+- `turnio.md` — Turn platform overview
 - `dermascan/Agents.md` — full agent map, signal flows, safety pipeline
 - `dermascan/backend/README.md` — API, webhooks, worker details
 - `dermascan/ai_service/docs/inference.md` — inference pipeline overview
-- `dermascan/docs/qutisdemo2.mp4` — product demo video (see intro)
 - `dermascan/docs/qutis-safety-guardrails-overview-anthropic.md` — safety guardrails brief
 
 ## License
