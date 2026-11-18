@@ -1,8 +1,21 @@
 # Dermascan Agents
 
-![Sample Telegram conversation with Qutis](dermascan/docs/tg.png)
-
 AI agent network for dermatology: conversational orchestration, image diagnosis, product safety review, and multi-channel delivery (Telegram / WhatsApp).
+
+### Qutis product demo
+
+<video controls width="100%" preload="metadata" poster="dermascan/docs/tg.png">
+  <source src="dermascan/docs/qutisdemo2.mp4" type="video/mp4" />
+</video>
+
+<p>
+  <a href="dermascan/docs/qutisdemo2.mp4">qutisdemo2.mp4</a>
+  (trimmed walkthrough) ·
+  <a href="dermascan/docs/qutisdemo.mp4">qutisdemo.mp4</a>
+  (full recording)
+</p>
+
+![Sample Telegram conversation with Qutis](dermascan/docs/tg.png)
 
 ## Architecture at a Glance
 
@@ -342,6 +355,8 @@ See `dermascan/ai_service/modal/medgemma_service/README.md` for gateway config.
 - `dermascan/Agents.md` — full agent map, signal flows, safety pipeline
 - `dermascan/backend/README.md` — API, webhooks, worker details
 - `dermascan/ai_service/docs/inference.md` — inference pipeline overview
+- `dermascan/docs/qutisdemo2.mp4` — product demo video (see intro above)
+- `dermascan/docs/qutis-safety-guardrails-overview-anthropic.md` — safety guardrails brief
 
 ## License
 
