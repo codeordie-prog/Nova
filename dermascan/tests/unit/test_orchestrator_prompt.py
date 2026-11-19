@@ -69,6 +69,13 @@ class TestOrchestratorPromptCosmeticPositioning:
         assert "audit_type=product" in prompt
         assert "do not use internet_search" in prompt or "never" in prompt
 
+    def test_prompt_product_photo_uses_text_path_not_register_product_image(self) -> None:
+        prompt = orchestrator_prompt.system_prompt.lower()
+        assert "do not" in prompt and "register_intake_image" in prompt
+        assert "image_category=product" in prompt or "category=product" in prompt
+        assert "medgemma" in prompt
+        assert "product_ref_text" in prompt
+
     def test_prompt_gates_dermatologist_offer_on_skin_analysis(self) -> None:
         prompt = orchestrator_prompt.system_prompt.lower()
         assert "completed ai skin snapshot" in prompt or "skin snapshot ai review" in prompt
