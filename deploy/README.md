@@ -265,13 +265,15 @@ Use `cloudbuild.images-only.yaml` on PRs if you only want build validation.
 
 ## Cloud Run service notes
 
-| Service | Public? | min-instances (staging deploy script) |
-|---------|---------|----------------------------------------|
-| API | Yes (`--allow-unauthenticated`) | 1 |
-| MedGemma gateway | Yes | 1 |
-| Workers | No | 1 |
-| MedGemma worker | No | 1 |
-| Telegram bridge | No | 1 |
+| Service | Public? | min / max instances (staging) |
+|---------|---------|-------------------------------|
+| API | Yes (`--allow-unauthenticated`) | 1 / 1 |
+| MedGemma gateway | Yes | 1 / 1 |
+| Workers | No | 1 / 1 |
+| MedGemma worker | No | 1 / 1 |
+| Telegram bridge | No | 1 / 1 |
+
+All staging services cap at **max-instances=1** for cost control (no burst scaling).
 
 Workers use `deploy/scripts/run_workers_with_turn_sidecar.py`:
 

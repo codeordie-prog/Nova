@@ -13,7 +13,9 @@ substitutions:
   # Leave empty to default to dermascan-cloud-run@<project>.iam.gserviceaccount.com
   # (Cloud Build does NOT expand $PROJECT_ID inside substitution defaults).
   _RUN_SA: ''
-  _POSTGRES_HOST: '34.79.111.107'
+  # Leave empty when using CLOUDSQL_CONNECTION (recommended for DB still in qutisai).
+  _POSTGRES_HOST: ''
+  _CLOUDSQL_CONNECTION: 'qutisai:europe-west1:qutis'
   # Optional override; default secret list is in deploy/scripts/deploy-staging-services.sh
   _SECRETS_SPEC: ''
 
@@ -112,6 +114,7 @@ steps:
       - RUN_SA=${_RUN_SA}
       - SECRETS_SPEC=${_SECRETS_SPEC}
       - POSTGRES_HOST=${_POSTGRES_HOST}
+      - CLOUDSQL_CONNECTION=${_CLOUDSQL_CONNECTION}
     waitFor:
       - push-api
       - push-workers

@@ -10,9 +10,26 @@ PROJECT_ID="${PROJECT_ID:?PROJECT_ID is required}"
 REPO="${REPO:-dermascan}"
 TAG="${TAG:-latest}"
 RUN_SA="${RUN_SA:-dermascan-cloud-run@${PROJECT_ID}.iam.gserviceaccount.com}"
-# Cloud SQL over unix socket (no public-IP allowlisting; RUN_SA needs roles/cloudsql.client).
-CLOUDSQL_CONNECTION="${CLOUDSQL_CONNECTION:-${PROJECT_ID}:${REGION}:qutis}"
-POSTGRES_CLOUD_ENV="POSTGRES_HOST=/cloudsql/${CLOUDSQL_CONNECTION},POSTGRES_SSLMODE=disable"
+# Postgres (three modes):
+# 1) Cross-project / in-project Cloud SQL socket — set CLOUDSQL_CONNECTION (e.g. qutisai:europe-west1:qutis).
+#    RUN_SA needs roles/cloudsql.client on the project that owns the instance.
+# 2) External TCP — set POSTGRES_HOST (public IP); instance must allow Cloud Run egress (authorized networks / NAT).
+# 3) Default socket in deploy PROJECT_ID — ${PROJECT_ID}:${REGION}:qutis
+CLOUDSQL_CONNECTION="${CLOUDSQL_CONNECTION:-}"
+cloudsql_flags=()
+if [[ -n "${CLOUDSQL_CONNECTION}" ]]; then
+  cloudsql_flags=( --add-cloudsql-instances="${CLOUDSQL_CONNECTION}" )
+  POSTGRES_CLOUD_ENV="POSTGRES_HOST=/cloudsql/${CLOUDSQL_CONNECTION},POSTGRES_SSLMODE=disable"
+  echo "Postgres: Cloud SQL socket ${CLOUDSQL_CONNECTION}"
+elif [[ -n "${POSTGRES_HOST:-}" ]]; then
+  POSTGRES_CLOUD_ENV="POSTGRES_HOST=${POSTGRES_HOST},POSTGRES_SSLMODE=${POSTGRES_SSLMODE:-require}"
+  echo "Postgres: TCP ${POSTGRES_HOST} (no Cloud SQL socket mount)"
+else
+  CLOUDSQL_CONNECTION="${PROJECT_ID}:${REGION}:qutis"
+  cloudsql_flags=( --add-cloudsql-instances="${CLOUDSQL_CONNECTION}" )
+  POSTGRES_CLOUD_ENV="POSTGRES_HOST=/cloudsql/${CLOUDSQL_CONNECTION},POSTGRES_SSLMODE=disable"
+  echo "Postgres: Cloud SQL socket ${CLOUDSQL_CONNECTION} (default)"
+fi
 
 IMAGE_PREFIX="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}"
 DOTENV_SECRET="dermascan-dotenv-staging"
@@ -51,9 +68,9 @@ gcloud run deploy dermascan-api-staging \
   --cpu=1 \
   --memory=2Gi \
   --min-instances=1 \
-  --max-instances=3 \
+  --max-instances=1 \
   --timeout=300 \
-  --add-cloudsql-instances="${CLOUDSQL_CONNECTION}" \
+  "${cloudsql_flags[@]}" \
   --set-env-vars="DERMASCAN_ENV_FILE=/secrets/env/.env,DERMASCAN_ROOT=/app,${POSTGRES_CLOUD_ENV}" \
   "${no_cpu_throttle[@]}" \
   "${common_flags[@]}"
@@ -73,9 +90,9 @@ gcloud run deploy dermascan-medgemma-gateway-staging \
   --cpu=1 \
   --memory=2Gi \
   --min-instances=1 \
-  --max-instances=2 \
+  --max-instances=1 \
   --timeout=300 \
-  --add-cloudsql-instances="${CLOUDSQL_CONNECTION}" \
+  "${cloudsql_flags[@]}" \
   --set-env-vars="DERMASCAN_ENV_FILE=/secrets/env/.env,DERMASCAN_ROOT=/app,${POSTGRES_CLOUD_ENV}" \
   "${no_cpu_throttle[@]}" \
   "${common_flags[@]}"
@@ -87,6 +104,7 @@ echo "MedGemma gateway URL: ${MEDGEMMA_GATEWAY_URL}"
 
 RUNTIME_OVERRIDES="DERMASCAN_ENV_FILE=/secrets/env/.env,DERMASCAN_ROOT=/app,MEDGEMMA_GATEWAY_URL=${MEDGEMMA_GATEWAY_URL},TELEGRAM_LOCAL_WEBHOOK_URL=${API_URL}/v1/webhooks/telegram"
 
+# Staging cost cap: every service uses max-instances=1 (no horizontal burst).
 # Background consumers (Redis streams / Telegram polling) get no HTTP traffic,
 # so min-instances=1 is required or Cloud Run never runs them.
 worker_flags=(
@@ -103,16 +121,20 @@ worker_flags=(
 echo "Deploying dermascan-workers-staging..."
 gcloud run deploy dermascan-workers-staging \
   --image="${IMAGE_PREFIX}/dermascan-workers:${TAG}" \
-  --add-cloudsql-instances="${CLOUDSQL_CONNECTION}" \
+  "${cloudsql_flags[@]}" \
   --set-env-vars="${RUNTIME_OVERRIDES},${POSTGRES_CLOUD_ENV}" \
   "${worker_flags[@]}" \
   "${common_flags[@]}"
 
 echo "Deploying dermascan-medgemma-worker-staging..."
+# MedGemma worker is a Redis consumer; it does not need the Cloud SQL socket mount.
+# Socket mount + min-instances=1 has caused startup probe timeouts on some revisions
+# while traffic was pinned to an older revision. Postgres for billing comes from the
+# mounted staging .env (TCP or socket vars as synced by sync_staging_secrets.py).
 gcloud run deploy dermascan-medgemma-worker-staging \
   --image="${IMAGE_PREFIX}/dermascan-medgemma-worker:${TAG}" \
-  --add-cloudsql-instances="${CLOUDSQL_CONNECTION}" \
-  --set-env-vars="${RUNTIME_OVERRIDES},${POSTGRES_CLOUD_ENV}" \
+  --clear-cloudsql-instances \
+  --set-env-vars="${RUNTIME_OVERRIDES}" \
   "${worker_flags[@]}" \
   "${common_flags[@]}"
 
