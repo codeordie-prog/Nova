@@ -76,6 +76,13 @@ class TestOrchestratorPromptCosmeticPositioning:
         assert "medgemma" in prompt
         assert "product_ref_text" in prompt
 
+    def test_prompt_product_review_rules_engine_not_medgemma(self) -> None:
+        prompt = orchestrator_prompt.system_prompt.lower()
+        assert "product review invariant" in prompt
+        assert "rules engine" in prompt
+        assert "never enqueued for products" in prompt or "never used for product" in prompt
+        assert "audit_type=product" in prompt
+
     def test_prompt_gates_dermatologist_offer_on_skin_analysis(self) -> None:
         prompt = orchestrator_prompt.system_prompt.lower()
         assert "completed ai skin snapshot" in prompt or "skin snapshot ai review" in prompt

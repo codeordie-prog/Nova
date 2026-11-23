@@ -1,7 +1,7 @@
 # Build, push, and deploy all backend services to Cloud Run (staging).
 #
 # BEFORE running: sync full .env to Secret Manager (required):
-#   python deploy/scripts/sync_staging_secrets.py --project qutisai
+#   python deploy/scripts/sync_staging_secrets.py --project dawagpn
 #
 #   gcloud builds submit --config=deploy/cloudbuild/cloudbuild.staging.yaml \
 #     --substitutions=_REGION=europe-west1,_TAG=latest,_POSTGRES_HOST=<postgres-ip>

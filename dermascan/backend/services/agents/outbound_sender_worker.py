@@ -450,6 +450,19 @@ def _deliver(fields: dict[str, Any], reply_to_message_id: int | None = None) -> 
         _send_telegram(recipient, text, reply_to_message_id=reply_to_message_id)
         return
 
+    if channel in ("web", "internal"):
+        from dermascan.shared.agent_turn_store import save_turn_reply
+
+        save_turn_reply(
+            _redis,
+            request_id=str(fields.get("request_id") or ""),
+            client_id=recipient,
+            case_id=str(fields.get("case_id") or ""),
+            text=text,
+            kind=str(fields.get("kind") or "job_reply"),
+        )
+        return
+
     if channel == "whatsapp":
         reply_wamid = _whatsapp_reply_wamid(fields)
         _send_whatsapp(recipient, text, reply_to_wamid=reply_wamid)

@@ -14,7 +14,7 @@ Chat with the hosted bot (no local setup): **[@Qutisbot](https://t.me/Qutisbot)*
 
 ### Run locally after cloning
 
-A full local run needs **Redis**, **PostgreSQL**, and your own **API credentials** (OpenAI, Google Gemini / Vertex, and optionally Modal for MedGemma). The rules engine and product-safety flows query Postgres for ingredient safety data (`cir_pdfs` and related migrations). **A curated Postgres dataset for developers will be published soon**; until then you can still run the stack with an empty local database (chat, orchestration, and image paths work; rich product-ingredient review needs that data).
+A full local run needs **Redis**, **PostgreSQL**, and your own **API credentials** (OpenAI, Google Gemini / Vertex, and optionally Modal for MedGemma). The rules engine and product-safety flows query Postgres for ingredient safety data (`cir_pdfs` and related migrations). Import the open **[Qutis CIR ingredients database](https://github.com/codeordie-prog/qutis-cir-ingredients-database)** (`scripts/import_to_postgres.py`) for full product-ingredient review locally.
 
 **Step-by-step (use your credentials, not production secrets):**
 
@@ -71,7 +71,16 @@ A full local run needs **Redis**, **PostgreSQL**, and your own **API credentials
    ```
    Message your bot in Telegram. Health check: `GET http://127.0.0.1:8088/health`.
 
-When the shared **Postgres rules dataset** is available, you will point `POSTGRES_*` (or keep using `local_stack.sh` with an import script we will document) so product review and CIR ingredient lookup match production. Until then, treat Postgres as required infrastructure with schema only.
+Clone [qutis-cir-ingredients-database](https://github.com/codeordie-prog/qutis-cir-ingredients-database), run `scripts/import_to_postgres.py`, and point `POSTGRES_*` (and `POSTGRES_TABLE=cir_pdfs`) at that database so product review and CIR ingredient lookup match production metadata.
+
+**Product safety checks need more than Postgres.** The rules engine looks up ingredients in `cir_pdfs`, then **downloads CIR safety-report PDFs**, chunks them, embeds them with OpenAI, and stores vectors in **Pinecone** for retrieval during a safety check. You must:
+
+1. **Pinecone** — Create a serverless index named `qutis-index` (1536 dimensions, cosine metric). Set `PINECONE_API_KEY_QUTIS` in `.env`. One-time create: `poetry run python -m dermascan.rules_engine.vector_store.build_index`.
+2. **Embeddings** — Set `OPENAI_API_KEY_QUTIS` (embeddings use `text-embedding-3-small`).
+3. **PDF URLs** — Each `cir_pdfs` row needs a fetchable `download_url`. The open dataset ships **public CIR URLs** only; for reliable production use, download reports from those URLs and host PDFs in **your** S3, Firebase, GCS, or similar, then point `download_url` (and optional `storage_path`) at your HTTPS objects. Local dev can start with CIR public links as set by the dataset import script.
+4. **Redis** — `REDIS_URL` is required for rules-index job coordination and caching.
+
+See the [ingredients database README](https://github.com/codeordie-prog/qutis-cir-ingredients-database#using-this-data-with-nova-pinecone--pdf-storage) for the full checklist. Pipeline detail: `dermascan/rules_engine/vector_store/search.md`.
 
 ## Architecture at a Glance
 
@@ -225,7 +234,9 @@ Model temperature and token defaults also live in `dermascan/backend/services/ag
 
 Product safety and skin-review signal enrichment call `RulesEngine` (`dermascan/rules_engine/engine/rules_engine.py`), which **queries PostgreSQL** for per-ingredient CIR safety data. Without a reachable Postgres instance and the variables below, product-review flows will fail at signal enrichment time.
 
-Required variables (see `.env_example`):
+Populate `cir_pdfs` from the open **[Qutis CIR ingredients database](https://github.com/codeordie-prog/qutis-cir-ingredients-database)** (`scripts/import_to_postgres.py`).
+
+### Ingredient metadata (Postgres)
 
 | Variable | Purpose |
 |---|---|
@@ -236,7 +247,21 @@ Required variables (see `.env_example`):
 | `POSTGRESS_PASSWORD` | Password (note: double-S spelling matches code) |
 | `POSTGRES_TABLE` | Ingredient table (default `cir_pdfs`) |
 
-`REDIS_URL` is also required by the rules engine for ingredient-index caching.
+Each row should expose a non-empty **`download_url`** so workers can fetch the CIR PDF. The public dataset fills this with CIR attachment URLs; you can mirror PDFs to your own **S3 / Firebase / GCS** and update `download_url` for production.
+
+### Vector search (Pinecone + OpenAI)
+
+Safety checks retrieve toxicology text from **Pinecone** (`qutis-index`, namespace `cir`, 1536-dim cosine vectors). On first use per ingredient, the rules engine downloads the PDF from `download_url`, chunks it, embeds with OpenAI, and upserts vectors (lazy indexing).
+
+| Variable | Purpose |
+|---|---|
+| `PINECONE_API_KEY_QUTIS` | Pinecone API key |
+| `OPENAI_API_KEY_QUTIS` | Embeddings for index + query |
+| `REDIS_URL` | Rules-index jobs and ingredient-index cache |
+
+Create the index once: `poetry run python -m dermascan.rules_engine.vector_store.build_index`.
+
+Algorithm and retrieval policy: `dermascan/rules_engine/vector_store/search.md`.
 
 ## 3. Run the backend API
 

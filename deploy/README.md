@@ -22,7 +22,8 @@ Step-by-step guide for **Cloud Build + Artifact Registry + Cloud Run**. Frontend
 
 Replace placeholders:
 
-- `PROJECT_ID` → e.g. `qutisai`
+- `PROJECT_ID` → `dawagpn` (Cloud Run, Artifact Registry, Secret Manager; Firebase is also `dawagpn`)
+- Postgres may still use Cloud SQL in another project — staging uses `qutisai:europe-west1:qutis` or `POSTGRES_HOST` (see `cloudbuild.staging.yaml`)
 - `REGION` → e.g. `europe-west1` (match Postgres/Redis latency)
 
 ### 0.1 Select project and enable APIs
@@ -95,11 +96,13 @@ Without these, builds succeed but deploy steps fail with permission errors.
 
 ### 0.5 Secret Manager — sync full `.env` (required before staging deploy)
 
+After changing `.env` (e.g. `QUTIS_AGENT_API_KEY`, billing-related vars), re-sync secrets **before** redeploy so API and workers pick up the new values.
+
 Cloud Run does **not** use your local `.env` file. Upload it once with:
 
 ```bash
 cd C:\Users\LENOVO\Documents\dermascanAgents
-python deploy/scripts/sync_staging_secrets.py --project qutisai
+python deploy/scripts/sync_staging_secrets.py --project dawagpn
 ```
 
 This creates/updates:

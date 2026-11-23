@@ -6,7 +6,7 @@ Upload local ``.env`` (+ credential JSON files) to GCP Secret Manager for stagin
 
 Run once before ``cloudbuild.staging.yaml`` (or whenever ``.env`` changes):
 
-    python deploy/scripts/sync_staging_secrets.py --project qutisai
+    python deploy/scripts/sync_staging_secrets.py --project dawagpn
 
 Requires: gcloud CLI authenticated, Secret Manager API enabled.
 """
@@ -211,7 +211,7 @@ def main() -> int:
         int: Process exit code.
     """
     parser = argparse.ArgumentParser(description="Sync .env to GCP Secret Manager (staging)")
-    parser.add_argument("--project", default="qutisai", help="GCP project id")
+    parser.add_argument("--project", default="dawagpn", help="GCP project id")
     parser.add_argument("--env-file", default="", help="Path to .env (default: repo root .env)")
     args = parser.parse_args()
 

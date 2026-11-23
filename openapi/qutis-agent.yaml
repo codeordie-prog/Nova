@@ -1,0 +1,139 @@
+openapi: 3.0.3
+info:
+  title: Qutis Agent API
+  version: 0.1.0
+  description: |
+    External agent client API for enqueueing orchestrator turns on `channel=web`
+    and polling assistant replies. Intended for OpenClaw plugins, MCP servers, and
+    future ChatGPT/Anthropic Actions adapters.
+servers:
+  - url: https://dermascan-api-staging-plivf742uq-ew.a.run.app
+    description: Hosted Qutis staging API (Cloud Run)
+  - url: http://127.0.0.1:8000
+    description: Local Nova stack
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      summary: API liveness
+      security: []
+      responses:
+        "200":
+          description: OK
+  /v1/agents/turns:
+    post:
+      summary: Submit a user turn
+      operationId: createAgentTurn
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentTurnCreateRequest"
+      responses:
+        "200":
+          description: Turn queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentTurnCreateResponse"
+        "400":
+          description: Invalid body
+        "401":
+          description: Missing or invalid Bearer token (when QUTIS_AGENT_API_KEY is set)
+        "429":
+          description: Rate limit or queue pressure
+        "503":
+          description: Redis unavailable
+  /v1/agents/turns/{request_id}:
+    get:
+      summary: Poll turn status and reply text
+      operationId: getAgentTurn
+      parameters:
+        - name: request_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Current status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentTurnStatusResponse"
+        "401":
+          description: Missing or invalid Bearer token
+        "404":
+          description: Unknown request_id
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: API key
+  schemas:
+    AgentTurnCreateRequest:
+      type: object
+      required: [client_id]
+      properties:
+        client_id:
+          type: string
+          description: Stable external client id, e.g. openclaw:<session>
+        case_id:
+          type: string
+          nullable: true
+          description: Conversation case id; server generates one when omitted
+        text:
+          type: string
+          nullable: true
+        image_base64:
+          type: string
+          nullable: true
+          description: JPEG/PNG/GIF/WebP as standard base64
+        image_mime_type:
+          type: string
+          default: image/jpeg
+        source:
+          type: string
+          nullable: true
+          description: Optional caller label in metadata (e.g. openclaw)
+        username:
+          type: string
+          nullable: true
+    AgentTurnCreateResponse:
+      type: object
+      required: [request_id, case_id, client_id, status]
+      properties:
+        request_id:
+          type: string
+        case_id:
+          type: string
+        client_id:
+          type: string
+        status:
+          type: string
+          enum: [queued]
+    AgentTurnStatusResponse:
+      type: object
+      required: [request_id, case_id, client_id, status]
+      properties:
+        request_id:
+          type: string
+        case_id:
+          type: string
+        client_id:
+          type: string
+        status:
+          type: string
+          enum: [queued, running, done, failed, unknown]
+        text:
+          type: string
+          nullable: true
+        kind:
+          type: string
+          nullable: true
+        error:
+          type: string
+          nullable: true

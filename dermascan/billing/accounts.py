@@ -37,7 +37,7 @@ class Account:
 
     Attributes:
         id: Account uuid.
-        channel: ``whatsapp`` or ``telegram``.
+        channel: ``whatsapp``, ``telegram``, ``web``, or ``internal``.
         client_id: Channel-native identifier (phone or Telegram user id).
         balance_credits: Spendable credits; may be negative within the overdraft floor.
         currency: Settlement currency.
@@ -83,7 +83,7 @@ def get_or_create(channel: str, client_id: str) -> Account:
     Fetch the account for a messaging identity, creating it on first contact.
 
     Args:
-        channel: ``whatsapp`` or ``telegram``.
+        channel: ``whatsapp``, ``telegram``, ``web``, or ``internal``.
         client_id: Channel-native identifier.
 
     Returns:
@@ -203,7 +203,7 @@ def resolve_for_client(channel: str, client_id: str) -> Account:
     This is the single entry point the chat surface uses.
 
     Args:
-        channel: ``whatsapp`` or ``telegram``.
+        channel: ``whatsapp``, ``telegram``, ``web``, or ``internal``.
         client_id: Channel-native identifier.
 
     Returns:
@@ -228,9 +228,9 @@ def remember_channel(client_id: str, channel: str) -> None:
 
     Args:
         client_id: Channel-native identifier.
-        channel: ``whatsapp`` or ``telegram``.
+        channel: ``whatsapp``, ``telegram``, ``web``, or ``internal``.
     """
-    if not client_id or channel not in {"whatsapp", "telegram"}:
+    if not client_id or channel not in {"whatsapp", "telegram", "web", "internal"}:
         return
     try:
         get_redis_client(decode_responses=True).set(
