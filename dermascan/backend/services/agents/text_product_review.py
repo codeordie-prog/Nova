@@ -15,6 +15,7 @@ existing orchestrator signal handler runs ``run_product_signal_rules_flow``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -56,35 +57,64 @@ def text_product_review_eligible(session: IntakeSession) -> bool:
     return bool(session.product_ref_text.strip())
 
 
-def text_product_dedupe_key(case_id: str) -> str:
+def _normalize_product_token(product_ref_text: str) -> str:
+    """
+    Build a stable token for a product name (case/whitespace insensitive).
+
+    Args:
+        product_ref_text: Raw product reference text from intake.
+
+    Returns:
+        str: Short hex digest of the normalized name, or "" when empty.
+    """
+    normalized = " ".join(str(product_ref_text or "").lower().split())
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def text_product_dedupe_key(case_id: str, product_ref_text: str = "") -> str:
     """
     Build Redis dedupe key for a text-only product review dispatch.
 
+    The key is scoped to (case, product) so a second product reviewed in the
+    same conversation dispatches its own review instead of being swallowed by
+    the first product's marker.
+
     Args:
         case_id: Intake case identifier.
+        product_ref_text: Product reference text for the review.
 
     Returns:
         str: Redis key string.
     """
-    normalized = str(case_id or "anonymous").strip() or "anonymous"
-    return f"{_TEXT_PRODUCT_DEDUPE_PREFIX}{normalized}"
+    normalized_case = str(case_id or "anonymous").strip() or "anonymous"
+    product_token = _normalize_product_token(product_ref_text)
+    if product_token:
+        return f"{_TEXT_PRODUCT_DEDUPE_PREFIX}{normalized_case}:{product_token}"
+    return f"{_TEXT_PRODUCT_DEDUPE_PREFIX}{normalized_case}"
 
 
-def is_text_product_review_enqueued(redis_client: Any, case_id: str) -> bool:
+def is_text_product_review_enqueued(
+    redis_client: Any,
+    case_id: str,
+    product_ref_text: str = "",
+) -> bool:
     """
-    Return True when a text-only product signal was already dispatched for the case.
+    Return True when this product's text-only review was already dispatched.
 
     Args:
         redis_client: Redis client.
         case_id: Intake case identifier.
+        product_ref_text: Product reference text for the review.
 
     Returns:
-        bool: True when dedupe marker exists.
+        bool: True when dedupe marker exists for this (case, product).
     """
     if redis_client is None:
         return False
     try:
-        return bool(redis_client.get(text_product_dedupe_key(case_id)))
+        return bool(redis_client.get(text_product_dedupe_key(case_id, product_ref_text)))
     except Exception:
         logger.exception("failed to read text product dedupe key: case_id=%s", case_id)
         return False
@@ -168,12 +198,13 @@ def dispatch_text_product_review_signal(
     if redis_client is None:
         raise RuntimeError("REDIS_URL is required for text product review dispatch")
 
-    dedupe_key = text_product_dedupe_key(case_id)
+    dedupe_key = text_product_dedupe_key(case_id, session.product_ref_text)
     if not redis_client.set(dedupe_key, "1", nx=True, ex=_TEXT_PRODUCT_DEDUPE_TTL_SEC):
         logger.info(
-            "text product review already dispatched: case_id=%s client_id=%s",
+            "text product review already dispatched: case_id=%s client_id=%s product=%s",
             case_id,
             client_id,
+            session.product_ref_text.strip(),
         )
         return {
             "status": "already_queued",

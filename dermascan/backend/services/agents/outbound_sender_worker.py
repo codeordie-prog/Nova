@@ -451,7 +451,10 @@ def _deliver(fields: dict[str, Any], reply_to_message_id: int | None = None) -> 
         return
 
     if channel in ("web", "internal"):
-        from dermascan.shared.agent_turn_store import save_turn_reply
+        from dermascan.shared.agent_turn_store import save_turn_reply, should_persist_web_agent_turn
+
+        if not should_persist_web_agent_turn(fields):
+            return
 
         save_turn_reply(
             _redis,

@@ -1676,7 +1676,7 @@ def _all_required_audits_enqueued(session: IntakeSession) -> bool:
             category == IntakeImageCategory.PRODUCT
             and text_product_review_eligible(session)
         ):
-            if is_text_product_review_enqueued(_redis, session.case_id):
+            if is_text_product_review_enqueued(_redis, session.case_id, session.product_ref_text):
                 continue
             return False
         ref = session.images.get(category.value)
@@ -2763,7 +2763,7 @@ def continue_product_review_after_skin_prerequisite(
     dispatched = False
 
     if text_product_review_eligible(session):
-        if is_text_product_review_enqueued(_redis, session.case_id):
+        if is_text_product_review_enqueued(_redis, session.case_id, session.product_ref_text):
             logger.info(
                 "product auto-chain skipped; text review already enqueued: case_id=%s",
                 session.case_id,
@@ -2943,7 +2943,7 @@ def _dispatch_required_audits_if_ready(
             and image_ref is None
             and text_product_review_eligible(session)
         ):
-            if is_text_product_review_enqueued(_redis, session.case_id):
+            if is_text_product_review_enqueued(_redis, session.case_id, session.product_ref_text):
                 continue
         elif image_ref is not None and _is_audit_enqueued(image_ref.request_id):
             continue

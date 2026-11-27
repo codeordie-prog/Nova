@@ -46,7 +46,9 @@ Apply migration `dermascan/migrations/006_billing_agent_channels.sql` on your Po
 
 Use a stable string per external session, for example `openclaw:<gatewaySessionId>`. Reuse `case_id` across turns in the same conversation when the client tracks it.
 
-## Polling guidance
+## Polling
+
+Turn status is **`done` only when a final `job_reply` outbound is stored** for `channel=web`. Intermediate `signal_update` messages (common during product/rules-engine audits) keep status **`running`** so clients do not stop polling before the report arrives. Allow **up to ~10 minutes** for product reviews (`timeout_seconds` in Clawtis defaults to 600).
 
 - Start with 1–2s interval; back off to 5–10s for long tool runs.
 - **Clawtis:** `qutis_wait_for_turn` polls every `poll_interval_seconds`; `qutis_get_turn` is one-shot only (Qutis has no webhook to OpenClaw).

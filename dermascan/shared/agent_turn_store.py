@@ -157,3 +157,51 @@ def load_turn_reply(redis_client: redis.Redis, request_id: str) -> dict[str, Any
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def is_interim_product_outbound(fields: dict[str, Any]) -> bool:
+    """
+    Return True for product-review progress outbounds that must not complete web poll.
+
+    Args:
+        fields: Outbound stream fields (must include ``dedupe_key`` when set at enqueue).
+
+    Returns:
+        bool: True when the outbound is the deferred index-pending interim message.
+    """
+    dedupe_key = str(fields.get("dedupe_key") or "")
+    return ":index_pending:" in dedupe_key
+
+
+def should_persist_web_agent_turn(fields: dict[str, Any]) -> bool:
+    """
+    Decide whether an outbound should be stored for ``GET /v1/agents/turns/{id}``.
+
+    Job replies and final signal reports are persisted; product index-pending
+    progress messages are skipped so clients keep polling until the full report.
+
+    Args:
+        fields: Outbound stream fields.
+
+    Returns:
+        bool: True when the message should be written to the agent turn store.
+    """
+    kind = str(fields.get("kind") or "").strip().lower()
+    if kind == "job_reply":
+        return True
+    if kind == "signal_update":
+        return not is_interim_product_outbound(fields)
+    return False
+
+
+def outbound_field_is_poll_terminal(fields: dict[str, Any]) -> bool:
+    """
+    Return True when an outbound stream entry can complete agent turn polling.
+
+    Args:
+        fields: Outbound stream fields.
+
+    Returns:
+        bool: True for job replies and non-interim signal updates.
+    """
+    return should_persist_web_agent_turn(fields)

@@ -107,3 +107,45 @@ class TestTextProductReview:
         assert first["status"] == "queued"
         assert second["status"] == "already_queued"
         assert len(fake_redis.xrange(tpr.ORCHESTRATOR_SIGNAL_STREAM)) == 1
+
+    def test_second_product_same_case_dispatches(self, fake_redis, monkeypatch) -> None:
+        """A different product in the same case must get its own review."""
+        monkeypatch.setattr(tpr, "cosmetic_pivot_enabled", lambda: True)
+        monkeypatch.setattr(tpr, "cosmetic_text_product_review_enabled", lambda: True)
+
+        first_session = self._session()
+        second_session = self._session()
+        second_session.product_ref_text = "CeraVe Skin Renewing Vitamin C Serum"
+
+        first = tpr.dispatch_text_product_review_signal(
+            fake_redis,
+            session=first_session,
+            profile={},
+            request_id="req-1",
+            case_id="case-1",
+            client_id="client-1",
+            message_id="msg-1",
+            channel="web",
+        )
+        second = tpr.dispatch_text_product_review_signal(
+            fake_redis,
+            session=second_session,
+            profile={},
+            request_id="req-2",
+            case_id="case-1",
+            client_id="client-1",
+            message_id="msg-2",
+            channel="web",
+        )
+        assert first["status"] == "queued"
+        assert second["status"] == "queued"
+        entries = fake_redis.xrange(tpr.ORCHESTRATOR_SIGNAL_STREAM)
+        assert len(entries) == 2
+
+    def test_dedupe_key_product_normalization(self) -> None:
+        """Same product with different case/spacing maps to one key."""
+        key_a = tpr.text_product_dedupe_key("case-1", "CeraVe  Hydrating Cleanser")
+        key_b = tpr.text_product_dedupe_key("case-1", "cerave hydrating cleanser ")
+        key_c = tpr.text_product_dedupe_key("case-1", "CeraVe Vitamin C Serum")
+        assert key_a == key_b
+        assert key_a != key_c

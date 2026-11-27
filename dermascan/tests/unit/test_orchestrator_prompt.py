@@ -64,23 +64,16 @@ class TestOrchestratorPromptCosmeticPositioning:
 
     def test_prompt_routes_text_product_review_through_enqueue_not_search(self) -> None:
         prompt = orchestrator_prompt.system_prompt.lower()
-        assert "text-based product review" in prompt
-        assert "internet_search" in prompt
+        assert "product check (simple" in prompt
         assert "audit_type=product" in prompt
-        assert "do not use internet_search" in prompt or "never" in prompt
-
-    def test_prompt_product_photo_uses_text_path_not_register_product_image(self) -> None:
-        prompt = orchestrator_prompt.system_prompt.lower()
-        assert "do not" in prompt and "register_intake_image" in prompt
-        assert "image_category=product" in prompt or "category=product" in prompt
-        assert "medgemma" in prompt
-        assert "product_ref_text" in prompt
-
-    def test_prompt_product_review_rules_engine_not_medgemma(self) -> None:
-        prompt = orchestrator_prompt.system_prompt.lower()
-        assert "product review invariant" in prompt
         assert "rules engine" in prompt
-        assert "never enqueued for products" in prompt or "never used for product" in prompt
+        assert "not search tools" in prompt or "internet_search" in prompt
+
+    def test_prompt_product_photo_collect_context_enqueue(self) -> None:
+        prompt = orchestrator_prompt.system_prompt.lower()
+        assert "product_ref_text" in prompt
+        assert "product photo" in prompt
+        assert "do not register" in prompt or "do not register_intake_image" in prompt
         assert "audit_type=product" in prompt
 
     def test_prompt_gates_dermatologist_offer_on_skin_analysis(self) -> None:

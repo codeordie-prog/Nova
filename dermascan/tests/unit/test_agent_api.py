@@ -140,6 +140,45 @@ def test_get_agent_turn_404_unknown(fake_redis: Any, monkeypatch: pytest.MonkeyP
     assert resp.status_code == 404
 
 
+def test_outbound_web_skips_signal_update_for_poll(fake_redis: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dermascan.backend.services.agents import outbound_sender_worker
+
+    monkeypatch.setattr(outbound_sender_worker, "_redis", fake_redis)
+    outbound_sender_worker._deliver(
+        {
+            "channel": "web",
+            "client_id": "openclaw:1",
+            "case_id": "case-99",
+            "request_id": "req-web",
+            "text": "Still working on your product review…",
+            "kind": "signal_update",
+            "dedupe_key": "signal_update:product_review_foo:index_pending:req-web:case-99",
+        }
+    )
+    assert load_turn_reply(fake_redis, "req-web") is None
+
+
+def test_outbound_web_persists_final_signal_update(fake_redis: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dermascan.backend.services.agents import outbound_sender_worker
+
+    monkeypatch.setattr(outbound_sender_worker, "_redis", fake_redis)
+    outbound_sender_worker._deliver(
+        {
+            "channel": "web",
+            "client_id": "openclaw:1",
+            "case_id": "case-99",
+            "request_id": "req-final",
+            "text": "Full product report text",
+            "kind": "signal_update",
+            "dedupe_key": "signal_update:product_review_index_ready:final:req-final:case-99",
+        }
+    )
+    cached = load_turn_reply(fake_redis, "req-final")
+    assert cached is not None
+    assert cached["text"] == "Full product report text"
+    assert cached["kind"] == "signal_update"
+
+
 def test_outbound_web_persists_turn_reply(fake_redis: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     from dermascan.backend.services.agents import outbound_sender_worker
 

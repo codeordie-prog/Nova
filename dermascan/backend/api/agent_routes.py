@@ -38,7 +38,12 @@ from dermascan.backend.models.requests import (
 )
 from dermascan.backend.services.agents import reclaim_logic
 from dermascan.shared.agent_api_auth import verify_agent_api_bearer
-from dermascan.shared.agent_turn_store import load_ingress_meta, load_turn_reply, save_ingress_meta
+from dermascan.shared.agent_turn_store import (
+    load_ingress_meta,
+    load_turn_reply,
+    outbound_field_is_poll_terminal,
+    save_ingress_meta,
+)
 from dermascan.shared.load_env import bootstrap_env
 from dermascan.shared.logger import get_logger
 from dermascan.shared.redis_stability import get_redis_client
@@ -97,9 +102,11 @@ def _find_outbound_text(redis_client: redis.Redis, request_id: str) -> tuple[str
     for _, fields in entries:
         if str(fields.get("request_id") or "") != request_id:
             continue
+        if not outbound_field_is_poll_terminal(fields):
+            continue
+        kind = str(fields.get("kind") or "").strip().lower() or "job_reply"
         text = str(fields.get("text") or "").strip()
         if text:
-            kind = str(fields.get("kind") or "").strip() or None
             return text, kind
     return None, None
 
